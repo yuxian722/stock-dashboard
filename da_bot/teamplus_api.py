@@ -103,7 +103,14 @@ def read_new_messages(cursor=None):
         print(f"[警告] 讀取team+訊息失敗(可能cookie過期，需要重新用F12抓一組新的): {type(e).__name__}: {e}")
         return [], cursor
 
-    msg_list = data.get("MessageList") or []
+    # team+後端這支API實際回傳的清單欄位名稱有時是ChatMessageList、有時是MessageList
+    # (同事逆向出來的teamplus_bot.py兩個都有處理)，這裡兩個都要檢查，
+    # 只認MessageList的話，如果剛好這次回傳的是ChatMessageList，會每次都誤判成
+    # "沒有新訊息"，即時問答會變成永遠沒反應、也不會印出任何錯誤或警告。
+    msg_list = data.get("ChatMessageList")
+    if msg_list is None:
+        msg_list = data.get("MessageList")
+    msg_list = msg_list or []
     if not msg_list:
         return [], cursor
 
