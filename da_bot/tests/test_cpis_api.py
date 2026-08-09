@@ -1,31 +1,11 @@
-"""cpis_api.py 純邏輯（不連網）的離線單元測試：隱藏欄位解析、表格解析（含 rowspan
-展開）、編碼自動偵測、驗證失敗判斷。"""
+"""cpis_api.py 純邏輯(不連網)的離線單元測試：隱藏欄位/表單欄位解析、編碼自動偵測、
+驗證失敗判斷、Utilization資料URL組合、iframe來源擷取。"""
 
 import conftest  # noqa: F401  (設定 sys.path)
 
 import unittest
 
 import cpis_api
-
-SIMPLE_TABLE_HTML = """
-<html><body>
-<table id="gvData">
-<tr><th>Date</th><th>Shift</th><th>Qty</th></tr>
-<tr><td>2026-08-01</td><td>Day</td><td>10</td></tr>
-<tr><td>2026-08-02</td><td>Night</td><td>20</td></tr>
-</table>
-</body></html>
-"""
-
-ROWSPAN_TABLE_HTML = """
-<html><body>
-<table id="gvData">
-<tr><th>Date</th><th>Shift</th><th>Qty</th></tr>
-<tr><td rowspan="2">2026-08-01</td><td>Day</td><td>10</td></tr>
-<tr><td>Night</td><td>20</td></tr>
-</table>
-</body></html>
-"""
 
 
 class TestExtractInput(unittest.TestCase):
@@ -41,6 +21,68 @@ class TestExtractInput(unittest.TestCase):
         self.assertEqual(cpis_api.extract_input(html, "__EVENTVALIDATION"), "")
 
 
+class TestExtractFormFields(unittest.TestCase):
+    def test_text_and_hidden_inputs(self):
+        html = """
+        <form id="form1">
+            <input type="hidden" name="__VIEWSTATE" value="vs123" />
+            <input type="text" name="txtStart_date" value="20260101" />
+        </form>
+        """
+        fields = cpis_api.extract_form_fields(html)
+        self.assertEqual(fields["__VIEWSTATE"], "vs123")
+        self.assertEqual(fields["txtStart_date"], "20260101")
+
+    def test_checkbox_only_included_when_checked(self):
+        html = """
+        <form>
+            <input type="checkbox" name="cbA" value="on" checked />
+            <input type="checkbox" name="cbB" value="on" />
+        </form>
+        """
+        fields = cpis_api.extract_form_fields(html)
+        self.assertEqual(fields.get("cbA"), "on")
+        self.assertNotIn("cbB", fields)
+
+    def test_select_uses_selected_option(self):
+        html = """
+        <form>
+            <select name="ddl_floor">
+                <option value="None">None</option>
+                <option value="A2" selected>A2</option>
+            </select>
+        </form>
+        """
+        fields = cpis_api.extract_form_fields(html)
+        self.assertEqual(fields["ddl_floor"], "A2")
+
+    def test_select_defaults_to_first_option_when_none_selected(self):
+        html = """
+        <form>
+            <select name="ddl_shift">
+                <option value="None">None</option>
+                <option value="Day">Day</option>
+            </select>
+        </form>
+        """
+        fields = cpis_api.extract_form_fields(html)
+        self.assertEqual(fields["ddl_shift"], "None")
+
+    def test_submit_buttons_excluded(self):
+        html = """
+        <form>
+            <input type="submit" name="btnFetch" value="Fetch" />
+            <input type="text" name="txtEngineer" value="" />
+        </form>
+        """
+        fields = cpis_api.extract_form_fields(html)
+        self.assertNotIn("btnFetch", fields)
+        self.assertIn("txtEngineer", fields)
+
+    def test_no_form_returns_empty_dict(self):
+        self.assertEqual(cpis_api.extract_form_fields("<div>no form</div>"), {})
+
+
 class TestIsAuthFail(unittest.TestCase):
     def test_by_url(self):
         self.assertTrue(cpis_api.is_auth_fail("<html></html>", "http://host/CPISWeb/Logon.aspx"))
@@ -50,38 +92,6 @@ class TestIsAuthFail(unittest.TestCase):
 
     def test_false(self):
         self.assertFalse(cpis_api.is_auth_fail("<html>正常資料頁</html>", "http://host/data.aspx"))
-
-
-class TestParseTable(unittest.TestCase):
-    def test_basic(self):
-        rows = cpis_api.parse_table(SIMPLE_TABLE_HTML, "gvData")
-        self.assertEqual(
-            rows,
-            [
-                ["Date", "Shift", "Qty"],
-                ["2026-08-01", "Day", "10"],
-                ["2026-08-02", "Night", "20"],
-            ],
-        )
-
-    def test_wrong_id_returns_empty(self):
-        self.assertEqual(cpis_api.parse_table(SIMPLE_TABLE_HTML, "no_such_table"), [])
-
-    def test_does_not_expand_rowspan(self):
-        rows = cpis_api.parse_table(ROWSPAN_TABLE_HTML, "gvData")
-        # 沒有展開 rowspan：第三列只有 2 個欄位，跟表頭欄位數對不齊
-        self.assertEqual(rows[2], ["Night", "20"])
-
-    def test_filled_expands_rowspan(self):
-        rows = cpis_api.parse_table_filled(ROWSPAN_TABLE_HTML, "gvData")
-        self.assertEqual(
-            rows,
-            [
-                ["Date", "Shift", "Qty"],
-                ["2026-08-01", "Day", "10"],
-                ["2026-08-01", "Night", "20"],
-            ],
-        )
 
 
 class TestDecodeBest(unittest.TestCase):
@@ -98,20 +108,22 @@ class TestDecodeBest(unittest.TestCase):
         self.assertIn(enc, ("big5", "cp950"))
 
 
-class TestEeOperFields(unittest.TestCase):
-    def test_matches_entity_checkbox(self):
-        html = (
-            '<input type="checkbox" name="DropDownCheckBoxes1$ctl02" value="0" />DA'
-            '<input type="checkbox" name="DropDownCheckBoxes1$ctl03" value="1" />DB'
-        )
-        fields = cpis_api._ee_oper_fields(html, "DA")
-        self.assertEqual(fields, {"DropDownCheckBoxes1$ctl02": "on"})
+class TestUtilizationDataUrl(unittest.TestCase):
+    def test_contains_dates_and_operation(self):
+        url = cpis_api._utilization_data_url("20260801", "20260809", "DA")
+        self.assertIn("start_date=20260801", url)
+        self.assertIn("end_date=20260809", url)
+        self.assertIn("operation=DA", url)
+        self.assertTrue(url.startswith(cpis_api.UTIL_BASE + cpis_api.UTIL_DATA_PATH))
 
 
 class TestIframeSrcs(unittest.TestCase):
-    def test_extracts_all(self):
-        html = '<iframe src="/a.aspx"></iframe><iframe src="/b.aspx"></iframe>'
+    def test_extracts_frame_and_iframe(self):
+        html = '<frame src="/a.aspx"></frame><iframe src="/b.aspx"></iframe>'
         self.assertEqual(cpis_api._iframe_srcs(html), ["/a.aspx", "/b.aspx"])
+
+    def test_no_frames_returns_empty(self):
+        self.assertEqual(cpis_api._iframe_srcs("<div>no frames</div>"), [])
 
 
 if __name__ == "__main__":

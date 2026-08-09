@@ -1,22 +1,37 @@
-"""CPIS/APG 站的純 requests(urllib) 封裝，取代 Selenium 附身模式。
-
-CPIS 是 ASP.NET WebForms 系統：先 GET 頁面把 __VIEWSTATE / __VIEWSTATEGENERATOR /
-__EVENTVALIDATION 抓出來，再原樣連同帳密／查詢條件 POST 回去；用 http.cookiejar
-讓 session cookie 自動夾帶在後續請求中，等同「登入後」的持續 session。
-
-對外主要函式：
-    login()                                          -> 登入 APG（EE Maintenance 用），回傳 opener
-    fetch_ee_maintenance(start_date, end_date, ...)   -> rows
-    fetch_utilization(start_date, end_date, ...)      -> rows
+# -*- coding: utf-8 -*-
 """
+CPIS/APG HTTP API 模組(取代 cpis_scraper.py / cpis_utilization_scraper.py 原本的
+Selenium 附身模式)
 
-from __future__ import annotations
+原本這兩支腳本靠附身模式Edge(--remote-debugging-port=9222)操作已登入的分頁，
+長期卡在「除錯模式Edge開不起來」的環境問題(單一實例限制、殘留行程沒清乾淨等)。
+同事的 APG_Dashboard 專案已證實 CPIS 可以純用 urllib.request 直接發HTTP請求
+登入+查詢，完全不需要開瀏覽器，這裡把這套方法整合成模組，比照 teamplus_api.py
+的封裝方式：只負責「登入 + 把查詢結果原始HTML抓回來」，實際的表格解析/欄位對應/
+資料清洗邏輯仍留在 cpis_scraper.py / cpis_utilization_scraper.py 裡(用
+BeautifulSoup，跟原本一致，只是資料來源從 driver.page_source 換成這裡回傳的HTML)。
 
+原理：CPIS是傳統ASP.NET WebForms系統，登入與查詢都要帶上隱藏欄位
+__VIEWSTATE / __VIEWSTATEGENERATOR / __EVENTVALIDATION(先GET頁面把值抓出來，
+再原樣連同帳密/查詢條件POST回去)。用http.cookiejar讓session cookie自動夾帶在
+後續請求中，就等於「登入後」的持續session，跟瀏覽器操作是同一件事。
+
+用法：
+    import cpis_api
+    html = cpis_api.fetch_ee_maintenance_html("20260716", "20260717", "B*")
+    html_list = cpis_api.fetch_utilization_html("20260809", "20260809")
+
+前置：
+    da_bot資料夾下要有 config.txt(複製 config.txt.example 改名，填入
+    apg_user/apg_password/util_user/util_password)。
+"""
 import http.cookiejar
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
-from html.parser import HTMLParser
+
+from bs4 import BeautifulSoup
 
 import config
 
@@ -51,35 +66,34 @@ EE_REFERER_URL = (
 UTIL_BASE = "http://tncpis.tn.chipmos.com.tw"
 UTIL_DATA_PATH = "/APG/APGPROD/EQUIPMENT/wFrmUtilizationAnalysis/util_overa2.aspx"
 
-# EE Maintenance / Utilization 回傳頁面可能用到的表格 id（新舊版型或走 frame 時 id 前綴會不同）
-EE_TABLE_IDS = ("ContentPlaceHolder1_gvData", "gvData")
-UTIL_TABLE_IDS = ("ctl00_ContentPlaceHolder1_gvData", "ContentPlaceHolder1_gvData", "gvData")
+# session過期時查詢途中可能出現的重新登入表單標記(entquery這類頁面逾時會有btnReLogon)
+RELOGON_MARKER = "btnReLogon"
+
+MAX_QUERY_ATTEMPTS = 2  # 查詢途中若偵測到session過期，最多重試幾次(跟原本Selenium版一致)
+MAX_FRAME_DEPTH = 5  # 遞迴掃描frame的最大深度(跟原本Selenium版FRAME_SCAN_MAX_DEPTH一致)
 
 _ENCODINGS = ("utf-8", "big5", "cp950")
 
 
 class CpisAuthError(RuntimeError):
-    """登入失敗或 session 已過期，重新登入也救不回來。"""
+    """登入失敗，或session過期重新登入後仍然失敗。"""
 
 
 # ---------------------------------------------------------------------------
-# 1. 建立帶 cookiejar 的 opener
+# 建立帶 cookiejar 的 opener
 # ---------------------------------------------------------------------------
 
-def build_opener() -> urllib.request.OpenerDirector:
+def build_opener():
     cj = http.cookiejar.CookieJar()
     op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-    # entquery.aspx 這類頁面會擋過於陽春的請求，必須用完整的瀏覽器標頭，否則會被導向逾時頁
+    # entquery.aspx這類頁面會擋過於陽春的請求，必須用完整的瀏覽器標頭，否則會被導向逾時頁
     op.addheaders = [
         (
             "User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
         ),
-        (
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        ),
+        ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
         ("Accept-Language", "zh-TW,zh;q=0.9,en;q=0.8"),
         ("Cache-Control", "no-cache"),
         ("Upgrade-Insecure-Requests", "1"),
@@ -88,10 +102,10 @@ def build_opener() -> urllib.request.OpenerDirector:
 
 
 # ---------------------------------------------------------------------------
-# 2. 從 HTML 抓 ASP.NET 隱藏欄位值 / 判斷驗證失敗 / 編碼自動偵測
+# 從HTML抓ASP.NET隱藏欄位值 / 目前表單狀態 / 編碼自動偵測 / 驗證失敗判斷
 # ---------------------------------------------------------------------------
 
-def extract_input(html: str, name: str) -> str:
+def extract_input(html, name):
     m = re.search(r'<input[^>]*\bname=["\']?' + re.escape(name) + r'["\']?[^>]*>', html, re.I)
     if not m:
         return ""
@@ -99,12 +113,47 @@ def extract_input(html: str, name: str) -> str:
     return vm.group(1) if vm else ""
 
 
-def is_auth_fail(html: str, url: str) -> bool:
-    return any(t in url or t in html[:3000] for t in AUTH_FAIL)
+def extract_form_fields(html):
+    """
+    把HTML裡第一個<form>目前的欄位狀態(name -> value)整理成dict，包含
+    __VIEWSTATE等隱藏欄位、文字框目前的值、下拉選單目前選到的選項、
+    已勾選的checkbox/radio。用來複製「表單上沒特別去改的欄位維持原樣送出」
+    這種真實瀏覽器postback的行為，只要再覆蓋我們真正要改的幾個欄位就好，
+    不用每個欄位都自己猜值。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    form = soup.find("form")
+    if not form:
+        return {}
+
+    fields = {}
+    for tag in form.find_all(["input", "select", "textarea"]):
+        name = tag.get("name")
+        if not name:
+            continue
+        tag_name = tag.name
+        if tag_name == "input":
+            input_type = (tag.get("type") or "text").lower()
+            if input_type in ("checkbox", "radio"):
+                if tag.has_attr("checked"):
+                    fields[name] = tag.get("value", "on")
+            elif input_type in ("submit", "button", "image", "reset", "file"):
+                continue
+            else:
+                fields[name] = tag.get("value", "")
+        elif tag_name == "select":
+            options = tag.find_all("option")
+            selected = next((o for o in options if o.has_attr("selected")), None)
+            if selected is None and options:
+                selected = options[0]
+            fields[name] = selected.get("value", selected.get_text(strip=True)) if selected else ""
+        elif tag_name == "textarea":
+            fields[name] = tag.get_text()
+    return fields
 
 
-def decode_best(raw: bytes) -> tuple[str, str]:
-    """頁面混用 utf-8/big5/cp950，挑亂碼字元數最少的編碼。"""
+def decode_best(raw):
+    """頁面混用utf-8/big5/cp950，挑亂碼字元數最少的編碼。"""
     best, best_bad, best_enc = "", float("inf"), _ENCODINGS[0]
     for enc in _ENCODINGS:
         try:
@@ -117,381 +166,183 @@ def decode_best(raw: bytes) -> tuple[str, str]:
     return best, best_enc
 
 
-def _read(opener: urllib.request.OpenerDirector, req_or_url, timeout: int = 30) -> tuple[str, str]:
+def is_auth_fail(html, url):
+    return any(t in url or t in html[:3000] for t in AUTH_FAIL)
+
+
+def _read(opener, req_or_url, timeout=30):
     with opener.open(req_or_url, timeout=timeout) as r:
         html, _ = decode_best(r.read())
         return html, r.geturl()
 
 
+def _post_form(opener, url, fields, referer=None, timeout=30):
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    req.add_header("Referer", referer or url)
+    return _read(opener, req, timeout=timeout)
+
+
 # ---------------------------------------------------------------------------
-# 3. 登入
+# 登入
 # ---------------------------------------------------------------------------
 
-def do_login(opener: urllib.request.OpenerDirector, host: str, user: str, pwd: str) -> bool:
+def do_login(opener, host, user, pwd):
     info = DOMAINS[host]
     html, _ = _read(opener, info["login"])
-
-    payload = urllib.parse.urlencode(
-        {
-            "__VIEWSTATE": extract_input(html, "__VIEWSTATE"),
-            "__VIEWSTATEGENERATOR": extract_input(html, "__VIEWSTATEGENERATOR"),
-            "__EVENTVALIDATION": extract_input(html, "__EVENTVALIDATION"),
-            "UserName": user,
-            "Password": pwd,
-            "Login.x": "61",
-            "Login.y": "5",
-        }
-    ).encode("utf-8")
-
-    req = urllib.request.Request(info["login"], data=payload, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    req.add_header("Referer", info["login"])
-    with opener.open(req, timeout=30) as r:
-        return "Logon.aspx" not in r.geturl()
+    payload = {
+        "__VIEWSTATE": extract_input(html, "__VIEWSTATE"),
+        "__VIEWSTATEGENERATOR": extract_input(html, "__VIEWSTATEGENERATOR"),
+        "__EVENTVALIDATION": extract_input(html, "__EVENTVALIDATION"),
+        "UserName": user,
+        "Password": pwd,
+        "Login.x": "61",
+        "Login.y": "5",
+    }
+    _, final_url = _post_form(opener, info["login"], payload, referer=info["login"])
+    return "Logon.aspx" not in final_url
 
 
-def login() -> urllib.request.OpenerDirector:
-    """建立 opener 並登入 APG（EE Maintenance 用），回傳已登入的 opener。"""
+def login():
+    """建立opener並登入APG主站(EE Maintenance用)，回傳已登入的opener。"""
     cfg = config.load()
     config.require(cfg, "apg_user", "apg_password")
     opener = build_opener()
     if not do_login(opener, "tncpisapg.tn.chipmos.com.tw", cfg["apg_user"], cfg["apg_password"]):
-        raise CpisAuthError("APG 登入失敗，請確認 config.txt 的 apg_user/apg_password")
+        raise CpisAuthError("APG登入失敗，請確認config.txt的apg_user/apg_password")
     return opener
 
 
 # ---------------------------------------------------------------------------
-# 4. 解析回傳 HTML 裡的表格
+# EE Maintenance Record：查詢表單頁 -> POST查詢條件 -> 回傳結果HTML
 # ---------------------------------------------------------------------------
 
-class TableParser(HTMLParser):
-    """按 id 抓指定表格，逐 row/td 取值（不處理 rowspan，欄位數可能因合併儲存格而不齊）。"""
+def fetch_ee_maintenance_html(date_start, date_end, entity_pattern="*", opener=None):
+    """
+    登入APG站並查詢EE Maintenance Record，回傳查詢結果頁的原始HTML(字串)，
+    交給cpis_scraper.py用BeautifulSoup解析(跟原本Selenium版的parse_result_table
+    邏輯完全一致，只是HTML的來源從driver.page_source換成這裡回傳的字串)。
 
-    def __init__(self, target_id: str):
-        super().__init__(convert_charrefs=True)
-        self.target_id = target_id
-        self.in_table = self.in_row = self.in_cell = False
-        self.depth = 0
-        self.cur_row: list[str] = []
-        self.cur_cell: list[str] = []
-        self.rows: list[list[str]] = []
-
-    def handle_starttag(self, tag, attrs):
-        d = dict(attrs)
-        if tag == "table":
-            if not self.in_table and d.get("id", "") == self.target_id:
-                self.in_table, self.depth = True, 1
-            elif self.in_table:
-                self.depth += 1
-        elif self.in_table:
-            if tag == "tr" and self.depth == 1:
-                self.in_row, self.cur_row = True, []
-            elif tag in ("td", "th") and self.in_row:
-                self.in_cell, self.cur_cell = True, []
-            elif tag == "br" and self.in_cell:
-                self.cur_cell.append(" ")
-
-    def handle_endtag(self, tag):
-        if not self.in_table:
-            return
-        if tag == "table":
-            self.depth -= 1
-            if self.depth == 0:
-                self.in_table = False
-        elif tag == "tr" and self.depth == 1 and self.in_row:
-            self.in_row = False
-            if self.cur_row:
-                self.rows.append(self.cur_row)
-        elif tag in ("td", "th") and self.in_cell:
-            self.cur_row.append(re.sub(r"\s+", " ", "".join(self.cur_cell)).strip())
-            self.in_cell = False
-
-    def handle_data(self, data):
-        if self.in_cell:
-            self.cur_cell.append(data)
-
-
-def parse_table(html: str, table_id: str) -> list[list[str]]:
-    p = TableParser(table_id)
-    try:
-        p.feed(html)
-    except Exception:
-        pass
-    return p.rows
-
-
-class GridTableParser(HTMLParser):
-    """跟 TableParser 一樣，但會把 rowspan 合併的儲存格展開回每一列（rowspan 補值），
-    展開後每列的欄位數才會對齊。"""
-
-    def __init__(self, target_id: str):
-        super().__init__(convert_charrefs=True)
-        self.target_id = target_id
-        self.in_table = self.in_row = self.in_cell = False
-        self.depth = 0
-        self.pending: dict[int, list] = {}  # col_index -> [value, remaining_rows]
-        self.cur_row: list[str] = []
-        self.cur_col = 0
-        self.cur_cell: list[str] = []
-        self.cur_cell_span = 1
-        self.rows: list[list[str]] = []
-
-    def handle_starttag(self, tag, attrs):
-        d = dict(attrs)
-        if tag == "table":
-            if not self.in_table and d.get("id", "") == self.target_id:
-                self.in_table, self.depth = True, 1
-            elif self.in_table:
-                self.depth += 1
-        elif self.in_table:
-            if tag == "tr" and self.depth == 1:
-                self.in_row, self.cur_row, self.cur_col = True, [], 0
-            elif tag in ("td", "th") and self.in_row:
-                self._fill_pending()
-                self.in_cell, self.cur_cell = True, []
-                try:
-                    self.cur_cell_span = max(1, int(d.get("rowspan", "1")))
-                except ValueError:
-                    self.cur_cell_span = 1
-            elif tag == "br" and self.in_cell:
-                self.cur_cell.append(" ")
-
-    def _fill_pending(self):
-        while self.cur_col in self.pending:
-            value, remaining = self.pending[self.cur_col]
-            self.cur_row.append(value)
-            remaining -= 1
-            if remaining <= 0:
-                del self.pending[self.cur_col]
-            else:
-                self.pending[self.cur_col] = [value, remaining]
-            self.cur_col += 1
-
-    def handle_endtag(self, tag):
-        if not self.in_table:
-            return
-        if tag == "table":
-            self.depth -= 1
-            if self.depth == 0:
-                self.in_table = False
-        elif tag == "tr" and self.depth == 1 and self.in_row:
-            self._fill_pending()
-            self.in_row = False
-            if self.cur_row:
-                self.rows.append(self.cur_row)
-        elif tag in ("td", "th") and self.in_cell:
-            value = re.sub(r"\s+", " ", "".join(self.cur_cell)).strip()
-            self.cur_row.append(value)
-            if self.cur_cell_span > 1:
-                self.pending[self.cur_col] = [value, self.cur_cell_span - 1]
-            self.cur_col += 1
-            self.in_cell = False
-
-    def handle_data(self, data):
-        if self.in_cell:
-            self.cur_cell.append(data)
-
-
-def parse_table_filled(html: str, table_id: str) -> list[list[str]]:
-    p = GridTableParser(table_id)
-    try:
-        p.feed(html)
-    except Exception:
-        pass
-    return p.rows
-
-
-def _first_matching_table(html: str, table_ids, filled: bool = False) -> list[list[str]]:
-    parse = parse_table_filled if filled else parse_table
-    for table_id in table_ids:
-        rows = parse(html, table_id)
-        if rows:
-            return rows
-    return []
-
-
-def _iframe_srcs(html: str) -> list[str]:
-    return [m.group(1) for m in re.finditer(r'<iframe[^>]*\bsrc=["\']([^"\']+)["\']', html, re.I)]
-
-
-# ---------------------------------------------------------------------------
-# 5. Session 過期自動續命（entquery 這類頁面逾時會出現 btnReLogon 表單）
-# ---------------------------------------------------------------------------
-
-def _has_relogon_form(html: str) -> bool:
-    return "btnReLogon" in html
-
-
-def _post_relogon(opener, url, html):
-    data = urllib.parse.urlencode(
-        {
-            "__VIEWSTATE": extract_input(html, "__VIEWSTATE"),
-            "__VIEWSTATEGENERATOR": extract_input(html, "__VIEWSTATEGENERATOR"),
-            "__EVENTVALIDATION": extract_input(html, "__EVENTVALIDATION"),
-            "btnReLogon": extract_input(html, "btnReLogon") or "重新登入",
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    req.add_header("Referer", url)
-    return _read(opener, req, timeout=40)
-
-
-def _open_with_relogon(opener, req_or_url, timeout: int = 30, max_retry: int = 2) -> tuple[str, str]:
-    html, url = _read(opener, req_or_url, timeout=timeout)
-    retry = 0
-    while _has_relogon_form(html) and retry < max_retry:
-        html, url = _post_relogon(opener, url, html)
-        retry += 1
-    return html, url
-
-
-# ---------------------------------------------------------------------------
-# 6. EE Maintenance Record 查詢
-# ---------------------------------------------------------------------------
-
-def _ee_oper_fields(html: str, entity: str) -> dict:
-    """DropDownCheckBoxes1 的站別代碼是動態產生的，不要寫死 index，改成從表單 HTML
-    解析每個 checkbox 對應的站別文字，找出符合 entity 的 checkbox 就標成勾選。
-    避免站別代碼改版後對照失準。"""
-    fields = {}
-    pattern = re.compile(
-        r'<input[^>]*type=["\']checkbox["\'][^>]*name=["\'](DropDownCheckBoxes1\$[^"\']+)["\'][^>]*>'
-        r'([^<]{0,40})',
-        re.I,
-    )
-    for m in pattern.finditer(html):
-        field_name, label_text = m.group(1), m.group(2).strip()
-        if entity in label_text:
-            fields[field_name] = "on"
-    return fields
-
-
-def fetch_ee_maintenance(
-    start_date: str,
-    end_date: str,
-    ee_entity: str = "DA",
-    ee_etag: str = "None(P,R,S,QC)",
-    opener: urllib.request.OpenerDirector | None = None,
-) -> list[list[str]]:
-    """登入 APG 站並查詢 EE Maintenance Record，回傳 parse_table 出來的 rows。"""
+    date_start/date_end格式跟原本Selenium版一致，YYYYMMDD。
+    entity_pattern是機台代號萬用字元查詢(例如"B*")，對應原始表單裡的txtentity欄位。
+    """
     opener = opener or login()
 
     req = urllib.request.Request(EE_FRAME_URL)
     req.add_header("Referer", EE_REFERER_URL)
-    html_form, form_url = _open_with_relogon(opener, req)
+    html_form, form_url = _read(opener, req)
     if is_auth_fail(html_form, form_url):
-        raise CpisAuthError("EE 驗證失敗（取表單）")
+        raise CpisAuthError("EE驗證失敗(取表單)")
 
-    post = {
-        "__VIEWSTATE": extract_input(html_form, "__VIEWSTATE"),
-        "__VIEWSTATEGENERATOR": extract_input(html_form, "__VIEWSTATEGENERATOR"),
-        "__EVENTVALIDATION": extract_input(html_form, "__EVENTVALIDATION"),
-        "txtStart_date": start_date,
-        "txtEnd_date": end_date,
-        "ddl_shift": "None",
-        "ddl_floor": "A2",
-        "ddl_etag": ee_etag,
-        "dllDept": "None",
-        "ddl_bd_id": "None",
-        "oper_type": "WD",
-        "txt_oper_type": "0",
-        "txtJobCode": "",
-        "txtEngineer": "",
-        "txtAssyLot": "",
-        "txtProduct": "",
-        "btnFetch": "Fetch",
-    }
-    post.update(_ee_oper_fields(html_form, ee_entity))
+    # 先複製表單目前所有欄位的值(包含VIEWSTATE等隱藏欄位)，只覆蓋我們真正要改的幾個，
+    # 其餘欄位維持頁面預設值，避免亂猜欄位值反而讓查詢條件跟預期不同
+    fields = extract_form_fields(html_form)
+    fields["txtStart_date"] = date_start
+    fields["txtEnd_date"] = date_end
+    if "txtentity" in fields:
+        fields["txtentity"] = entity_pattern
 
-    data = urllib.parse.urlencode(post).encode("utf-8")
-    req2 = urllib.request.Request(EE_FRAME_URL, data=data, method="POST")
-    req2.add_header("Content-Type", "application/x-www-form-urlencoded")
-    req2.add_header("Referer", EE_FRAME_URL)
-    html_result, final_url = _open_with_relogon(opener, req2, timeout=60)
+    # Operation「Select all」：原始頁面用DropDownCheckBoxes1_sll這個checkbox觸發JS
+    # 把底下每個站別checkbox(DropDownCheckBoxes1$xxx)全部勾選，這裡直接把偵測到的
+    # 每一個都設成"on"，效果相同(勾「Select all」全選才不會讓查詢條件互相打架變成No Data)
+    if "DropDownCheckBoxes1_sll" in fields:
+        fields["DropDownCheckBoxes1_sll"] = "on"
+    for name in list(fields):
+        if name.startswith("DropDownCheckBoxes1$"):
+            fields[name] = "on"
 
+    fields["btnFetch"] = fields.get("btnFetch") or "Fetch"
+
+    html_result, final_url = _post_form(opener, EE_FRAME_URL, fields, referer=EE_FRAME_URL, timeout=60)
     if is_auth_fail(html_result, final_url):
-        raise CpisAuthError("EE POST 驗證失敗")
+        raise CpisAuthError("EE POST驗證失敗")
 
-    return _first_matching_table(html_result, EE_TABLE_IDS, filled=True)
+    return html_result
 
 
 # ---------------------------------------------------------------------------
-# 7. Utilization Analysis 查詢
+# Utilization Analysis：APG子系統獨立登入 -> 直接GET資料頁 -> 回傳結果HTML列表
 # ---------------------------------------------------------------------------
 
-def _utilization_data_url(start_date: str, end_date: str, util_oper: str) -> str:
+def _utilization_data_url(date_start, date_end, util_oper):
     return (
         UTIL_BASE + UTIL_DATA_PATH +
         "?sort_by=&ismfgmc=&HidCount=&paging=False&shift=None"
-        f"&start_date={start_date}&end_date={end_date}"
+        f"&start_date={date_start}&end_date={date_end}"
         f"&operation={urllib.parse.quote(util_oper)}"
         "&types=p&isinlinecombine=&bd_id=None&getqty=N&sort=None&pline="
     )
 
 
-def fetch_utilization(
-    start_date: str,
-    end_date: str,
-    util_oper: str = "DA",
-    max_frame_depth: int = 2,
-) -> list[list[str]]:
-    """走 APG 子系統獨立登入查詢 Utilization Analysis，登入成功會直接 redirect 到資料頁。
-    回傳的 rows 已把多個候選表格 id 合併、rowspan 展開；若主頁面找不到表格會遞迴掃描
-    內嵌 iframe。"""
+def _iframe_srcs(html):
+    return [m.group(1) for m in re.finditer(r'<i?frame[^>]*\bsrc=["\']([^"\']+)["\']', html, re.I)]
+
+
+def _login_utilization(date_start, date_end, util_oper):
     cfg = config.load()
     config.require(cfg, "util_user", "util_password")
 
-    data_url = _utilization_data_url(start_date, end_date, util_oper)
+    data_url = _utilization_data_url(date_start, date_end, util_oper)
     login_url = UTIL_BASE + "/APG/Logon.aspx?ReturnUrl=" + urllib.parse.quote(
         data_url.replace(UTIL_BASE, ""), safe=""
     )
 
     opener = build_opener()
     login_html, _ = _read(opener, login_url, timeout=20)
-
-    payload = urllib.parse.urlencode(
-        {
-            "__VIEWSTATE": extract_input(login_html, "__VIEWSTATE"),
-            "__VIEWSTATEGENERATOR": extract_input(login_html, "__VIEWSTATEGENERATOR"),
-            "__EVENTVALIDATION": extract_input(login_html, "__EVENTVALIDATION"),
-            "UserName": cfg["util_user"],
-            "Password": cfg["util_password"],
-            "Login.x": "61",
-            "Login.y": "5",
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(login_url, data=payload, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    req.add_header("Referer", login_url)
-    html, final_url = _open_with_relogon(opener, req, timeout=60)
-
+    payload = {
+        "__VIEWSTATE": extract_input(login_html, "__VIEWSTATE"),
+        "__VIEWSTATEGENERATOR": extract_input(login_html, "__VIEWSTATEGENERATOR"),
+        "__EVENTVALIDATION": extract_input(login_html, "__EVENTVALIDATION"),
+        "UserName": cfg["util_user"],
+        "Password": cfg["util_password"],
+        "Login.x": "61",
+        "Login.y": "5",
+    }
+    html, final_url = _post_form(opener, login_url, payload, referer=login_url, timeout=60)
     if is_auth_fail(html, final_url):
-        raise CpisAuthError("Utilization 驗證失敗")
+        raise CpisAuthError("Utilization驗證失敗")
+    return opener, html, final_url
 
-    return _scan_utilization_tables(opener, html, final_url, max_frame_depth)
 
-
-def _scan_utilization_tables(opener, html: str, url: str, depth: int) -> list[list[str]]:
-    """多表格合併：把每個候選 table id 找到的 rows 都接起來；找不到表格且頁面帶
-    iframe 時遞迴掃描 iframe（處理 CPIS 舊版把資料放進內嵌 frame 的情況）。"""
-    merged: list[list[str]] = []
-    for table_id in UTIL_TABLE_IDS:
-        merged.extend(parse_table_filled(html, table_id))
-
-    if merged or depth <= 0:
-        return merged
+def _collect_html_recursive(opener, html, url, depth):
+    """
+    遞迴掃描frame/iframe，把每一層的HTML都收集起來(對應原本Selenium版
+    collect_all_tables_recursive遞迴掃描所有frame的邏輯)。直接GET資料頁通常
+    已經是自包含的完整頁面，不會再有巢狀frame，這裡是保險，真的遇到才會用到。
+    """
+    htmls = [html]
+    if depth <= 0:
+        return htmls
 
     for src in _iframe_srcs(html):
         frame_url = urllib.parse.urljoin(url, src)
         try:
-            frame_html, frame_final_url = _open_with_relogon(opener, frame_url, timeout=30)
-        except Exception:
+            frame_html, frame_final_url = _read(opener, frame_url, timeout=30)
+        except (urllib.error.URLError, OSError):
             continue
         if is_auth_fail(frame_html, frame_final_url):
             continue
-        rows = _scan_utilization_tables(opener, frame_html, frame_final_url, depth - 1)
-        if rows:
-            return rows
+        htmls.extend(_collect_html_recursive(opener, frame_html, frame_final_url, depth - 1))
 
-    return merged
+    return htmls
+
+
+def fetch_utilization_html(date_start, date_end, util_oper="DA", max_attempts=MAX_QUERY_ATTEMPTS):
+    """
+    走APG子系統獨立登入查詢Utilization Analysis，登入成功會直接redirect到資料頁。
+    回傳HTML字串清單(通常只有一個元素)，交給cpis_utilization_scraper.py用
+    BeautifulSoup解析每個頁面的<table>再合併(跟原本Selenium版的parse_tables邏輯
+    完全一致)。查詢途中若偵測到session過期，最多重試max_attempts次(重新登入)。
+    """
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            opener, html, final_url = _login_utilization(date_start, date_end, util_oper)
+            if RELOGON_MARKER in html:
+                # entquery這類頁面逾時會出現重新登入表單，直接視為本次嘗試失敗，重登再試
+                raise CpisAuthError("查詢途中session過期(偵測到重新登入表單)")
+            return _collect_html_recursive(opener, html, final_url, MAX_FRAME_DEPTH)
+        except CpisAuthError as e:
+            last_err = e
+    raise last_err

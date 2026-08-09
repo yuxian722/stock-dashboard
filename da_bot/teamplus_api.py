@@ -1,0 +1,156 @@
+# -*- coding: utf-8 -*-
+"""
+team+ HTTP API 模組(08/06新增)
+
+取代原本用Selenium操控瀏覽器讀/送team+訊息的做法。經同事(APG_TeamplusBot專案)
+逆向出team+網頁客戶端實際呼叫的後端API，改用urllib直接發HTTP請求，完全不需要
+Edge/Selenium/除錯模式——這條路線這天debug了快一整天都不穩定，改用API後
+team+這部分的穩定性應該會好非常多。
+
+原理(與同事teamplus_push.py/teamplus_bot.py的邏輯一致)：
+  讀新訊息：POST ChatMainHandler.ashx  action=getNewestMessageList
+  送訊息：  POST SendMsgHandler.ashx   action=sendChatMessage
+  兩者都靠瀏覽器登入後的Cookie驗證身分，不需要帳密。
+
+用法：
+    import teamplus_api
+    texts, new_cursor = teamplus_api.read_new_messages(cursor)
+    ok, desc = teamplus_api.send_message("要送出的文字")
+
+前置：
+    da_bot資料夾下要有 teamplus_cookie.txt，內容是從瀏覽器F12開發者工具->
+    網路分頁->任一個team+請求->標頭->要求標頭->cookie 那一整串複製出來的。
+    這組cookie有時效性，過期時send_message/read_new_messages會回傳失敗，
+    訊息會提示需要重新用F12抓一次新的cookie。
+"""
+import os
+import sys
+import json
+import uuid
+import ssl
+import urllib.request
+import urllib.parse
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+COOKIE_PATH = os.path.join(SCRIPT_DIR, "teamplus_cookie.txt")
+
+READ_URL = "https://teamplus.chipmos.com/EIM/Chat/ChatMainHandler.ashx"
+SEND_URL = "https://teamplus.chipmos.com/EIM/Common/SendMsgHandler.ashx"
+PAGE_URL = "https://teamplus.chipmos.com/EIM/Messenger/MessengerMain.aspx"
+
+# 08/06從F12開發者工具實際抓到、確認可用的「機器人推播」室設定
+CHAT_ID = "702193c7-0029-4b5c-a819-4fa17fdf4f16"
+CHANNEL_TYPE = "1"
+MOBILE = "903"  # 使用者(余毓賢)自己帳號的內部代碼，讀/送訊息都要帶
+RECIPIENTS = [{"Mobile": "903", "Email": ""}]
+
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
+
+
+def load_cookie():
+    if not os.path.exists(COOKIE_PATH):
+        print(f"[錯誤] 找不到 {COOKIE_PATH}")
+        print("       請依說明用F12開發者工具抓team+的cookie，存成這個檔案")
+        sys.exit(1)
+    with open(COOKIE_PATH, "r", encoding="utf-8") as f:
+        cookie = f.read().strip()
+    if not cookie:
+        print(f"[錯誤] {COOKIE_PATH} 是空的")
+        sys.exit(1)
+    return cookie
+
+
+def read_new_messages(cursor=None):
+    """
+    讀「機器人推播」室裡比cursor新的訊息。
+    cursor是上次讀到的最新BatchID，第一次呼叫可傳None(會拿到目前最新一批，
+    之後用回傳的new_cursor接續)。
+    回傳 (texts, new_cursor)，texts是純文字內容清單(按時間順序)；
+    如果cookie過期或請求失敗，回傳 ([], cursor)(cursor不變)，並印出錯誤訊息。
+    """
+    cookie = load_cookie()
+    body = urllib.parse.urlencode({
+        "action": "getNewestMessageList",
+        "ChannelType": CHANNEL_TYPE,
+        "Mobile": MOBILE,
+        "ChatID": CHAT_ID,
+        "NewestBatchID": cursor or "",
+        "FromNearline": "false",
+        "LoadCount": "25",
+    }).encode("utf-8")
+    req = urllib.request.Request(READ_URL, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+    req.add_header("Accept", "application/json, text/javascript, */*; q=0.01")
+    req.add_header("X-Requested-With", "XMLHttpRequest")
+    req.add_header("Referer", PAGE_URL)
+    req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+    req.add_header("Cookie", cookie)
+    try:
+        with urllib.request.urlopen(req, context=_SSL_CTX, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[警告] 讀取team+訊息失敗(可能cookie過期，需要重新用F12抓一組新的): {type(e).__name__}: {e}")
+        return [], cursor
+
+    msg_list = data.get("MessageList") or []
+    if not msg_list:
+        return [], cursor
+
+    texts = [m.get("MsgContent", "") for m in msg_list if m.get("MsgContent")]
+    # 用這批訊息裡最大的BatchID當作下次的cursor，避免重複讀到同一批
+    new_cursor = cursor
+    for m in msg_list:
+        bid = m.get("BatchID")
+        if bid:
+            new_cursor = bid
+    return texts, new_cursor
+
+
+def send_message(message):
+    """
+    送一則訊息到「機器人推播」室。
+    回傳 (ok: bool, desc: str)。
+    """
+    cookie = load_cookie()
+    data = {
+        "action": "sendChatMessage",
+        "batchID": str(uuid.uuid4()),
+        "ChannelType": CHANNEL_TYPE,
+        "ChatID": CHAT_ID,
+        "Recipients": json.dumps(RECIPIENTS, ensure_ascii=False, separators=(",", ":")),
+        "GroupList": "[]",
+        "MsgContent": message,
+        "Content2": "",
+        "MsgType": "1",
+        "FileList": "",
+        "SourceType": "1",
+        "AtUsers": "[]",
+        "replyBatchID": "",
+        "UrlPreviewList": "%5B%5D",
+    }
+    encoded = urllib.parse.urlencode(data).encode("utf-8")
+    req = urllib.request.Request(SEND_URL, data=encoded, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+    req.add_header("Accept", "application/json, text/javascript, */*; q=0.01")
+    req.add_header("X-Requested-With", "XMLHttpRequest")
+    req.add_header("Referer", PAGE_URL)
+    req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                 "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+    req.add_header("Cookie", cookie)
+    try:
+        with urllib.request.urlopen(req, context=_SSL_CTX, timeout=15) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            if result.get("IsSuccess"):
+                return True, "發送成功"
+            return False, result.get("Description", "未知錯誤(可能cookie過期，需要重新用F12抓一組新的)")
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+if __name__ == "__main__":
+    # 簡單測試：python teamplus_api.py 送一則測試訊息
+    msg = sys.argv[1] if len(sys.argv) > 1 else "[測試] teamplus_api.py 連線測試"
+    ok, desc = send_message(msg)
+    print(("✓" if ok else "✗"), desc)

@@ -1,11 +1,21 @@
 __pycache__/
 *.pyc
 
-# 真實帳密設定檔，不進版控（用 config.txt.example 當範本）
+# 真實帳密/session設定檔，不進版控（用 config.txt.example 當範本）
 da_bot/config.txt
+da_bot/cpis_credentials.txt
+da_bot/teamplus_cookie.txt
 
-# SQLite 資料庫
+# SQLite 資料庫（含測試/正式資料）
 da_bot/*.db
 da_bot/*.db-journal
 da_bot/*.db-wal
 da_bot/*.db-shm
+
+# 執行期產生的狀態/紀錄檔
+da_bot/listener_state.txt
+da_bot/push_log.txt
+
+# Selenium附身模式殘留物（CPIS/health_dashboard已不需要，其餘手動除錯工具本機自備即可）
+da_bot/msedgedriver.exe
+da_bot/edge_debug_profile/
