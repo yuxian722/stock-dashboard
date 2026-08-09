@@ -2,7 +2,7 @@
 
 在能連到 CPIS 內網、且已經設定好 config.txt 的機器上執行：
 
-    python _probe_entity_status.py ee 20260801 20260809 B*
+    python _probe_entity_status.py ee 20260801 20260809 BA*
     python _probe_entity_status.py util 20260809 20260809
 
 用來確認 cpis_api.py 能不能正確登入、抓到表格資料，沒問題後再接回
@@ -60,11 +60,11 @@ def main():
 
     try:
         if mode == "ee":
-            entity_pattern = sys.argv[4] if len(sys.argv) > 4 else "*"
+            entity_pattern = sys.argv[4] if len(sys.argv) > 4 else "BA*"
             probe_ee(date_start, date_end, entity_pattern)
         else:
             probe_util(date_start, date_end)
-    except cpis_api.CpisAuthError as e:
+    except (cpis_api.CpisAuthError, ValueError) as e:
         print(f"[錯誤] {e}")
         sys.exit(1)
 

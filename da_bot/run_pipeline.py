@@ -14,7 +14,9 @@ import datetime
 import os
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ENTITY_PATTERN = "B*"  # 依使用者偏好，固定用有範圍的萬用字元，避免對CPIS系統造成過大負擔
+ENTITY_PATTERN = "BA*"  # 依使用者偏好，固定用有範圍的萬用字元，避免對CPIS系統造成過大負擔
+# 注意：CPIS的txtentity欄位規定扣掉萬用字元後至少要有2個字元，"B*"實測會被
+# CPIS前端擋掉(彈alert、查不到任何資料)，改用"BA*"才符合規則。
 
 LOG_PATH = os.path.join(SCRIPT_DIR, "push_log.txt")
 

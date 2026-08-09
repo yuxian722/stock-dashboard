@@ -55,6 +55,31 @@ class TestUtilizationDataUrl(unittest.TestCase):
         self.assertTrue(url.startswith(cpis_api.UTIL_BASE + cpis_api.UTIL_DATA_PATH))
 
 
+class TestCheckEntityPattern(unittest.TestCase):
+    def test_two_literal_chars_ok(self):
+        cpis_api._check_entity_pattern("BA*")  # 不應該丟例外
+
+    def test_full_code_without_wildcard_ok(self):
+        cpis_api._check_entity_pattern("BA205")  # 不應該丟例外
+
+    def test_empty_rejected(self):
+        with self.assertRaises(ValueError):
+            cpis_api._check_entity_pattern("")
+
+    def test_none_rejected(self):
+        with self.assertRaises(ValueError):
+            cpis_api._check_entity_pattern(None)
+
+    def test_single_literal_char_rejected(self):
+        # CPIS實測會被擋："B*"扣掉萬用字元只剩1個字元
+        with self.assertRaises(ValueError):
+            cpis_api._check_entity_pattern("B*")
+
+    def test_only_wildcards_rejected(self):
+        with self.assertRaises(ValueError):
+            cpis_api._check_entity_pattern("*")
+
+
 class TestIframeSrcs(unittest.TestCase):
     def test_extracts_frame_and_iframe(self):
         html = '<frame src="/a.aspx"></frame><iframe src="/b.aspx"></iframe>'

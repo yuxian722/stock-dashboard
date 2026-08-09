@@ -217,17 +217,33 @@ def _ee_oper_fields(html_form, ee_entity):
     return fields
 
 
-def fetch_ee_maintenance_html(date_start, date_end, entity_pattern="*", ee_entity="ALL", opener=None):
+def _check_entity_pattern(entity_pattern):
+    """
+    CPIS的txtentity欄位有前端驗證：不可為空，且扣掉萬用字元(*/?)後至少要有2個
+    字元，否則會直接跳出alert擋掉整次查詢(伺服器只回一小段<script>alert(...)</script>，
+    不是正常結果頁，我們自己送出前先擋掉比較清楚，不要等CPIS回傳警告才發現)。
+    """
+    literal_len = len((entity_pattern or "").replace("*", "").replace("?", ""))
+    if literal_len < 2:
+        raise ValueError(
+            f"entity_pattern={entity_pattern!r} 不符合CPIS規則：不可為空，"
+            "且扣掉萬用字元(*/?)後至少要有2個字元(例如用'BA*'而不是'B*')"
+        )
+
+
+def fetch_ee_maintenance_html(date_start, date_end, entity_pattern="BA*", ee_entity="ALL", opener=None):
     """
     登入APG站並查詢EE Maintenance Record，回傳查詢結果頁的原始HTML(字串)，
     交給cpis_scraper.py用BeautifulSoup解析(跟原本Selenium版的parse_result_table
     邏輯完全一致，只是HTML的來源從driver.page_source換成這裡回傳的字串)。
 
     date_start/date_end格式跟原本Selenium版一致，YYYYMMDD。
-    entity_pattern是機台代號萬用字元查詢(例如"B*")，對應表單裡的txtentity欄位。
+    entity_pattern是機台代號萬用字元查詢(例如"BA*")，對應表單裡的txtentity欄位；
+    CPIS規定不可為空，且扣掉萬用字元後至少要有2個字元(實測"B*"會被擋，"BA*"可以)。
     ee_entity是Operation多選要勾哪些站別，預設"ALL"(全選，等同原本Selenium版點
     「Select all」的效果)，機台範圍改用entity_pattern篩選。
     """
+    _check_entity_pattern(entity_pattern)
     opener = opener or login()
 
     req = urllib.request.Request(EE_FRAME_URL)

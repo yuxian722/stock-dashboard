@@ -7,9 +7,10 @@ CPIS EE Maintenance Record 自動抓取腳本(改版：cpis_api HTTP請求，取
 
 用法:
     python cpis_scraper.py 20260716 20260717
-    python cpis_scraper.py 20260716 20260717 B*
+    python cpis_scraper.py 20260716 20260717 BA*
 (參數: 起始日期、結束日期，格式YYYYMMDD；不帶參數則預設抓昨天到今天；
- 第三個參數是entity萬用字元查詢，預設"*")
+ 第三個參數是entity萬用字元查詢，預設"BA*"。CPIS規定這個欄位不可為空，
+ 且扣掉萬用字元(*/?)後至少要有2個字元，"B*"這種只有1個字元會被CPIS擋掉)
 
 前置:
     da_bot資料夾下要有 config.txt(複製 config.txt.example 改名，填入
@@ -150,13 +151,13 @@ if __name__ == "__main__":
         date_start = yesterday.strftime("%Y%m%d")
         date_end = today.strftime("%Y%m%d")
 
-    entity_pattern = sys.argv[3] if len(sys.argv) >= 4 else "*"
+    entity_pattern = sys.argv[3] if len(sys.argv) >= 4 else "BA*"
 
     print(f"查詢區間: {date_start} ~ {date_end}, Entity範圍: {entity_pattern}")
 
     try:
         html = cpis_api.fetch_ee_maintenance_html(date_start, date_end, entity_pattern)
-    except cpis_api.CpisAuthError as e:
+    except (cpis_api.CpisAuthError, ValueError) as e:
         print(f"[錯誤] {e}")
         sys.exit(1)
 
