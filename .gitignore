@@ -6,11 +6,11 @@ da_bot/config.txt
 da_bot/cpis_credentials.txt
 da_bot/teamplus_cookie.txt
 
-# SQLite 資料庫（含測試/正式資料）
-da_bot/*.db
-da_bot/*.db-journal
-da_bot/*.db-wal
-da_bot/*.db-shm
+# SQLite 資料庫（含測試/正式資料，也涵蓋tests/底下手動測試時意外產生的檔案）
+da_bot/**/*.db
+da_bot/**/*.db-journal
+da_bot/**/*.db-wal
+da_bot/**/*.db-shm
 
 # 執行期產生的狀態/紀錄檔
 da_bot/listener_state.txt
