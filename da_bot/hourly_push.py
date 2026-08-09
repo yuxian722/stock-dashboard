@@ -139,6 +139,57 @@ def get_setup_group_stats():
     return stats
 
 
+# PM/REPAIR/SETUP Monitor頁面的STATUS代碼(cpis_pm_monitor_scraper.py抓的
+# 即時機況)顯示用中文名稱，跟query_bot.py的_PM_STATUS_ZH對照一致
+_PM_STATUS_LABELS = [
+    ("IN-REPAIR", "修機中"), ("WAIT-REPAIR", "等待修機"),
+    ("SETUP", "改機中"), ("WAIT-SETUP", "等待改機"),
+    ("PM", "保養中"), ("ENG", "工程異常"),
+]
+
+
+def get_pm_monitor_group_stats():
+    """
+    從pm_monitor_record最新一批快照(cpis_pm_monitor_scraper.py抓的PM/REPAIR/
+    SETUP Monitor即時機況)依機型群組(ESEC/DB/LOC/FC)統計各STATUS台數，是CPIS
+    當下真正的異常機況清單，不是像get_setup_group_stats()那樣從EE Maintenance
+    歷史紀錄推算的近似值。回傳{group: {status_code: 台數}}；這個資料表用
+    Selenium無頭瀏覽器抓，比較容易受環境影響、可能還沒抓過，資料表不存在或
+    是空的時候回傳空dict(呼叫端要優雅跳過，不能讓整個推播訊息掛掉)。
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT MAX(fetched_at) FROM pm_monitor_record")
+    except sqlite3.OperationalError:
+        conn.close()
+        return {}
+    row = cur.fetchone()
+    latest = row[0] if row else None
+    if not latest:
+        conn.close()
+        return {}
+
+    cur.execute("SELECT entity, status FROM pm_monitor_record WHERE fetched_at = ?", (latest,))
+    rows = cur.fetchall()
+    conn.close()
+
+    stats = {g: {} for g in ("ESEC", "DB", "LOC", "FC")}
+    for r in rows:
+        g = _group_for_machine(r["entity"])
+        if g is None:
+            continue
+        stats[g][r["status"]] = stats[g].get(r["status"], 0) + 1
+    return stats
+
+
+def _pm_stats_line(label, group_stats, indent=""):
+    field_parts = [f"{zh}{group_stats[code]}" for code, zh in _PM_STATUS_LABELS if group_stats.get(code)]
+    if not field_parts:
+        return None
+    return f"{indent}{label}  " + " ".join(field_parts)
+
+
 def _to_float_percent(s):
     """把 '54.5 %' 這種字串轉成浮點數 54.5，轉不了回傳None"""
     try:
@@ -244,6 +295,28 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
     parts.append(_setup_stats_line("└DB", db, " "))
     parts.append(_setup_stats_line("LOC", loc))
     parts.append(_setup_stats_line("FlipChip", fc))
+
+    # ⚡ 即時機況：來源是PM/REPAIR/SETUP Monitor頁面的真實快照(不是像上面
+    # 「今日改機統計」那樣用EE Maintenance歷史紀錄推算的近似值)。這個資料源
+    # 可能還沒抓過或抓取失敗，抓不到資料時整段跳過，不影響其他推播內容
+    pm_stats = get_pm_monitor_group_stats()
+    if any(pm_stats.get(g) for g in ("ESEC", "DB", "LOC", "FC")):
+        epoxy_pm = {}
+        for g in ("ESEC", "DB"):
+            for code, cnt in pm_stats.get(g, {}).items():
+                epoxy_pm[code] = epoxy_pm.get(code, 0) + cnt
+        lines = [
+            _pm_stats_line("EPOXY", epoxy_pm),
+            _pm_stats_line("├ESEC", pm_stats.get("ESEC", {}), " "),
+            _pm_stats_line("└DB", pm_stats.get("DB", {}), " "),
+            _pm_stats_line("LOC", pm_stats.get("LOC", {})),
+            _pm_stats_line("FlipChip", pm_stats.get("FC", {})),
+        ]
+        lines = [ln for ln in lines if ln is not None]
+        if lines:
+            parts.append("")
+            parts.append("⚡ 即時機況(PM Monitor)")
+            parts.extend(lines)
 
     # ⏰ 超時機台：改機中/修機中(進行中且超過標準工時) + 待改/待修(還在排隊等待中)
     ongoing = get_ongoing_records()

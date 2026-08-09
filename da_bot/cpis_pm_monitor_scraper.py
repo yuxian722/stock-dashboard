@@ -31,7 +31,9 @@ debugging-port接到已經開著的瀏覽器，公司網路環境下常常啟動
 單獨測試(不用寫程式，直接看結果)：
     python cpis_pm_monitor_scraper.py
 """
+import datetime
 import os
+import sqlite3
 import time
 from collections import Counter
 
@@ -45,6 +47,14 @@ PM_MONITOR_URL = (
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DRIVER_PATH = os.path.join(SCRIPT_DIR, "msedgedriver.exe")
+DB_PATH = os.path.join(SCRIPT_DIR, "da_maintenance.db")
+
+# records的key(照CPIS表頭原樣，含空格) -> pm_monitor_record資料表欄位名
+_FIELD_MAP = {
+    "oper": "OPER", "entity": "ENTITY", "model": "MODEL", "status": "STATUS",
+    "lot_no": "LOT NO", "bond_id": "Bond ID", "wip": "WIP", "in_time": "IN TIME",
+    "outplan": "OUTPLAN", "jcode": "JCODE", "operator": "OPERATOR",
+}
 
 # JS把Syncfusion Grid畫出來要等多久，太短可能表格還沒渲染完、抓到空表格
 WAIT_SECONDS = 15
@@ -269,6 +279,40 @@ def fetch_pm_monitor_records(wait_seconds=WAIT_SECONDS, oper_kind="D/A"):
     return parse_pm_monitor_html(html)
 
 
+def save_to_db(records, db_path=DB_PATH):
+    """
+    把抓到的機況快照存進SQLite，對應hourly_push.py/query_bot.py共用的
+    pm_monitor_record資料表。這個頁面本身就是「目前異常機況清單」(Auto
+    Refresh)，不是像EE Maintenance那樣要累積歷史紀錄，所以每次都整批
+    覆蓋(先清空、再寫入這次抓到的快照)，只保留最新一次的狀態。
+    """
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS pm_monitor_record (
+        oper TEXT, entity TEXT, model TEXT, status TEXT,
+        lot_no TEXT, bond_id TEXT, wip TEXT, in_time TEXT,
+        outplan TEXT, jcode TEXT, operator TEXT,
+        fetched_at TEXT
+    )
+    """)
+    cur.execute("DELETE FROM pm_monitor_record")
+
+    fetched_at = datetime.datetime.now().isoformat(timespec="seconds")
+    cols = list(_FIELD_MAP.keys())
+    placeholders = ",".join("?" * (len(cols) + 1))
+    for r in records:
+        values = [r.get(_FIELD_MAP[c]) for c in cols] + [fetched_at]
+        cur.execute(
+            f"INSERT INTO pm_monitor_record ({','.join(cols)}, fetched_at) VALUES ({placeholders})",
+            values,
+        )
+
+    conn.commit()
+    print(f"[完成] 已寫入 {len(records)} 筆到 {db_path} 的 pm_monitor_record 資料表")
+    conn.close()
+
+
 def _dump_entity_context(html, needle="ENTITY", radius=250, max_hits=3):
     """
     診斷用：直接把html裡"ENTITY"字樣附近的原始內容印出來(而不是再猜表格
@@ -301,3 +345,5 @@ if __name__ == "__main__":
         print(r)
     if not records:
         _dump_entity_context(html)
+    else:
+        save_to_db(records)

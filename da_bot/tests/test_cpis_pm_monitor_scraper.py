@@ -1,10 +1,12 @@
-"""cpis_pm_monitor_scraper.py 的離線單元測試(不連網、不開瀏覽器)：只測純HTML
-解析邏輯(parse_pm_monitor_html)，不測fetch_pm_monitor_html/records(要真的
-開Selenium連CPIS，不適合離線單元測試，只能實機手動跑python cpis_pm_monitor_
-scraper.py驗證)。"""
+"""cpis_pm_monitor_scraper.py 的離線單元測試(不連網、不開瀏覽器)：純HTML
+解析邏輯(parse_pm_monitor_html)、存DB邏輯(save_to_db，用暫存SQLite)，
+不測fetch_pm_monitor_html/records(要真的開Selenium連CPIS，不適合離線
+單元測試，只能實機手動跑python cpis_pm_monitor_scraper.py驗證)。"""
 
 import conftest  # noqa: F401  (設定 sys.path)
 
+import sqlite3
+import tempfile
 import unittest
 
 import cpis_pm_monitor_scraper as pm
@@ -143,6 +145,45 @@ class TestParsePmMonitorHtml(unittest.TestCase):
         records = pm.parse_pm_monitor_html(html)
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["ENTITY"], "BA721")
+
+
+class TestSaveToDb(unittest.TestCase):
+    """這頁本身就是「目前異常機況清單」(Auto Refresh)，不是要累積歷史，
+    每次都整批覆蓋，鎖定：寫入後只留這次的快照(不是越存越多)、欄位對得起來。"""
+
+    def _make_record(self, entity="BA721", status="IN-REPAIR"):
+        return {
+            "OPER": "DA", "ENTITY": entity, "MODEL": "DIE-ATTACH", "STATUS": status,
+            "LOT NO": "V32ABE904", "Bond ID": "", "WIP": "1760",
+            "IN TIME": "2026/08/09 17:29", "OUTPLAN": "2026-08-09 17:44:30",
+            "JCODE": "E", "OPERATOR": "25552",
+        }
+
+    def test_writes_records_with_mapped_columns(self):
+        db_path = tempfile.mktemp(suffix=".db")
+        pm.save_to_db([self._make_record()], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM pm_monitor_record").fetchall()
+        conn.close()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["entity"], "BA721")
+        self.assertEqual(rows[0]["status"], "IN-REPAIR")
+        self.assertEqual(rows[0]["jcode"], "E")
+        self.assertTrue(rows[0]["fetched_at"])
+
+    def test_second_call_replaces_first_snapshot_not_accumulates(self):
+        db_path = tempfile.mktemp(suffix=".db")
+        pm.save_to_db([self._make_record("BA721", "IN-REPAIR")], db_path=db_path)
+        pm.save_to_db([self._make_record("BA231", "SETUP")], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("SELECT entity, status FROM pm_monitor_record").fetchall()
+        conn.close()
+
+        self.assertEqual(rows, [("BA231", "SETUP")])
 
 
 if __name__ == "__main__":

@@ -319,5 +319,67 @@ class TestBuildHourlyPushMessageNewSections(unittest.TestCase):
         self.assertIn("BA801  待改", msg)
 
 
+def _add_pm_monitor_rows(db_path, rows, fetched_at="2026-08-09T17:00:00"):
+    """rows是list of (entity, status)，寫進db_path的pm_monitor_record表(同一批fetched_at)。"""
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pm_monitor_record (
+            oper TEXT, entity TEXT, model TEXT, status TEXT,
+            lot_no TEXT, bond_id TEXT, wip TEXT, in_time TEXT,
+            outplan TEXT, jcode TEXT, operator TEXT, fetched_at TEXT
+        )
+    """)
+    for entity, status in rows:
+        conn.execute(
+            "INSERT INTO pm_monitor_record (entity, status, fetched_at) VALUES (?,?,?)",
+            (entity, status, fetched_at),
+        )
+    conn.commit()
+    conn.close()
+
+
+class TestGetPmMonitorGroupStats(unittest.TestCase):
+    """PM/REPAIR/SETUP Monitor即時機況(cpis_pm_monitor_scraper.py抓的真實
+    快照)依機型群組統計，跟get_setup_group_stats()的EE Maintenance推算值
+    是兩個獨立的資料來源。"""
+
+    def setUp(self):
+        self._orig_db_path = hourly_push.DB_PATH
+
+    def tearDown(self):
+        hourly_push.DB_PATH = self._orig_db_path
+
+    def test_groups_by_machine_prefix_and_counts_status(self):
+        hourly_push.DB_PATH = _make_db_with_records([])
+        _add_pm_monitor_rows(hourly_push.DB_PATH, [
+            ("BA205", "IN-REPAIR"),  # ESEC
+            ("BAA01", "SETUP"),      # DB
+            ("BAA02", "SETUP"),      # DB
+            ("BA801", "WAIT-SETUP"),  # LOC
+        ])
+        stats = hourly_push.get_pm_monitor_group_stats()
+        self.assertEqual(stats["ESEC"], {"IN-REPAIR": 1})
+        self.assertEqual(stats["DB"], {"SETUP": 2})
+        self.assertEqual(stats["LOC"], {"WAIT-SETUP": 1})
+        self.assertEqual(stats["FC"], {})
+
+    def test_missing_table_returns_empty_dict(self):
+        hourly_push.DB_PATH = _make_db_with_records([])
+        self.assertEqual(hourly_push.get_pm_monitor_group_stats(), {})
+
+    def test_push_message_includes_pm_monitor_section_when_data_available(self):
+        hourly_push.DB_PATH = _make_db_with_records([])
+        _add_pm_monitor_rows(hourly_push.DB_PATH, [("BA205", "IN-REPAIR")])
+        msg = hourly_push.build_hourly_push_message()
+        self.assertIn("⚡ 即時機況(PM Monitor)", msg)
+        self.assertIn("EPOXY  修機中1", msg)
+        self.assertIn("├ESEC  修機中1", msg)
+
+    def test_push_message_skips_pm_monitor_section_when_no_data(self):
+        hourly_push.DB_PATH = _make_db_with_records([])
+        msg = hourly_push.build_hourly_push_message()
+        self.assertNotIn("PM Monitor", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

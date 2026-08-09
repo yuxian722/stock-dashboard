@@ -90,6 +90,19 @@ def run_once():
     if not ok_util:
         log("[警告] 稼動率資料更新失敗，訊息裡的rates會顯示暫無，繼續往下推播")
 
+    # PM/REPAIR/SETUP Monitor(即時機況)靠Selenium無頭瀏覽器抓，比其他純HTTP
+    # request的資料源慢、也更容易受電腦上msedgedriver.exe版本/網路狀況影響，
+    # 逾時秒數給寬鬆一點(180秒)，獨立失敗一樣不中止整體流程——抓不到最新
+    # 即時機況的話，查詢/推播該退回用EE Maintenance歷史紀錄推論，不能因此
+    # 連修機/改機提醒都一起停推
+    ok_pm = run_step(
+        ["cpis_pm_monitor_scraper.py"],
+        "更新CPIS即時機況(PM/REPAIR/SETUP Monitor)",
+        timeout=180,
+    )
+    if not ok_pm:
+        log("[警告] 即時機況更新失敗，查詢/推播會退回用EE Maintenance歷史紀錄推論，繼續往下推播")
+
     ok2 = run_step(["teamplus_push.py"], "推播到team+")
     if not ok2:
         log("[失敗] 推播失敗")

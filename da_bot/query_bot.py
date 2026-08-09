@@ -179,14 +179,75 @@ def detail_reply(machine_id: str, date: str = None, e_tag: str = None) -> str:
     return "\n".join(lines)
 
 
+# CPIS PM/REPAIR/SETUP Monitor頁面的STATUS代碼(cpis_pm_monitor_scraper.py
+# 抓的即時機況)，跟畫面上的顏色圖例對照：黃=修機中、藍=保養中、淺綠=改機中、
+# 綠=等待修機、白/灰=等待改機
+_PM_STATUS_ZH = {
+    "IN-REPAIR": "修機中", "WAIT-REPAIR": "等待修機",
+    "SETUP": "改機中", "WAIT-SETUP": "等待改機",
+    "PM": "保養中", "ENG": "工程異常",
+}
+
+
+def get_latest_pm_monitor_status(cur, machine_id):
+    """
+    查pm_monitor_record最新一批快照裡，該機台的即時狀態列。查不到(機台
+    目前不在PM/REPAIR/SETUP Monitor的異常清單裡，或這個資料表還沒抓過)
+    回傳None，呼叫端要自己決定要不要退回用EE Maintenance歷史紀錄推論。
+    """
+    try:
+        cur.execute("SELECT MAX(fetched_at) FROM pm_monitor_record")
+    except sqlite3.OperationalError:
+        return None  # 資料表還不存在(還沒跑過cpis_pm_monitor_scraper.py)
+    row = cur.fetchone()
+    latest = row[0] if row else None
+    if not latest:
+        return None
+    cur.execute("""
+        SELECT status, jcode, operator, in_time, outplan, lot_no, model
+        FROM pm_monitor_record
+        WHERE fetched_at = ? AND entity = ?
+    """, (latest, machine_id))
+    return cur.fetchone()
+
+
+def _elapsed_hours_since(time_str):
+    """PM Monitor的IN TIME是"2026/08/09 17:29"這種格式，算到現在經過幾小時。"""
+    try:
+        dt = datetime.datetime.strptime(time_str, "%Y/%m/%d %H:%M")
+    except (TypeError, ValueError):
+        return None
+    return (datetime.datetime.now() - dt).total_seconds() / 3600.0
+
+
 def live_status_reply(machine_id: str) -> str:
     """
-    回傳機台目前即時狀態。
-    優先找 end_time 是空的(代表還在進行中)最新一筆；
-    沒有進行中的話，回傳最近一筆已結束的紀錄摘要。
+    回傳機台目前即時狀態。優先用PM/REPAIR/SETUP Monitor的即時快照(真的是
+    當下的機況，不是推論的)；查不到該機台(不在異常清單裡，代表正常運作中，
+    或這個資料表還沒抓過)才退回用EE Maintenance歷史紀錄推論——找end_time
+    是空的(代表還在進行中)最新一筆，沒有進行中的話回傳最近一筆已結束的
+    紀錄摘要。
     """
     conn = get_conn()
     cur = conn.cursor()
+
+    pm_row = get_latest_pm_monitor_status(cur, machine_id)
+    if pm_row is not None:
+        status_zh = _PM_STATUS_ZH.get(pm_row["status"], pm_row["status"])
+        lines = [f"{machine_id} 目前狀態(即時): {status_zh}"]
+        if pm_row["jcode"]:
+            lines.append(f"代碼: {pm_row['jcode']}")
+        elapsed = _elapsed_hours_since(pm_row["in_time"])
+        if elapsed is not None:
+            std = get_std_hours(pm_row["jcode"])
+            over_note = f" [已超時](標準{std}hr)" if (std is not None and elapsed > std) else ""
+            lines.append(f"已耗時: {elapsed:.2f}hr{over_note}")
+        if pm_row["operator"]:
+            lines.append(f"人員: {pm_row['operator']}")
+        if pm_row["lot_no"]:
+            lines.append(f"批號: {pm_row['lot_no']}")
+        conn.close()
+        return "\n".join(lines)
 
     cur.execute("""
         SELECT bgn_date, bgn_time, job_code, e_tag, cause, description, engineer_id
