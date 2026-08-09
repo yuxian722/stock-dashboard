@@ -492,16 +492,30 @@ def _pm_status_map(cur):
     查PM Monitor有沒有這台，查不到就當「這個資料表還沒抓過」退回EE Maintenance，
     沒辦法區分「這台真的正常」跟「PM Monitor整批都沒資料」)。
     """
+    rows, has_data = _pm_latest_rows(cur)
+    return {r["entity"]: r["status"] for r in rows}, has_data
+
+
+def _pm_latest_rows(cur):
+    """
+    回傳pm_monitor_record最新一批快照的原始列(entity/status/jcode/operator/
+    in_time)，以及有沒有抓過PM Monitor資料的旗標(has_data)。db_group_reply()
+    的「修機超時機台」清單要用到in_time/operator才能算出修機多久、是誰在修，
+    _pm_status_map()只回傳status不夠用，兩者共用這支底層查詢。
+    """
     try:
         cur.execute("SELECT MAX(fetched_at) FROM pm_monitor_record")
     except sqlite3.OperationalError:
-        return {}, False
+        return [], False
     row = cur.fetchone()
     latest = row[0] if row else None
     if not latest:
-        return {}, False
-    cur.execute("SELECT entity, status FROM pm_monitor_record WHERE fetched_at = ?", (latest,))
-    return {r["entity"]: r["status"] for r in cur.fetchall()}, True
+        return [], False
+    cur.execute("""
+        SELECT entity, status, jcode, operator, in_time
+        FROM pm_monitor_record WHERE fetched_at = ?
+    """, (latest,))
+    return cur.fetchall(), True
 
 
 def _machine_live_status_short(cur, machine_id, pm_status_map=None, pm_has_data=False):
@@ -611,7 +625,10 @@ def db_group_reply(group_names=None) -> str:
     now_str = datetime.datetime.now().strftime("%m/%d %H:%M")
     lines = [f"【{'/'.join(group_names)}機型群組】{now_str}"]
 
-    pm_status_map, pm_has_data = _pm_status_map(cur)
+    pm_rows, pm_has_data = _pm_latest_rows(cur)
+    pm_status_map = {r["entity"]: r["status"] for r in pm_rows}
+    pm_row_by_entity = {r["entity"]: r for r in pm_rows}
+    now = datetime.datetime.now()
 
     for group_name in group_names:
         machine_ids = _group_machine_ids(cur, group_name)
@@ -643,10 +660,24 @@ def db_group_reply(group_names=None) -> str:
                     dr_parts.append(f"{cn}{avg[col]:.1f}%")
             lines.append(f"  downrate(有資料{n_found}/{len(machine_ids)}台): " + " · ".join(dr_parts))
 
-        # 只列有狀況(修機中/改機中)的機台，正常的不逐台列出，避免洗版
-        abnormal = [f"{mid}:{s}" for mid, s in statuses.items() if s != "正常"]
-        if abnormal:
-            lines.append(f"  異常機台: " + "、".join(abnormal))
+        # 異常機台清單：只列「修機中且已經超過1小時」的機台(2026/08/10使用者
+        # 要求)，不再像之前那樣把改機中/工程異常/等待修機全部混在一起列，
+        # 避免洗版又抓不到真正該關注的重點(修機拖太久的機台)。
+        # 沒抓過PM Monitor資料(pm_has_data=False)時沒有in_time可以算修機
+        # 多久，這裡就不列，跟其他仰賴PM Monitor即時快照的功能一致。
+        overtime_repairs = []
+        if pm_has_data:
+            for mid in machine_ids:
+                row = pm_row_by_entity.get(mid)
+                if row is None or row["status"] != "IN-REPAIR":
+                    continue
+                elapsed = hourly_push._pm_elapsed_hours(row["in_time"], now)
+                if elapsed is None or elapsed <= 1.0:
+                    continue
+                operator = row["operator"] or "?"
+                overtime_repairs.append(f"{mid} 修機超時{elapsed:.2f}hr/{operator}")
+        if overtime_repairs:
+            lines.append(f"  異常機台(修機超時1hr以上): " + "、".join(overtime_repairs))
 
     conn.close()
     return "\n".join(lines)

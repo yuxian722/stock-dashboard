@@ -151,7 +151,10 @@ class TestLiveStatusReplyPrefersPmMonitor(unittest.TestCase):
 
 def _make_db_for_group_tests(util_rows=None, pm_rows=None, ee_rows=None, no_pm_table=False):
     """util_rows: list of (model, entity)寫進utilization_record同一批fetched_at。
-    pm_rows: list of (entity, status)寫進pm_monitor_record同一批fetched_at；
+    pm_rows: list寫進pm_monitor_record同一批fetched_at，每個元素可以是
+             (entity, status)這種簡單tuple(其餘欄位補None)，也可以是dict
+             (例如{"entity": "BAA03", "status": "IN-REPAIR", "in_time": "...",
+             "operator": "E"})，測試修機超時清單要用到in_time/operator時用dict；
              no_pm_table=True時完全不建pm_monitor_record表(模擬還沒抓過)。
     ee_rows: list of dict寫進ee_maintenance_record(缺欄位當NULL)。"""
     path = tempfile.mktemp(suffix=".db")
@@ -186,10 +189,17 @@ def _make_db_for_group_tests(util_rows=None, pm_rows=None, ee_rows=None, no_pm_t
             )
         """)
         pm_fetched_at = "2026-08-09T17:00:00"
-        for entity, status in (pm_rows or []):
+        for pm_row in (pm_rows or []):
+            if isinstance(pm_row, dict):
+                entity, status = pm_row.get("entity"), pm_row.get("status")
+                jcode, operator, in_time = pm_row.get("jcode"), pm_row.get("operator"), pm_row.get("in_time")
+            else:
+                entity, status = pm_row
+                jcode, operator, in_time = None, None, None
             conn.execute(
-                "INSERT INTO pm_monitor_record (entity, status, fetched_at) VALUES (?,?,?)",
-                (entity, status, pm_fetched_at),
+                "INSERT INTO pm_monitor_record (entity, status, jcode, operator, in_time, fetched_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (entity, status, jcode, operator, in_time, pm_fetched_at),
             )
     conn.commit()
     conn.close()
@@ -292,6 +302,62 @@ class TestDbGroupReplyUsesPmMonitorForStatus(unittest.TestCase):
         )
         reply = query_bot.db_group_reply(["DB830"])
         self.assertIn("共1台 · 修機1 · 改機0 · 正常0", reply)
+
+
+class TestDbGroupReplyOvertimeRepairList(unittest.TestCase):
+    """異常機台清單改成只顯示「修機中且已經超過1小時」的機台，並附上修機
+    超時多久跟修機人員(2026/08/10使用者要求)，不再把改機中/工程異常/等待
+    修機這些狀態全部混在一起列出來洗版。"""
+
+    def setUp(self):
+        self._orig_db_path = query_bot.DB_PATH
+
+    def tearDown(self):
+        query_bot.DB_PATH = self._orig_db_path
+
+    @staticmethod
+    def _in_time_hours_ago(hours):
+        dt = datetime.datetime.now() - datetime.timedelta(hours=hours)
+        return dt.strftime("%Y/%m/%d %H:%M")
+
+    def test_lists_repair_machine_over_one_hour_with_elapsed_and_operator(self):
+        query_bot.DB_PATH = _make_db_for_group_tests(
+            util_rows=[("DB830", "BAB01")],
+            pm_rows=[{"entity": "BAB01", "status": "IN-REPAIR",
+                      "in_time": self._in_time_hours_ago(2), "operator": "E1"}],
+        )
+        reply = query_bot.db_group_reply(["DB830"])
+        self.assertIn("異常機台(修機超時1hr以上)", reply)
+        self.assertIn("BAB01 修機超時2.0", reply)
+        self.assertIn("/E1", reply)
+
+    def test_excludes_repair_machine_under_one_hour(self):
+        query_bot.DB_PATH = _make_db_for_group_tests(
+            util_rows=[("DB830", "BAB01")],
+            pm_rows=[{"entity": "BAB01", "status": "IN-REPAIR",
+                      "in_time": self._in_time_hours_ago(0.5), "operator": "E1"}],
+        )
+        reply = query_bot.db_group_reply(["DB830"])
+        self.assertNotIn("異常機台", reply)
+
+    def test_excludes_non_repair_status_even_when_over_one_hour(self):
+        query_bot.DB_PATH = _make_db_for_group_tests(
+            util_rows=[("DB830", "BAB01")],
+            pm_rows=[{"entity": "BAB01", "status": "SETUP",
+                      "in_time": self._in_time_hours_ago(3), "operator": "E1"}],
+        )
+        reply = query_bot.db_group_reply(["DB830"])
+        self.assertNotIn("異常機台", reply)
+
+    def test_no_overtime_list_when_pm_monitor_has_no_data(self):
+        query_bot.DB_PATH = _make_db_for_group_tests(
+            util_rows=[("DB830", "BAB01")],
+            ee_rows=[{"machine_id": "BAB01", "bgn_date": "2026-08-09", "bgn_time": "07:00",
+                      "e_tag": "R"}],
+            no_pm_table=True,
+        )
+        reply = query_bot.db_group_reply(["DB830"])
+        self.assertNotIn("異常機台", reply)
 
 
 class TestGetStdHours(unittest.TestCase):
