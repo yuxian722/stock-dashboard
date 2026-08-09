@@ -69,6 +69,40 @@ class TestParsePmMonitorHtml(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["ENTITY"], "BA721")
 
+    def test_finds_data_rows_in_a_separate_table_from_the_header(self):
+        # 實測抓到的真實情況：Syncfusion Grid把表頭跟資料內容拆成兩個不同的
+        # <table>(方便凍結表頭)，表頭那個<table>裡完全沒有資料列。
+        # 這是造成之前"共擷取到0筆"的真正原因，這裡鎖定要能跨table抓到資料。
+        html = """
+        <div class="e-gridheader">
+          <table><tr><th>ENTITY</th><th>STATUS</th></tr></table>
+        </div>
+        <div class="e-gridcontent">
+          <table>
+            <tr><td>BA721</td><td>IN-REPAIR</td></tr>
+            <tr><td>BA231</td><td>SETUP</td></tr>
+          </table>
+        </div>
+        """
+        records = pm.parse_pm_monitor_html(html)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["ENTITY"], "BA721")
+        self.assertEqual(records[1]["ENTITY"], "BA231")
+
+    def test_repeated_frozen_header_row_not_counted_as_data(self):
+        # 凍結表頭機制有時會讓表頭列在畫面上重複出現(例如捲動用的複製列)，
+        # 逐字相同的表頭列不該被當成一筆資料
+        html = """
+        <table>
+          <tr><th>ENTITY</th><th>STATUS</th></tr>
+          <tr><td>ENTITY</td><td>STATUS</td></tr>
+          <tr><td>BA721</td><td>IN-REPAIR</td></tr>
+        </table>
+        """
+        records = pm.parse_pm_monitor_html(html)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["ENTITY"], "BA721")
+
 
 if __name__ == "__main__":
     unittest.main()

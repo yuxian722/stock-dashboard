@@ -206,26 +206,36 @@ def parse_pm_monitor_html(html):
     """
     解析渲染後的HTML，抓OPER/ENTITY/MODEL/STATUS/LOT NO/Bond ID/WIP/
     IN TIME/OUTPLAN/JCODE/OPERATOR這個表格，回傳list of dict(欄位名照表頭原樣)。
+
+    Syncfusion Grid這類元件很常見的做法是把「表頭」跟「資料內容」拆成兩個
+    不同的<table>(方便凍結表頭、內容區單獨捲動)，不是同一個<table>裡表頭
+    加資料列這種單純結構。原本邏輯要求表頭跟資料列在同一個<table>裡，
+    抓到表頭表格(通常沒有資料列，或資料列數=0)就直接回傳，導致實際上真的
+    有資料的表格根本沒被掃到，永遠回傳空清單。
+
+    改成：先找出表頭在哪一列(欄位名稱清單)，再不限定同一個<table>，直接
+    在整份HTML裡找「欄位數跟表頭一樣」的所有<tr>當資料列，跳過表頭本身
+    (表頭列可能因為凍結表頭機制重複出現)。
     """
     soup = BeautifulSoup(html, "html.parser")
-    for table in soup.find_all("table"):
-        rows = table.find_all("tr")
-        if len(rows) < 2:
-            continue
-        header = [c.get_text(strip=True) for c in rows[0].find_all(["td", "th"])]
-        header_upper = [h.upper() for h in header]
-        if "ENTITY" not in header_upper or "STATUS" not in header_upper:
-            continue
+    header = None
+    for tr in soup.find_all("tr"):
+        candidate = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+        candidate_upper = [h.upper() for h in candidate]
+        if "ENTITY" in candidate_upper and "STATUS" in candidate_upper:
+            header = candidate
+            break
 
-        records = []
-        for row in rows[1:]:
-            cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
-            if len(cells) != len(header):
-                continue
-            records.append(dict(zip(header, cells)))
-        return records
+    if header is None:
+        return []
 
-    return []
+    records = []
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+        if len(cells) != len(header) or cells == header or not any(cells):
+            continue
+        records.append(dict(zip(header, cells)))
+    return records
 
 
 def fetch_pm_monitor_records(wait_seconds=WAIT_SECONDS, oper_kind="D/A"):
