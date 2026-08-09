@@ -149,7 +149,7 @@ class TestGetOfficialGroupRates(unittest.TestCase):
 
 
 class TestGroupForMachine(unittest.TestCase):
-    """機台代號→機型群組(ESEC/DB/LOC/FC)，對齊同事Dashboard的getEntityGroup規則。"""
+    """機台代號→機型群組(ESEC/DB/LOC/FC/CM700)，對齊同事Dashboard的getEntityGroup規則。"""
 
     def test_esec_prefixes(self):
         self.assertEqual(hourly_push._group_for_machine("BA205"), "ESEC")
@@ -161,7 +161,17 @@ class TestGroupForMachine(unittest.TestCase):
         self.assertEqual(hourly_push._group_for_machine("BA701"), "DB")
 
     def test_loc_prefix(self):
+        # BA8開頭但不在query_bot.MODEL_GROUPS["CM700"]清單裡的才是LOC，
+        # BA801不在CM700清單裡(2026/08/09使用者確認)
         self.assertEqual(hourly_push._group_for_machine("BA801"), "LOC")
+
+    def test_cm700_machines(self):
+        # 2026/08/09使用者更正：BA8開頭不是全部都是LOC，query_bot.MODEL_GROUPS
+        # 裡已經有實測驗證過的CM700專屬機台清單，直接沿用同一份，不要自己另外
+        # 猜一份BA8範圍規則
+        self.assertEqual(hourly_push._group_for_machine("BA802"), "CM700")
+        self.assertEqual(hourly_push._group_for_machine("BA893"), "CM700")
+        self.assertIn("BA802", hourly_push._CM700_MACHINE_IDS)
 
     def test_fc_prefixes(self):
         self.assertEqual(hourly_push._group_for_machine("BA512"), "FC")
@@ -347,7 +357,7 @@ class TestGetPmMonitorGroupStats(unittest.TestCase):
         hourly_push.DB_PATH = _make_db_with_records([])
         self.assertEqual(
             hourly_push.get_pm_monitor_group_stats(),
-            {"ESEC": {}, "DB": {}, "LOC": {}, "FC": {}},
+            {"ESEC": {}, "DB": {}, "LOC": {}, "FC": {}, "CM700": {}},
         )
 
     def test_push_message_includes_pm_monitor_section_when_data_available(self):
