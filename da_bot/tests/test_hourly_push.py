@@ -289,6 +289,55 @@ class TestGetEpoxyDoneByJcode(unittest.TestCase):
         self.assertEqual(hourly_push.get_epoxy_done_by_jcode(now), {"CED": 1})
 
 
+class TestGetEpoxyDoneByShift(unittest.TestCase):
+    """EPOXY(ESEC+DB)今日已完成改機依早班(07:30~19:30)/夜班(19:30~次日07:30)
+    分類(2026/08/09使用者要求)，跟get_epoxy_done_by_jcode()同一套CED/CEE/CD
+    篩選標準。"""
+
+    def setUp(self):
+        self._orig_db_path = hourly_push.DB_PATH
+
+    def tearDown(self):
+        hourly_push.DB_PATH = self._orig_db_path
+
+    def test_splits_by_day_and_night_shift(self):
+        today = _TEST_NOW.date().isoformat()
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "08:00", "job_code": "CED"},   # 早班
+            {"machine_id": "BA401", "e_tag": "S", "end_date": today, "end_time": "19:00", "job_code": "CED"},   # 早班(19:30前)
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "20:00", "job_code": "CEDO"},  # 夜班
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": "2026-08-10", "end_time": "02:00", "job_code": "CD"},  # 跨午夜的夜班
+        ])
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        result = hourly_push.get_epoxy_done_by_shift(now)
+        self.assertEqual(result, {"早班": 2, "夜班": 2})
+
+    def test_non_changeover_jcode_excluded_from_shift_counts(self):
+        today = _TEST_NOW.date().isoformat()
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "08:00", "job_code": "INK"},
+        ])
+        self.assertEqual(hourly_push.get_epoxy_done_by_shift(_TEST_NOW), {"早班": 0, "夜班": 0})
+
+    def test_non_epoxy_group_excluded_from_shift_counts(self):
+        today = _TEST_NOW.date().isoformat()
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA801", "e_tag": "S", "end_date": today, "end_time": "08:00", "job_code": "CED"},  # LOC
+        ])
+        self.assertEqual(hourly_push.get_epoxy_done_by_shift(_TEST_NOW), {"早班": 0, "夜班": 0})
+
+    def test_total_matches_get_epoxy_done_by_jcode_total(self):
+        today = _TEST_NOW.date().isoformat()
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "08:00", "job_code": "CED"},
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "20:00", "job_code": "CEDO"},
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": today, "end_time": "21:00", "job_code": "CD"},
+        ])
+        by_jcode = hourly_push.get_epoxy_done_by_jcode(_TEST_NOW)
+        by_shift = hourly_push.get_epoxy_done_by_shift(_TEST_NOW)
+        self.assertEqual(sum(by_jcode.values()), sum(by_shift.values()))
+
+
 class TestGetSetupGroupStats(unittest.TestCase):
     """今日改機統計：done(今日完成)算自ee_maintenance_record；in_progress(改機中)/
     waiting(待改)改成算自pm_monitor_record的即時快照(SETUP/WAIT-SETUP)。"""
@@ -365,6 +414,16 @@ class TestBuildHourlyPushMessageNewSections(unittest.TestCase):
         # 逐一列出實際job_code(不再收斂成CED機台這種大類)，加總要等於改機總數
         self.assertIn("CED1台", msg)
         self.assertIn("CEDO1台", msg)
+
+    def test_includes_shift_breakdown(self):
+        # 2026/08/09使用者要求要在推播裡補上早班/夜班改機台數
+        today = _TEST_NOW.date().isoformat()
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "08:00", "job_code": "CED"},   # 早班
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "20:00", "job_code": "CEDO"},  # 夜班
+        ])
+        msg = hourly_push.build_hourly_push_message(now=_TEST_NOW)
+        self.assertIn("早班1台 夜班1台", msg)
 
     def test_overtime_section_shows_placeholder_when_no_pm_monitor_data(self):
         hourly_push.DB_PATH = _make_db_with_records([])
