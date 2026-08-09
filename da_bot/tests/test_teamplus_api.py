@@ -78,6 +78,67 @@ class TestReadNewMessagesFieldNameFallback(unittest.TestCase):
         self.assertEqual(cursor, "old-cursor")
 
 
+class TestReadNewMessagesCursorBootstrap(unittest.TestCase):
+    """team+的getNewestMessageList這支API，NewestBatchID傳空字串會直接回
+    IsSuccess=false"參數錯誤：NewestBatchID"——這是之前即時問答從頭到尾完全
+    沒反應的真正原因：cursor第一次是None，過去的寫法會送出空字串，永遠卡在
+    這個參數錯誤，state["cursor"]永遠初始化不了。改成cursor是None時自動帶一個
+    隨機UUID，這裡鎖定：(1)真的送出去的NewestBatchID不能是空字串，
+    (2)就算這次沒有新訊息，回傳的cursor也要是這次實際用的UUID(不能是None)，
+    不然下一輪又會重新產生一個新的UUID，永遠沒辦法穩定用同一個cursor追蹤下去。
+    """
+
+    def setUp(self):
+        self._orig_load_cookie = teamplus_api.load_cookie
+        self._orig_urlopen = teamplus_api.urllib.request.urlopen
+        teamplus_api.load_cookie = lambda: "fake_cookie=1"
+
+    def tearDown(self):
+        teamplus_api.load_cookie = self._orig_load_cookie
+        teamplus_api.urllib.request.urlopen = self._orig_urlopen
+
+    def test_none_cursor_never_sends_empty_newest_batch_id(self):
+        captured = {}
+
+        def fake_urlopen(req, context=None, timeout=None):
+            body = req.data.decode("utf-8")
+            captured["NewestBatchID"] = teamplus_api.urllib.parse.parse_qs(body)["NewestBatchID"][0]
+            return _FakeResponse({"IsSuccess": True, "MessageList": [], "Description": "查無資料"})
+
+        teamplus_api.urllib.request.urlopen = fake_urlopen
+        teamplus_api.read_new_messages(None)
+        self.assertNotEqual(captured["NewestBatchID"], "")
+
+    def test_bootstrap_with_no_new_messages_returns_nonempty_cursor(self):
+        def fake_urlopen(req, context=None, timeout=None):
+            return _FakeResponse({"IsSuccess": True, "MessageList": [], "Description": "查無資料"})
+
+        teamplus_api.urllib.request.urlopen = fake_urlopen
+        texts, cursor = teamplus_api.read_new_messages(None)
+        self.assertEqual(texts, [])
+        self.assertTrue(cursor)  # 不能是None、也不能是空字串
+
+    def test_bootstrap_cursor_reused_on_next_call_with_no_new_messages(self):
+        # 承上，重點是：下一輪呼叫要能拿這個回傳的cursor繼續用，
+        # 不會又送出空字串重蹈覆轍
+        def fake_urlopen(req, context=None, timeout=None):
+            return _FakeResponse({"IsSuccess": True, "MessageList": [], "Description": "查無資料"})
+
+        teamplus_api.urllib.request.urlopen = fake_urlopen
+        _, cursor1 = teamplus_api.read_new_messages(None)
+
+        captured = {}
+
+        def fake_urlopen2(req, context=None, timeout=None):
+            body = req.data.decode("utf-8")
+            captured["NewestBatchID"] = teamplus_api.urllib.parse.parse_qs(body)["NewestBatchID"][0]
+            return _FakeResponse({"IsSuccess": True, "MessageList": [], "Description": "查無資料"})
+
+        teamplus_api.urllib.request.urlopen = fake_urlopen2
+        teamplus_api.read_new_messages(cursor1)
+        self.assertEqual(captured["NewestBatchID"], cursor1)
+
+
 class TestLoadExtraChatIds(unittest.TestCase):
     def setUp(self):
         self._orig_load = teamplus_api.config.load

@@ -74,18 +74,25 @@ def load_cookie():
 def read_new_messages(cursor=None):
     """
     讀「機器人推播」室裡比cursor新的訊息。
-    cursor是上次讀到的最新BatchID，第一次呼叫可傳None(會拿到目前最新一批，
-    之後用回傳的new_cursor接續)。
+    cursor是上次讀到的最新BatchID，第一次呼叫可傳None。
+
+    重要：NewestBatchID傳空字串會被team+的API直接拒絕("參數錯誤：NewestBatchID")，
+    這是之前即時問答完全沒反應的真正原因——第一次呼叫永遠失敗，cursor永遠
+    初始化不了，之後每一輪都用空字串重蹈覆轍。改成cursor是None時自動產生一個
+    隨機UUID當NewestBatchID(格式模仿同事teamplus_bot.py送訊息時自己產生的
+    batchID)，實測這樣team+會正常回應IsSuccess=true、視為目前沒有更新的訊息。
+
     回傳 (texts, new_cursor)，texts是純文字內容清單(按時間順序)；
     如果cookie過期或請求失敗，回傳 ([], cursor)(cursor不變)，並印出錯誤訊息。
     """
     cookie = load_cookie()
+    effective_cursor = cursor or str(uuid.uuid4())
     body = urllib.parse.urlencode({
         "action": "getNewestMessageList",
         "ChannelType": CHANNEL_TYPE,
         "Mobile": MOBILE,
         "ChatID": CHAT_ID,
-        "NewestBatchID": cursor or "",
+        "NewestBatchID": effective_cursor,
         "FromNearline": "false",
         "LoadCount": "25",
     }).encode("utf-8")
@@ -112,11 +119,15 @@ def read_new_messages(cursor=None):
         msg_list = data.get("MessageList")
     msg_list = msg_list or []
     if not msg_list:
-        return [], cursor
+        # 就算這批沒有新訊息，也要記住這次實際用的effective_cursor(尤其是
+        # cursor原本是None、剛完成bootstrap的情況)，不能回傳原本的cursor(None)，
+        # 否則下一輪又會用None重新產生一個全新的隨機UUID，永遠沒辦法穩定下來、
+        # 每次都用不一樣的"起點"去問，行為會變得不可預期。
+        return [], effective_cursor
 
     texts = [m.get("MsgContent", "") for m in msg_list if m.get("MsgContent")]
     # 用這批訊息裡最大的BatchID當作下次的cursor，避免重複讀到同一批
-    new_cursor = cursor
+    new_cursor = effective_cursor
     for m in msg_list:
         bid = m.get("BatchID")
         if bid:
