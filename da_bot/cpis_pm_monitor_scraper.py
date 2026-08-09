@@ -126,30 +126,46 @@ def _switch_to_frame_with_element(driver, element_id, max_depth=5):
     return False
 
 
-def _select_oper_kind_and_fetch(driver, oper_kind):
+def _select_oper_kind_and_fetch(driver, oper_kind, timeout=15):
     """
     截圖發現：全新開的無頭瀏覽器一開始Oper Kind預設是"FRONT END"、下面的
     機況表格整個是空的，完全沒有資料——實際使用者手動操作時之所以一開頁面
     就有資料，是瀏覽器記得之前選過"D/A"、按過Fetch的緣故(session/ViewState)，
     全新session沒有這個記憶。這裡就是補上這個動作：切進控制項所在的那個
     frame，把Oper Kind下拉選單選成oper_kind、按下Fetch按鈕，觸發JS真正
-    去要一次資料。選不到/按不到就算了(結構跟預期不同)，讓呼叫端自己決定
-    要不要退回用預設值繼續嘗試找表格。
-    """
-    driver.switch_to.default_content()
-    if not _switch_to_frame_with_element(driver, "ddlOperKind"):
-        return False
-    try:
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import Select
+    去要一次資料。
 
+    第一版用固定time.sleep(3)才開始找控制項所在的frame，實測發現常常
+    frame還沒完全載入完(巢狀好幾層、每層都要各自發一次請求)，導致找不到
+    ddlOperKind、整個動作默默失敗，畫面還是停在FRONT END/空白。這裡改成
+    在timeout秒內每秒重試一次，並回傳status字串描述實際發生的狀況(不再
+    默默吞掉例外)，方便印出來診斷到底是哪一步卡住。
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import Select
+
+    deadline = time.time() + timeout
+    found = False
+    while time.time() < deadline:
+        driver.switch_to.default_content()
+        if _switch_to_frame_with_element(driver, "ddlOperKind"):
+            found = True
+            break
+        time.sleep(1)
+
+    if not found:
+        driver.switch_to.default_content()
+        return f"[選單] 等了{timeout}秒還是找不到ddlOperKind下拉選單所在的frame"
+
+    try:
         Select(driver.find_element(By.ID, "ddlOperKind")).select_by_visible_text(oper_kind)
         driver.find_element(By.ID, "btnFetch").click()
-        return True
-    except Exception:
-        return False
+        status = f"[選單] 已選{oper_kind}、按下Fetch"
+    except Exception as e:
+        status = f"[選單] 找到frame了，但選取/點擊失敗: {type(e).__name__}: {e}"
     finally:
         driver.switch_to.default_content()
+    return status
 
 
 def fetch_pm_monitor_html(wait_seconds=WAIT_SECONDS, oper_kind="D/A"):
@@ -163,8 +179,8 @@ def fetch_pm_monitor_html(wait_seconds=WAIT_SECONDS, oper_kind="D/A"):
     driver = _make_driver()
     try:
         driver.get(PM_MONITOR_URL)
-        time.sleep(3)  # 先讓frame結構載入完，才找得到裡面的控制項
-        _select_oper_kind_and_fetch(driver, oper_kind)
+        select_status = _select_oper_kind_and_fetch(driver, oper_kind)
+        print(select_status)
         time.sleep(wait_seconds)
         log = []
         html = _find_grid_html(driver, log=log)
@@ -178,6 +194,7 @@ def fetch_pm_monitor_html(wait_seconds=WAIT_SECONDS, oper_kind="D/A"):
             raise PmMonitorError(
                 "找不到含ENTITY+STATUS表頭的表格，可能JS還沒渲染完"
                 f"(可以拉長wait_seconds，目前是{wait_seconds}秒)，或頁面結構變了。\n"
+                f"{select_status}\n"
                 f"掃過的每一層HTML長度: {log}\n{shot_note}"
             )
         return html
