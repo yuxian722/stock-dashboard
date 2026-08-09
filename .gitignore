@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# 真實帳密設定檔，不進版控（用 config.txt.example 當範本）
+da_bot/config.txt
+
+# SQLite 資料庫
+da_bot/*.db
+da_bot/*.db-journal
+da_bot/*.db-wal
+da_bot/*.db-shm

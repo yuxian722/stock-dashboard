@@ -1,0 +1,11 @@
+# da_bot 設定檔範例。
+# 複製這個檔案改名為 config.txt，填入實際帳密後放在同一層目錄。
+# config.txt 內含真實密碼，不要進版控（已加進 .gitignore）。
+
+# EE Maintenance Record 用的 APG 帳密（tncpisapg.tn.chipmos.com.tw）
+apg_user=your_apg_account
+apg_password=your_apg_password
+
+# Utilization Analysis 用的 APG 子系統帳密（tncpis.tn.chipmos.com.tw）
+util_user=your_util_account
+util_password=your_util_password
