@@ -18,6 +18,17 @@ da_bot_service.py(整點推播+即時問答合併服務)。
 import os
 import sys
 
+# Windows主控台預設用cp950(繁體中文)編碼，服務裡的推播/回覆內容含emoji
+# (🔧⏳⚡🤖等)沒辦法用cp950編碼，print()會直接丟UnicodeEncodeError把整支
+# 服務弄當掉。這是最上層的進入點，最早就把stdout/stderr強制轉成utf-8輸出，
+# encode不了的字元用errors="replace"跳過，底下da_bot_service.py/
+# teamplus_listener.py等都在同一個行程裡，一起受惠。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 if __name__ == "__main__":

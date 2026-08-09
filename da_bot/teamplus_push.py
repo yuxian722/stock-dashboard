@@ -13,6 +13,16 @@ teamplus_extra_chat_ids(逗號分隔)即可，不用改這支腳本。
 """
 import sys
 
+# Windows主控台預設用cp950(繁體中文)編碼，推播訊息裡的emoji(🔧⏳⚡等)沒辦法
+# 用cp950編碼，print()會直接丟UnicodeEncodeError把整支腳本弄當掉，導致
+# 推播失敗。改成把stdout/stderr強制用utf-8輸出(比照同事teamplus_bot.py的
+# 做法)，encode不了的字元用errors="replace"跳過，不會再整支當掉。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import teamplus_api
 from hourly_push import build_hourly_push_message
 

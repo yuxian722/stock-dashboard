@@ -34,6 +34,17 @@ team+「機器人推播」室 - 即時問答監聽腳本 (08/06改版：HTTP API
       不再需要開除錯模式Edge、不再需要msedgedriver.exe(仍保留給CPIS爬蟲用)。
       執行: python teamplus_listener.py，Ctrl+C結束監聽。
 """
+import sys
+
+# Windows主控台預設用cp950(繁體中文)編碼，HELP_TEXT等回覆內容含emoji(🤖等)，
+# print()會直接丟UnicodeEncodeError把腳本弄當掉。改成把stdout/stderr強制用
+# utf-8輸出，encode不了的字元用errors="replace"跳過。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import re
 import time
 import datetime

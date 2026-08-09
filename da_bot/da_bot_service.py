@@ -43,6 +43,17 @@ DA 監控機器人 - 合併常駐服務 (CPIS改版：整點任務也不再需�
 會乖乖等到下一個真正的整點。
 """
 import os
+import sys
+
+# Windows主控台預設用cp950(繁體中文)編碼，推播/回覆內容含emoji(🔧⏳⚡🤖等)
+# 沒辦法用cp950編碼，print()會直接丟UnicodeEncodeError把這支長駐服務弄當掉。
+# 改成把stdout/stderr強制用utf-8輸出，encode不了的字元用errors="replace"跳過。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import threading
 import time
 import datetime

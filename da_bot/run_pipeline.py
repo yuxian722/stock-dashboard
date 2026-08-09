@@ -13,6 +13,15 @@ import sys
 import datetime
 import os
 
+# Windows主控台預設用cp950(繁體中文)編碼，印不出推播訊息裡的emoji(🔧⏳⚡等)，
+# print()會直接丟UnicodeEncodeError——這裡是印log()/subprocess輸出的地方，
+# 一樣要修，不然log(result.stdout)遇到子行程印出的emoji內容也會當掉。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ENTITY_PATTERN = "BA*"  # 依使用者偏好，固定用有範圍的萬用字元，避免對CPIS系統造成過大負擔
 # 注意：CPIS的txtentity欄位規定扣掉萬用字元後至少要有2個字元，"B*"實測會被
@@ -36,10 +45,16 @@ def log(msg: str):
 def run_step(args, step_name: str, timeout: int = STEP_TIMEOUT_SECONDS) -> bool:
     log(f"[開始] {step_name}: {' '.join(args)}")
     try:
+        # 子行程另外強制帶PYTHONIOENCODING=utf-8：即使某支腳本忘了自己reconfigure
+        # stdout，子行程輸出還是會用utf-8編碼，不會在子行程那端就先當掉；這裡
+        # capture_output的解碼端也要用utf-8+errors="replace"對應，不然子行程用
+        # utf-8編碼輸出、父行程卻用cp950去解碼捕捉到的內容，一樣會炸開
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
         result = subprocess.run(
             [sys.executable] + args,
             cwd=SCRIPT_DIR,
-            capture_output=True, text=True, timeout=timeout
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, env=env,
         )
         log(result.stdout)
         if result.stderr:

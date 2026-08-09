@@ -11,6 +11,15 @@ import sqlite3
 import sys
 import datetime
 
+# Windows主控台預設用cp950(繁體中文)編碼，回覆內容可能含emoji，print()會
+# 直接丟UnicodeEncodeError把腳本弄當掉。改成把stdout/stderr強制用utf-8
+# 輸出，encode不了的字元用errors="replace"跳過。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 DB_PATH = "da_maintenance.db"
 
 # 各 JOB CODE 的標準工時(小時)，用來判斷是否超時

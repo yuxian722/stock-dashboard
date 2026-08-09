@@ -6,6 +6,17 @@ DA 整點推播 - 訊息產生器 (過渡版，先印出文字供手動複製貼
 換成呼叫 API 的函式（例如 send_to_teamplus(msg)），
 其他組訊息的邏輯都不用改。
 """
+import sys
+
+# Windows主控台預設用cp950(繁體中文)編碼，推播訊息裡的emoji(🔧⏳⚡等)沒辦法
+# 用cp950編碼，print()會直接丟UnicodeEncodeError把腳本弄當掉。改成把stdout/
+# stderr強制用utf-8輸出，encode不了的字元用errors="replace"跳過。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import sqlite3
 import datetime
 
