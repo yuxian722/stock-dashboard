@@ -101,24 +101,39 @@ def _get_done_setup_records(now):
     return rows
 
 
-# 「今日改機」認定為真正改機的job_code只有CED/CEE/CD三類(2026/08/09使用者
-# 提供+確認)，也用來當「這筆紀錄算不算改機」的統一篩選標準——不管是EE
-# Maintenance的e_tag='S'紀錄(判斷「改機完成」)，還是PM Monitor的SETUP/
-# WAIT-SETUP快照(判斷「改機中」/「待改」)，都要用同一套標準，CPIS的
+# 「今日改機」認定為真正改機的job_code，依機型群組各自有不同標準
+# (2026/08/09使用者分兩次提供)：ESEC/DB(Die Attach設備，EPOXY=ESEC+DB)
+# 是CED/CEE/CD家族+獨立代碼CE；LOC(CM700設備，機型完全不同)是CN/CD家族。
+# FlipChip(FC)還沒跟使用者確認過標準，暫時沿用ESEC/DB同一套當預設。
+# 這套標準也是「這筆紀錄算不算改機」的統一篩選標準——不管是EE Maintenance
+# 的e_tag='S'紀錄(判斷「改機完成」)，還是PM Monitor的SETUP/WAIT-SETUP快照
+# (判斷「改機中」/「待改」)，都要用同一套依群組區分的標準，CPIS的
 # STATUS='SETUP'/e_tag='S'不是每一筆都是機型改機——INK(補墨水)/AING(AI視覺
 # 校正)/CWT(換料)/OC(操作員備註)/CWTM/EI這類生產中的小動作也會被標成同樣
-# 的狀態，對不到這幾類的就不算改機(2026/08/09使用者確認PM Monitor這邊也要
-# 統一套用)。"CE"是獨立代碼，比"CED"/"CEE"還短，不是誰的前綴，要另外精確
-# 比對(2026/08/09使用者補充)。
-_EPOXY_JCODE_CATEGORIES = [("CED", "CED機台"), ("CEE", "CEE機台"), ("CD", "CD機台")]
+# 的狀態，對不到清單裡的就不算改機。CEDO/CEEO/CNO這種"O"結尾的變體，靠
+# CED/CEE/CN前綴比對就會自動涵蓋，不用另外列。
+_EPOXY_JCODE_PREFIXES = [("CED", "CED機台"), ("CEE", "CEE機台"), ("CD", "CD機台")]
 _EPOXY_JCODE_EXACT = {"CE": "CEE機台"}
+_LOC_JCODE_PREFIXES = [("CN", "CN機台"), ("CD", "CD機台")]
+
+_CHANGEOVER_JCODE_PREFIXES = {
+    "ESEC": _EPOXY_JCODE_PREFIXES, "DB": _EPOXY_JCODE_PREFIXES,
+    "LOC": _LOC_JCODE_PREFIXES, "FC": _EPOXY_JCODE_PREFIXES,
+}
+_CHANGEOVER_JCODE_EXACT = {
+    "ESEC": _EPOXY_JCODE_EXACT, "DB": _EPOXY_JCODE_EXACT,
+    "LOC": {}, "FC": _EPOXY_JCODE_EXACT,
+}
 
 
-def _epoxy_jcode_category(job_code):
+def _changeover_jcode_category(group, job_code):
+    """依機型群組(_group_for_machine()回傳的ESEC/DB/LOC/FC)判斷job_code
+    算不算真正改機，回傳分類標籤(顯示/分組用)，對不到就回傳None(不算改機)。"""
     jc = (job_code or "").upper()
-    if jc in _EPOXY_JCODE_EXACT:
-        return _EPOXY_JCODE_EXACT[jc]
-    for prefix, label in _EPOXY_JCODE_CATEGORIES:
+    exact = _CHANGEOVER_JCODE_EXACT.get(group, {})
+    if jc in exact:
+        return exact[jc]
+    for prefix, label in _CHANGEOVER_JCODE_PREFIXES.get(group, []):
         if jc.startswith(prefix):
             return label
     return None
@@ -149,7 +164,7 @@ def get_epoxy_done_by_jcode(now: datetime.datetime = None):
         g = _group_for_machine(r["machine_id"])
         if g not in ("ESEC", "DB"):
             continue
-        if _epoxy_jcode_category(r["job_code"]) is None:
+        if _changeover_jcode_category(g, r["job_code"]) is None:
             continue
         jc = (r["job_code"] or "").upper()
         result[jc] = result.get(jc, 0) + 1
@@ -173,7 +188,7 @@ def get_epoxy_done_by_shift(now: datetime.datetime = None):
         g = _group_for_machine(r["machine_id"])
         if g not in ("ESEC", "DB"):
             continue
-        if _epoxy_jcode_category(r["job_code"]) is None:
+        if _changeover_jcode_category(g, r["job_code"]) is None:
             continue
         if _is_night_shift(r["end_time"]):
             night_count += 1
@@ -250,11 +265,11 @@ def _pm_group_stats_from_rows(rows):
     """
     依機型群組(ESEC/DB/LOC/FC)統計PM Monitor各STATUS台數，回傳
     {group: {status_code: 台數}}。SETUP/WAIT-SETUP(改機中/待改)這兩種
-    狀態額外用_epoxy_jcode_category()篩過，只算jcode對得到CED/CEE/CD/CE
+    狀態額外用_changeover_jcode_category()篩過，只算jcode對得到該群組
     真正改機類別的紀錄——PM Monitor同一個STATUS='SETUP'底下混了CWTM/EI/
     INK這類生產中小動作，不是每一筆都是真正改機(2026/08/09使用者確認，
-    要跟改機完成的判斷標準統一)。其餘狀態(IN-REPAIR/WAIT-REPAIR/PM/ENG)
-    不受影響，照原樣全部計入。
+    要跟改機完成的判斷標準統一，且各群組標準不同)。其餘狀態(IN-REPAIR/
+    WAIT-REPAIR/PM/ENG)不受影響，照原樣全部計入。
     """
     stats = {g: {} for g in ("ESEC", "DB", "LOC", "FC")}
     for r in rows:
@@ -262,7 +277,7 @@ def _pm_group_stats_from_rows(rows):
         if g is None:
             continue
         status = r["status"]
-        if status in _PM_CHANGEOVER_STATUSES and _epoxy_jcode_category(r["jcode"]) is None:
+        if status in _PM_CHANGEOVER_STATUSES and _changeover_jcode_category(g, r["jcode"]) is None:
             continue
         stats[g][status] = stats[g].get(status, 0) + 1
     return stats
@@ -277,12 +292,12 @@ def get_pm_monitor_group_stats():
 def get_setup_group_stats(now: datetime.datetime = None):
     """
     今日改機統計，依機型群組(ESEC/DB/LOC/FC)分組。"改機"(今日已完成)算自
-    ee_maintenance_record，只算job_code屬於CED/CEE/CD三類真正改機的紀錄
-    (跟get_epoxy_done_by_jcode()同一套篩選標準，理由見該函式docstring—
-    e_tag='S'裡混了很多生產中的小動作，不能整批當改機算)；"改機中"/"待改"
-    改成算自PM Monitor的即時快照(SETUP/WAIT-SETUP狀態)，比EE Maintenance的
-    wait_date/bgn_date推算法準確，是當下真正的狀態，不是歷史推論的。「今日」
-    跟班別對齊(見_shift_day_bounds())，不是日曆日。
+    ee_maintenance_record，只算job_code屬於該群組真正改機類別的紀錄(各
+    群組標準不同，見_changeover_jcode_category()，跟get_epoxy_done_by_jcode()
+    同一套篩選標準——e_tag='S'裡混了很多生產中的小動作，不能整批當改機算)；
+    "改機中"/"待改"改成算自PM Monitor的即時快照(SETUP/WAIT-SETUP狀態)，
+    比EE Maintenance的wait_date/bgn_date推算法準確，是當下真正的狀態，
+    不是歷史推論的。「今日」跟班別對齊(見_shift_day_bounds())，不是日曆日。
     回傳{group: {"done": int, "in_progress": int, "waiting": int}}。
     """
     if now is None:
@@ -292,7 +307,7 @@ def get_setup_group_stats(now: datetime.datetime = None):
     stats = {g: {"done": 0, "in_progress": 0, "waiting": 0} for g in ("ESEC", "DB", "LOC", "FC")}
     for r in done_rows:
         g = _group_for_machine(r["machine_id"])
-        if g and _epoxy_jcode_category(r["job_code"]) is not None:
+        if g and _changeover_jcode_category(g, r["job_code"]) is not None:
             stats[g]["done"] += 1
 
     pm_stats = get_pm_monitor_group_stats()

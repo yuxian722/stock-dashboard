@@ -212,29 +212,58 @@ class TestShiftDayBounds(unittest.TestCase):
         self.assertEqual(shift_date, "2026-08-08")
 
 
-class TestEpoxyJcodeCategory(unittest.TestCase):
-    """真正改機job_code的判斷標準：CED/CEE/CD前綴比對，加上"CE"獨立精確比對
-    (2026/08/09使用者確認，"CE"比"CED"/"CEE"短，不是誰的前綴)。"""
+class TestChangeoverJcodeCategory(unittest.TestCase):
+    """真正改機job_code的判斷標準依機型群組各自不同(2026/08/09使用者分兩次
+    提供)：ESEC/DB(EPOXY，Die Attach設備)是CED/CEE/CD前綴比對+"CE"獨立
+    精確比對("CE"比"CED"/"CEE"短，不是誰的前綴)；LOC(CM700設備，機型完全
+    不同)是CN/CD前綴比對，沒有"CE"這個獨立代碼。"""
 
-    def test_ced_prefix_family(self):
-        for jc in ("CED", "CEDO", "CED-1", "CED-M2"):
-            self.assertEqual(hourly_push._epoxy_jcode_category(jc), "CED機台", msg=jc)
+    def test_esec_and_db_ced_prefix_family(self):
+        for group in ("ESEC", "DB"):
+            for jc in ("CED", "CEDO", "CED-1", "CED-M2"):
+                self.assertEqual(hourly_push._changeover_jcode_category(group, jc), "CED機台", msg=(group, jc))
 
-    def test_cee_prefix_family(self):
-        for jc in ("CEE", "CEEO", "CEE123"):
-            self.assertEqual(hourly_push._epoxy_jcode_category(jc), "CEE機台", msg=jc)
+    def test_esec_and_db_cee_prefix_family(self):
+        for group in ("ESEC", "DB"):
+            for jc in ("CEE", "CEEO", "CEE123"):
+                self.assertEqual(hourly_push._changeover_jcode_category(group, jc), "CEE機台", msg=(group, jc))
 
-    def test_cd_prefix_family(self):
+    def test_esec_and_db_cd_prefix_family(self):
+        for group in ("ESEC", "DB"):
+            for jc in ("CD", "CD-2"):
+                self.assertEqual(hourly_push._changeover_jcode_category(group, jc), "CD機台", msg=(group, jc))
+
+    def test_esec_and_db_ce_exact_match_maps_to_cee(self):
+        for group in ("ESEC", "DB"):
+            self.assertEqual(hourly_push._changeover_jcode_category(group, "CE"), "CEE機台", msg=group)
+            self.assertEqual(hourly_push._changeover_jcode_category(group, "ce"), "CEE機台", msg=group)
+
+    def test_esec_and_db_non_changeover_codes_return_none(self):
+        for group in ("ESEC", "DB"):
+            for jc in ("INK", "AING", "CWT", "OC", "CWTM", "EI", "XI", None, ""):
+                self.assertIsNone(hourly_push._changeover_jcode_category(group, jc), msg=(group, jc))
+
+    def test_loc_cn_prefix_family(self):
+        # LOC(CM700設備)的真正改機代碼是CN/CD家族，CNO被CN前綴涵蓋，
+        # 2026/08/09使用者確認
+        for jc in ("CN", "CNO", "CN-1"):
+            self.assertEqual(hourly_push._changeover_jcode_category("LOC", jc), "CN機台", msg=jc)
+
+    def test_loc_cd_prefix_family(self):
         for jc in ("CD", "CD-2"):
-            self.assertEqual(hourly_push._epoxy_jcode_category(jc), "CD機台", msg=jc)
+            self.assertEqual(hourly_push._changeover_jcode_category("LOC", jc), "CD機台", msg=jc)
 
-    def test_ce_exact_match_maps_to_cee(self):
-        self.assertEqual(hourly_push._epoxy_jcode_category("CE"), "CEE機台")
-        self.assertEqual(hourly_push._epoxy_jcode_category("ce"), "CEE機台")
+    def test_loc_does_not_recognize_ced_cee_or_ce(self):
+        # LOC不是Die Attach設備，不該套用ESEC/DB那套CED/CEE/CE標準
+        for jc in ("CED", "CEE", "CE", "CEDO"):
+            self.assertIsNone(hourly_push._changeover_jcode_category("LOC", jc), msg=jc)
 
-    def test_non_changeover_codes_return_none(self):
-        for jc in ("INK", "AING", "CWT", "OC", "CWTM", "EI", "XI", None, ""):
-            self.assertIsNone(hourly_push._epoxy_jcode_category(jc), msg=jc)
+    def test_fc_falls_back_to_epoxy_family_by_default(self):
+        # FlipChip還沒跟使用者確認過標準，暫時沿用ESEC/DB同一套當預設
+        self.assertEqual(hourly_push._changeover_jcode_category("FC", "CED"), "CED機台")
+
+    def test_unknown_group_returns_none(self):
+        self.assertIsNone(hourly_push._changeover_jcode_category("UNKNOWN", "CED"))
 
 
 class TestGetEpoxyDoneByJcode(unittest.TestCase):
@@ -383,8 +412,8 @@ class TestGetSetupGroupStats(unittest.TestCase):
              "job_code": "CE"},
         ])
         _add_pm_monitor_rows(hourly_push.DB_PATH, [
-            {"entity": "BAA01", "status": "SETUP", "jcode": "CED"},       # DB, 改機中
-            {"entity": "BA801", "status": "WAIT-SETUP", "jcode": "CEE"},  # LOC, 待改
+            {"entity": "BAA01", "status": "SETUP", "jcode": "CED"},      # DB, 改機中
+            {"entity": "BA801", "status": "WAIT-SETUP", "jcode": "CN"},  # LOC(CN/CD家族), 待改
         ])
         stats = hourly_push.get_setup_group_stats(_TEST_NOW)
         self.assertEqual(stats["ESEC"], {"done": 1, "in_progress": 0, "waiting": 0})

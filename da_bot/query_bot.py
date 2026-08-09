@@ -21,9 +21,10 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 # 「<群組>改機」「工時」查詢要沿用hourly_push.py裡已經對過、修正過好幾次的
-# 機台代號→機型群組對照(_group_for_machine)、真正改機job_code判斷
-# (_epoxy_jcode_category)、跟班別對齊的「今日」定義(_shift_day_bounds)，
-# 不要在這裡自己重新猜一份、重蹈之前LOC/CM700分類搞錯的覆轍。這幾個都是
+# 機台代號→機型群組對照(_group_for_machine)、依群組區分的真正改機job_code
+# 判斷(_changeover_jcode_category)、跟班別對齊的「今日」定義
+# (_shift_day_bounds)，不要在這裡自己重新猜一份、重蹈之前LOC/CM700分類
+# 搞錯的覆轍。這幾個都是
 # 不碰資料庫的純函式，直接import沿用沒有交互汙染DB_PATH的疑慮。
 import hourly_push
 
@@ -807,21 +808,35 @@ def _changeover_rows_for_group(cur, group_name, now):
                 continue
         elif g != group_name:
             continue
-        if hourly_push._epoxy_jcode_category(r["job_code"]) is None:
+        # 用這一列真正對應到的機型群組(g)去判斷job_code算不算改機，不是用
+        # 查詢參數group_name——group_name="EPOXY"時混合了ESEC/DB兩組，各自
+        # 要用各自的job_code標準比對(雖然目前ESEC/DB剛好共用同一套標準，
+        # 但這樣寫才不會在未來兩者標準分家時算錯)
+        category = hourly_push._changeover_jcode_category(g, r["job_code"])
+        if category is None:
             continue
-        rows.append(r)
+        rows.append({
+            "machine_id": r["machine_id"], "job_code": r["job_code"],
+            "engineer_id": r["engineer_id"], "dur": r["dur"], "category": category,
+        })
     return rows
 
 
+# 各群組job_code分類標籤的固定顯示順序，沒有資料的類別不顯示。
+# ESEC/DB(EPOXY)用CED機台/CEE機台/CD機台，LOC用CN機台/CD機台，兩邊「CD機台」
+# 剛好同名，用同一個順序清單涵蓋全部類別即可，不用分群組各自維護一份。
+_CHANGEOVER_LABEL_ORDER = ["CED機台", "CEE機台", "CD機台", "CN機台"]
+
+
 def _category_avg_parts(rows):
-    """把rows依CED機台/CEE機台/CD機台分類，回傳["CED機台3台平均1.2hr", ...]這種
-    字串清單(照CED/CEE/CD固定順序，沒有資料的類別不顯示)。"""
+    """把rows(_changeover_rows_for_group()回傳、已經帶好category欄位的)依
+    job_code分類，回傳["CED機台3台平均1.2hr", ...]這種字串清單(照
+    _CHANGEOVER_LABEL_ORDER固定順序，沒有資料的類別不顯示)。"""
     by_cat = {}
     for r in rows:
-        cat = hourly_push._epoxy_jcode_category(r["job_code"])
-        by_cat.setdefault(cat, []).append(r["dur"] or 0.0)
+        by_cat.setdefault(r["category"], []).append(r["dur"] or 0.0)
     parts = []
-    for _, label in hourly_push._EPOXY_JCODE_CATEGORIES:
+    for label in _CHANGEOVER_LABEL_ORDER:
         durs = by_cat.get(label)
         if not durs:
             continue
@@ -871,9 +886,10 @@ def _workhours_rows(cur, now, engineer_id=None):
     """
     回傳今日(跟班別對齊)所有e_tag屬於R(修機)/S(改機)的紀錄(e_tag/engineer_id/
     dur)。engineer_id有指定時只查該工號，不指定時回傳全部工號的紀錄。
-    e_tag='S'的紀錄要另外篩掉job_code不是CED/CEE/CD真正改機類別的(INK補
-    墨水/AING視覺校正這類生產中小動作)，跟這個檔案其他「改機」統計的認定
-    標準一致(e_tag='R'的修機紀錄不用篩，全部都算修機工時)。
+    e_tag='S'的紀錄要另外依機台所屬群組篩掉不是該群組真正改機類別的
+    job_code(INK補墨水/AING視覺校正這類生產中小動作)，跟這個檔案其他
+    「改機」統計的認定標準一致(e_tag='R'的修機紀錄不用篩，全部都算修機
+    工時)。
     """
     shift_date, next_date = hourly_push._shift_day_bounds(now)
     params = [shift_date, hourly_push.SHIFT_CHANGE_TIME, next_date, hourly_push.SHIFT_CHANGE_TIME]
@@ -892,8 +908,10 @@ def _workhours_rows(cur, now, engineer_id=None):
 
     rows = []
     for r in cur.fetchall():
-        if r["e_tag"] == "S" and hourly_push._epoxy_jcode_category(r["job_code"]) is None:
-            continue
+        if r["e_tag"] == "S":
+            g = hourly_push._group_for_machine(r["machine_id"])
+            if hourly_push._changeover_jcode_category(g, r["job_code"]) is None:
+                continue
         rows.append(r)
     return rows
 

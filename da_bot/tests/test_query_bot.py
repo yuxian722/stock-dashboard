@@ -395,6 +395,27 @@ class TestGroupChangeoverDetailReply(unittest.TestCase):
         reply = query_bot.group_changeover_detail_reply("EPOXY", now)
         self.assertIn("【EPOXY改機】今日共2台", reply)
 
+    def test_loc_uses_cn_cd_standard_not_ced_cee(self):
+        # LOC(CM700設備)的真正改機代碼是CN/CD家族，跟ESEC/DB的CED/CEE不一樣
+        # (2026/08/09使用者確認)
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BA801", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CN", "engineer_id": "e1", "dur": 1.0},
+            {"machine_id": "BA802", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CNO", "engineer_id": "e2", "dur": 2.0},
+            {"machine_id": "BA803", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CD", "engineer_id": "e3", "dur": 0.5},
+            # CED不是LOC認得的代碼，不算改機
+            {"machine_id": "BA804", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "e4", "dur": 1.0},
+        ])
+        reply = query_bot.group_changeover_detail_reply("LOC", now)
+        self.assertIn("【LOC改機】今日共3台", reply)
+        self.assertIn("CN機台2台平均1.5hr", reply)
+        self.assertIn("CD機台1台平均0.5hr", reply)
+
 
 class TestWorkhoursReply(unittest.TestCase):
     """「工時」查詢：今日各工號人員修機+改機總工時(2026/08/09使用者要求)。"""
