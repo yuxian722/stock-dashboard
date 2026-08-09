@@ -38,8 +38,9 @@ def get_conn():
 
 def get_ongoing_records():
     """
-    抓「進行中」的紀錄：end_date/end_time 為空(還沒結束)
-    只看 e_tag = R(修機)或 S(改機)，其他分類(保養/工程異常/品保)不列入超時機台清單
+    抓「進行中」的紀錄：bgn_date/bgn_time 已填(已經開始動工)、end_date/end_time
+    還是空的(還沒結束)。只看 e_tag = R(修機)或 S(改機)，其他分類(保養/工程異常/
+    品保)不列入超時機台清單。
     """
     conn = get_conn()
     cur = conn.cursor()
@@ -56,14 +57,83 @@ def get_ongoing_records():
     return rows
 
 
-def elapsed_hours(bgn_date: str, bgn_time: str, now: datetime.datetime) -> float:
-    """計算從 bgn_date+bgn_time 到現在經過的小時數"""
+def get_waiting_records():
+    """
+    抓「排隊等待中」的紀錄：wait_date/wait_time已填(已經排入等待)，
+    但bgn_date還是空的(還沒真的開始動工)、也還沒結束。
+    這批資料本來就存在ee_maintenance_record裡(cpis_scraper.py解析EJP報表時
+    wait_date/wait_time欄位就有存)，只是之前的整點推播沒有查詢/顯示過。
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT machine_id, wait_date, wait_time, job_code, e_tag
+        FROM ee_maintenance_record
+        WHERE wait_date IS NOT NULL AND wait_date != ''
+          AND (bgn_date IS NULL OR bgn_date = '')
+          AND (end_date IS NULL OR end_date = '')
+          AND e_tag IN ('R', 'S')
+        ORDER BY wait_date, wait_time
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def elapsed_hours(date_str: str, time_str: str, now: datetime.datetime) -> float:
+    """計算從 date_str+time_str 到現在經過的小時數(bgn/wait兩種時間戳記都能用)"""
     try:
-        bgn_dt = datetime.datetime.strptime(f"{bgn_date} {bgn_time}", "%Y-%m-%d %H:%M")
+        dt = datetime.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
     except ValueError:
         return 0.0
-    delta = now - bgn_dt
+    delta = now - dt
     return delta.total_seconds() / 3600.0
+
+
+# 機台代號→機型群組(ESEC/DB/LOC/FC)，依代號前3碼分類，對齊同事Dashboard的
+# getEntityGroup規則(APG_TeamplusBot/teamplus_bot.py的_entity_group())
+_ENTITY_GROUP_PREFIXES = {
+    "BA2": "ESEC", "BA4": "ESEC",
+    "BA7": "DB", "BAA": "DB", "BAB": "DB",
+    "BA8": "LOC",
+    "BA5": "FC", "FC5": "FC", "BAD": "FC", "FC1": "FC",
+}
+
+
+def _group_for_machine(machine_id):
+    p3 = (machine_id or "").upper()[:3]
+    return _ENTITY_GROUP_PREFIXES.get(p3)
+
+
+def get_setup_group_stats():
+    """
+    今日改機統計，依機型群組(ESEC/DB/LOC/FC)分組。回傳
+    {group: {"done": 今日已完成次數, "in_progress": 改機中台數, "waiting": 待改台數}}。
+    """
+    today = datetime.date.today().isoformat()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT machine_id, wait_date, bgn_date, end_date
+        FROM ee_maintenance_record
+        WHERE e_tag = 'S'
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    stats = {g: {"done": 0, "in_progress": 0, "waiting": 0} for g in ("ESEC", "DB", "LOC", "FC")}
+    for r in rows:
+        g = _group_for_machine(r["machine_id"])
+        if g is None:
+            continue
+        if r["end_date"]:
+            if r["end_date"] == today:
+                stats[g]["done"] += 1
+        elif r["bgn_date"]:
+            stats[g]["in_progress"] += 1
+        elif r["wait_date"]:
+            stats[g]["waiting"] += 1
+    return stats
 
 
 def _to_float_percent(s):
@@ -126,48 +196,81 @@ def get_official_group_rates():
     return result
 
 
+def _setup_stats_line(label, s, indent=""):
+    return f"{indent}{label}   改機{s['done']} | 改機中{s['in_progress']} | 待改{s['waiting']}"
+
+
+def _overtime_line(r, hrs, show_cause=False):
+    """
+    超時機台清單裡的一行(改機中/修機中共用)：機台 經過時數(超時Xhr) 代碼 人員xxx。
+    改機沒有「原因」這種概念(排定的正常換線，不是故障)，只有修機才顯示
+    原因(show_cause=True)，沿用之前"修機過久要看修機人員/修機內容"的需求。
+    """
+    std = get_std_hours(r["job_code"])
+    status_note = f"(超時{hrs - std:.2f}hr)" if (std is not None and hrs > std) else ""
+    engineer = r["engineer_id"] or "未指定"
+    line = f"{r['machine_id']}  {hrs:.2f}hr{status_note}  {r['job_code']}  人員{engineer}"
+    if show_cause:
+        cause = r["cause"] or "無"
+        line += f"  原因:{cause}"
+    return line
+
+
+def _waiting_line(r, hrs, label):
+    return f"{r['machine_id']}  {label}{hrs:.2f}hr  {r['job_code']}"
+
+
 def build_hourly_push_message(now: datetime.datetime = None) -> str:
     """組出整點推播訊息文字(格式比照同事的推播範本)"""
     if now is None:
         now = datetime.datetime.now()
 
-    rows = get_ongoing_records()
-
-    setup_lines = []   # 改機中 (e_tag S)
-    repair_lines = []  # 修機中 (e_tag R)
-
-    for r in rows:
-        hrs = elapsed_hours(r["bgn_date"], r["bgn_time"], now)
-        std = get_std_hours(r["job_code"])
-
-        if std is not None:
-            if hrs > std:
-                status_note = f"(超時{hrs - std:.2f}hr)"
-            else:
-                status_note = f"(剩餘{std - hrs:.2f}hr)"
-        else:
-            status_note = ""
-
-        engineer = r["engineer_id"] or "未指定"
-        cause = r["cause"] or "無"
-        line = f"{r['machine_id']}  {hrs:.2f}hr{status_note}  {r['job_code']}  工程師:{engineer}  原因:{cause}"
-
-        if r["e_tag"] == "S":
-            setup_lines.append(line)
-        elif r["e_tag"] == "R":
-            repair_lines.append(line)
-
     title = f"【APG DA 整點推播】{now.strftime('%m/%d %H:%M')}"
-    parts = [title, "", "【超時機台】"]
+    parts = [title]
 
-    if setup_lines:
-        parts.append("改機中:")
-        parts.extend(setup_lines)
-    if repair_lines:
-        parts.append("修機中:")
-        parts.extend(repair_lines)
-    if not setup_lines and not repair_lines:
-        parts.append("(目前無進行中的改機/修機紀錄)")
+    # 🔧 今日改機統計：依機型群組(EPOXY=ESEC+DB、LOC、FlipChip)列出今日已完成/
+    # 改機中/待改的台數，wait_date這些欄位其實資料庫裡早就有存，只是之前的
+    # 整點推播沒有查詢/顯示過
+    setup_stats = get_setup_group_stats()
+    esec, db, loc, fc = setup_stats["ESEC"], setup_stats["DB"], setup_stats["LOC"], setup_stats["FC"]
+    epoxy = {k: esec[k] + db[k] for k in ("done", "in_progress", "waiting")}
+    parts.append("")
+    parts.append("🔧 今日改機統計")
+    parts.append(_setup_stats_line("EPOXY", epoxy))
+    parts.append(_setup_stats_line("├ESEC", esec, " "))
+    parts.append(_setup_stats_line("└DB", db, " "))
+    parts.append(_setup_stats_line("LOC", loc))
+    parts.append(_setup_stats_line("FlipChip", fc))
+
+    # ⏰ 超時機台：改機中/修機中(進行中且超過標準工時) + 待改/待修(還在排隊等待中)
+    ongoing = get_ongoing_records()
+    waiting = get_waiting_records()
+
+    setup_ongoing = [r for r in ongoing if r["e_tag"] == "S"]
+    repair_ongoing = [r for r in ongoing if r["e_tag"] == "R"]
+    setup_waiting = [r for r in waiting if r["e_tag"] == "S"]
+    repair_waiting = [r for r in waiting if r["e_tag"] == "R"]
+
+    parts.append("")
+    parts.append("⏰ 超時機台")
+    if setup_ongoing:
+        parts.append("🔧改機中")
+        for r in setup_ongoing:
+            parts.append(_overtime_line(r, elapsed_hours(r["bgn_date"], r["bgn_time"], now)))
+    if setup_waiting:
+        parts.append("⏳待改")
+        for r in setup_waiting:
+            parts.append(_waiting_line(r, elapsed_hours(r["wait_date"], r["wait_time"], now), "待改"))
+    if repair_ongoing:
+        parts.append("🔨修機中")
+        for r in repair_ongoing:
+            parts.append(_overtime_line(r, elapsed_hours(r["bgn_date"], r["bgn_time"], now), show_cause=True))
+    if repair_waiting:
+        parts.append("⏳待修")
+        for r in repair_waiting:
+            parts.append(_waiting_line(r, elapsed_hours(r["wait_date"], r["wait_time"], now), "待修"))
+    if not (setup_ongoing or setup_waiting or repair_ongoing or repair_waiting):
+        parts.append("(目前無進行中/等待中的改機/修機紀錄)")
 
     # 稼動/改機 rate，來源是CPIS APG Utilization Analysis頁面最下方的官方GROUP彙總表
     parts.append("")
