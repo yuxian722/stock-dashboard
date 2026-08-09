@@ -70,5 +70,49 @@ class TestHelpTrigger(unittest.TestCase):
         self.assertIn("今天", reply)
 
 
+class TestPollOnceFloodProtection(unittest.TestCase):
+    """
+    poll_once()以前偵測到疑似自問自答/洗版時會sys.exit(1)，把整支服務(連同
+    整點推播)一起殺死，之後除非有人發現、手動重開，機器人會一直保持沒反應。
+    這裡鎖定：不管洗版怎麼發生，poll_once()都不能讓整個程序當掉。
+    """
+
+    def setUp(self):
+        self._orig_read = listener.teamplus_api.read_new_messages
+        self._orig_send = listener.teamplus_api.send_message
+
+    def tearDown(self):
+        listener.teamplus_api.read_new_messages = self._orig_read
+        listener.teamplus_api.send_message = self._orig_send
+
+    def test_flood_within_one_batch_does_not_raise_systemexit(self):
+        flood_size = listener.MAX_REPLIES_PER_WINDOW + 3
+        texts = ["查詢"] * flood_size
+
+        listener.teamplus_api.read_new_messages = lambda cursor: (texts, "cursor-1")
+        sent = []
+        listener.teamplus_api.send_message = lambda message, chat_id=None: (sent.append(message) or (True, "ok"))
+
+        state = {"cursor": None, "bot_sent_norms": [], "recent_reply_times": []}
+        try:
+            listener.poll_once(state)
+        except SystemExit:
+            self.fail("poll_once() 不應該用sys.exit()把整個服務殺掉")
+
+        # 應該在達到上限那一刻就停手，不是把整批洗版訊息全部回完
+        self.assertEqual(len(sent), listener.MAX_REPLIES_PER_WINDOW)
+
+    def test_cursor_still_advances_after_flood_stops_early(self):
+        # 就算這批訊息因為洗版保護提早跳出，cursor還是要更新，
+        # 不然下次poll_once()會重複讀到同一批舊訊息卡在無限迴圈
+        texts = ["查詢"] * (listener.MAX_REPLIES_PER_WINDOW + 3)
+        listener.teamplus_api.read_new_messages = lambda cursor: (texts, "cursor-new")
+        listener.teamplus_api.send_message = lambda message, chat_id=None: (True, "ok")
+
+        state = {"cursor": "cursor-old", "bot_sent_norms": [], "recent_reply_times": []}
+        listener.poll_once(state)
+        self.assertEqual(state["cursor"], "cursor-new")
+
+
 if __name__ == "__main__":
     unittest.main()

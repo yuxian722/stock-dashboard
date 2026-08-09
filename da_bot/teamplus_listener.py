@@ -34,7 +34,6 @@ team+「機器人推播」室 - 即時問答監聽腳本 (08/06改版：HTTP API
       執行: python teamplus_listener.py，Ctrl+C結束監聽。
 """
 import re
-import sys
 import time
 import datetime
 
@@ -310,9 +309,13 @@ def poll_once(state):
         now = time.time()
         recent_reply_times[:] = [t for t in recent_reply_times if now - t < RATE_LIMIT_WINDOW_SECONDS]
         if len(recent_reply_times) >= MAX_REPLIES_PER_WINDOW:
-            print(f"[緊急停止] {RATE_LIMIT_WINDOW_SECONDS}秒內已回覆{len(recent_reply_times)}次，")
-            print("疑似自問自答或異常迴圈，強制停止腳本，請檢查聊天室內容後再重跑")
-            sys.exit(1)
+            # 這裡以前是sys.exit(1)：一遇到疑似自問自答/洗版就把整支服務(連同整點推播)
+            # 一起殺掉，之後除非有人發現、手動重開，不然機器人會一直保持沒反應的狀態。
+            # 改成只跳過這批訊息剩下的部分不回覆，讓服務繼續跑，等這波次數退到
+            # RATE_LIMIT_WINDOW_SECONDS之外自動恢復正常回覆。
+            print(f"[警告] {RATE_LIMIT_WINDOW_SECONDS}秒內已回覆{len(recent_reply_times)}次，"
+                  "疑似自問自答或異常迴圈，這批訊息剩下的部分先不回覆，服務繼續運作")
+            break
 
         print(f"[收到指令] {text!r} -> {cmd}")
         reply = build_reply(cmd)
