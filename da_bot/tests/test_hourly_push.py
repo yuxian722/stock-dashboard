@@ -1,5 +1,5 @@
 """hourly_push.py 的離線單元測試(不連網)：用暫存SQLite驗證超時機台訊息格式
-有帶上工程師/原因，以及稼動率統計邏輯。"""
+有帶上工程師/原因，以及官方GROUP分組稼動率統計邏輯。"""
 
 import conftest  # noqa: F401  (設定 sys.path)
 
@@ -9,6 +9,14 @@ import tempfile
 import unittest
 
 import hourly_push
+
+_UTIL_TABLE_SQL = """
+    CREATE TABLE utilization_record (
+        MODEL TEXT, ENTITY TEXT, fetched_at TEXT,
+        UTIL TEXT, "W-SET" TEXT, SETUP TEXT, ENG TEXT, PM TEXT,
+        "W-REP" TEXT, "IN-REP" TEXT
+    )
+"""
 
 
 def _make_db_with_ongoing_record(machine_id="BA205", bgn_offset_hours=5.0, job_code="CED",
@@ -29,7 +37,7 @@ def _make_db_with_ongoing_record(machine_id="BA205", bgn_offset_hours=5.0, job_c
         (machine_id, bgn.strftime("%Y-%m-%d"), bgn.strftime("%H:%M"),
          None, None, job_code, e_tag, engineer_id, cause),
     )
-    conn.execute("CREATE TABLE utilization_record (MODEL TEXT, UTIL TEXT, SETUP TEXT, ENTITY TEXT, fetched_at TEXT)")
+    conn.execute(_UTIL_TABLE_SQL)
     conn.commit()
     conn.close()
     return path
@@ -66,7 +74,7 @@ class TestBuildHourlyPushMessage(unittest.TestCase):
                 engineer_id TEXT, cause TEXT
             )
         """)
-        conn.execute("CREATE TABLE utilization_record (MODEL TEXT, UTIL TEXT, SETUP TEXT, ENTITY TEXT, fetched_at TEXT)")
+        conn.execute(_UTIL_TABLE_SQL)
         conn.commit()
         conn.close()
         hourly_push.DB_PATH = path
@@ -76,7 +84,8 @@ class TestBuildHourlyPushMessage(unittest.TestCase):
 
 
 def _make_db_with_group_rates(rows):
-    """rows是list of (model, util, setup, entity)，寫進utilization_record同一批fetched_at。"""
+    """rows是list of dict，每個dict至少要有model/entity，其餘欄位(util/w_set/setup/
+    eng/pm/w_rep/in_rep)缺的話當NULL，全部寫進utilization_record同一批fetched_at。"""
     path = tempfile.mktemp(suffix=".db")
     conn = sqlite3.connect(path)
     conn.execute("""
@@ -86,12 +95,17 @@ def _make_db_with_group_rates(rows):
             engineer_id TEXT, cause TEXT
         )
     """)
-    conn.execute("CREATE TABLE utilization_record (MODEL TEXT, UTIL TEXT, SETUP TEXT, ENTITY TEXT, fetched_at TEXT)")
+    conn.execute(_UTIL_TABLE_SQL)
     fetched_at = "2026-08-09T12:00:00"
-    for model, util, setup, entity in rows:
+    for row in rows:
         conn.execute(
-            "INSERT INTO utilization_record VALUES (?,?,?,?,?)",
-            (model, util, setup, entity, fetched_at),
+            'INSERT INTO utilization_record (MODEL, ENTITY, fetched_at, UTIL, "W-SET", SETUP, ENG, PM, "W-REP", "IN-REP")'
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                row.get("model"), row.get("entity"), fetched_at,
+                row.get("util"), row.get("w_set"), row.get("setup"),
+                row.get("eng"), row.get("pm"), row.get("w_rep"), row.get("in_rep"),
+            ),
         )
     conn.commit()
     conn.close()
@@ -105,16 +119,21 @@ class TestGetOfficialGroupRates(unittest.TestCase):
     def tearDown(self):
         hourly_push.DB_PATH = self._orig_db_path
 
-    def test_reads_official_group_rows_only(self):
+    def test_reads_official_group_row_all_fields(self):
         hourly_push.DB_PATH = _make_db_with_group_rates([
-            ("DB800", "77.0 %", "13.0 %", None),      # 官方GROUP彙總列(ENTITY為空)
-            ("DB800", "50.0 %", "5.0 %", "BAA01"),    # 個別機台明細列，不該被拿來當GROUP數字
+            {"model": "DB800", "entity": None, "util": "77.0 %", "w_set": "1.1 %",
+             "setup": "13.0 %", "eng": "0.0 %", "pm": "0.0 %", "w_rep": "1.7 %", "in_rep": "1.3 %"},
+            # 個別機台明細列(ENTITY非空)，不該被拿來當官方GROUP數字
+            {"model": "DB800", "entity": "BAA01", "util": "50.0 %"},
         ])
         rates = hourly_push.get_official_group_rates()
-        self.assertEqual(rates["DB800"], {"util": 77.0, "setup": 13.0})
+        self.assertEqual(
+            rates["DB800"],
+            {"UTIL": 77.0, "W-SET": 1.1, "SETUP": 13.0, "ENG": 0.0, "PM": 0.0, "W-REP": 1.7, "IN-REP": 1.3},
+        )
 
     def test_missing_group_omitted_from_result(self):
-        hourly_push.DB_PATH = _make_db_with_group_rates([("DB800", "77.0 %", "13.0 %", None)])
+        hourly_push.DB_PATH = _make_db_with_group_rates([{"model": "DB800", "entity": None, "util": "77.0 %"}])
         rates = hourly_push.get_official_group_rates()
         self.assertNotIn("Epoxy", rates)
 
@@ -123,10 +142,21 @@ class TestGetOfficialGroupRates(unittest.TestCase):
         self.assertEqual(hourly_push.get_official_group_rates(), {})
 
     def test_push_message_lists_each_group_and_flags_missing(self):
-        hourly_push.DB_PATH = _make_db_with_group_rates([("DB800", "77.0 %", "13.0 %", None)])
+        hourly_push.DB_PATH = _make_db_with_group_rates([
+            {"model": "DB800", "entity": None, "util": "77.0 %", "setup": "13.0 %"},
+        ])
         msg = hourly_push.build_hourly_push_message()
-        self.assertIn("DB800  稼動77.0%  改機13.0%", msg)
+        self.assertIn("DB800  稼動77.0% 改機13.0%", msg)
         self.assertIn("Epoxy: 暫無資料", msg)
+
+    def test_push_message_skips_missing_fields_within_a_group(self):
+        # w_set/eng/pm/w_rep/in_rep都沒抓到值時，該欄位不該出現在那一行裡
+        hourly_push.DB_PATH = _make_db_with_group_rates([
+            {"model": "DB800", "entity": None, "util": "77.0 %"},
+        ])
+        msg = hourly_push.build_hourly_push_message()
+        self.assertIn("DB800  稼動77.0%", msg)
+        self.assertNotIn("改機", msg.split("DB800")[1].split("\n")[0])
 
 
 class TestGetStdHours(unittest.TestCase):

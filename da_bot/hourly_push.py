@@ -78,12 +78,23 @@ def _to_float_percent(s):
 # 官方彙總表(跟query_bot.OFFICIAL_GROUP_LABELS共用同一份官方名稱/大小寫)
 PUSH_GROUP_LABELS = ["EPOXY(DB)", "Epoxy", "DB700", "DB800", "DB830", "2100SD"]
 
+# 推播每個分組要列出哪些欄位(DB欄位名, 顯示用名稱)，對應CPIS GROUP彙總表的欄位
+PUSH_GROUP_FIELDS = [
+    ("UTIL", "稼動"),
+    ("W-SET", "等待改機"),
+    ("SETUP", "改機"),
+    ("ENG", "工程"),
+    ("PM", "保養"),
+    ("W-REP", "等待修機"),
+    ("IN-REP", "修機"),
+]
+
 
 def get_official_group_rates():
     """
     從 utilization_record 抓最新一批資料裡，PUSH_GROUP_LABELS這幾個官方GROUP
-    彙總列(ENTITY為空、MODEL=群組名)的UTIL/SETUP，回傳
-    {group_label: {"util":.., "setup":..}}；抓不到資料的分組不會出現在結果裡，
+    彙總列(ENTITY為空、MODEL=群組名)的PUSH_GROUP_FIELDS各欄位數字，回傳
+    {group_label: {欄位名: 數值或None}}；抓不到資料的分組不會出現在結果裡，
     整批都沒抓到資料時回傳空dict。
     """
     conn = get_conn()
@@ -96,19 +107,20 @@ def get_official_group_rates():
         conn.close()
         return {}
 
+    field_cols = ", ".join(f'"{col}"' for col, _ in PUSH_GROUP_FIELDS)
     result = {}
     for label in PUSH_GROUP_LABELS:
-        cur.execute("""
-            SELECT UTIL, SETUP FROM utilization_record
+        cur.execute(f"""
+            SELECT {field_cols} FROM utilization_record
             WHERE fetched_at = ? AND MODEL = ? AND (ENTITY IS NULL OR ENTITY = '')
         """, (latest_fetched_at, label))
         r = cur.fetchone()
         if r is None:
             continue
-        util = _to_float_percent(r["UTIL"])
-        if util is None:
+        values = {col: _to_float_percent(r[col]) for col, _ in PUSH_GROUP_FIELDS}
+        if values["UTIL"] is None:
             continue
-        result[label] = {"util": util, "setup": _to_float_percent(r["SETUP"])}
+        result[label] = values
 
     conn.close()
     return result
@@ -165,14 +177,15 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
         parts.append("(rates 暫無，尚未抓取Utilization Analysis資料)")
     else:
         for label in PUSH_GROUP_LABELS:
-            g = group_rates.get(label)
-            if g is None:
+            values = group_rates.get(label)
+            if values is None:
                 parts.append(f"{label}: 暫無資料")
                 continue
-            line = f"{label}  稼動{g['util']:.1f}%"
-            if g["setup"] is not None:
-                line += f"  改機{g['setup']:.1f}%"
-            parts.append(line)
+            field_parts = [
+                f"{name}{v:.1f}%" for col, name in PUSH_GROUP_FIELDS
+                if (v := values.get(col)) is not None
+            ]
+            parts.append(f"{label}  " + " ".join(field_parts))
 
     return "\n".join(parts)
 
