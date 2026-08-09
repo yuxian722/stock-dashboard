@@ -62,15 +62,18 @@ def _epoxy_jcode_category(job_code):
 
 def get_epoxy_done_by_jcode():
     """
-    EPOXY(ESEC+DB)今日已完成的改機次數，依job_code分CED機台/CEE機台/CD機台
-    三類。CPIS的e_tag='S'不是每一筆都是真正的機型改機——生產過程中很多
-    小動作(補墨水INK、AI視覺校正AING、換料CWT、操作員備註OC...)也會被
-    標成'S'，2026/08/09實測診斷發現這類小動作占了e_tag='S'紀錄的大多數，
+    EPOXY(ESEC+DB)今日已完成的改機次數，依「實際job_code」逐一列出台數
+    (2026/08/09使用者要求要看到CED/CEDO/CD這些實際代碼各自的台數，方便
+    肉眼核對加總對不對，不要收斂成CED/CEE/CD三個大類、把CEDO藏在CED機台
+    裡看不到)。CPIS的e_tag='S'不是每一筆都是真正的機型改機——生產過程中
+    很多小動作(補墨水INK、AI視覺校正AING、換料CWT、操作員備註OC...)也會
+    被標成'S'，2026/08/09實測診斷發現這類小動作占了e_tag='S'紀錄的大多數，
     導致改機統計數字暴增到不合理(EPOXY改機274/315這種)。這裡只算job_code
-    對得到CED/CEE/CD這三類的紀錄，對不到的一律不算改機(不再放進"其他"
-    桶，2026/08/09使用者確認)。用SELECT DISTINCT防重複——同一筆真實紀錄
-    理論上不該重複，這裡用DISTINCT保險。回傳{"CED機台":n, ...}，沒有資料
-    的類別不會出現在結果裡。
+    對得到CED/CEE/CD前綴(真正改機類別)的紀錄，對不到的一律不算改機
+    (2026/08/09使用者確認)，所以回傳結果加總起來會等於get_setup_group_stats()
+    裡EPOXY(ESEC+DB)的done數字。用SELECT DISTINCT防重複——同一筆真實紀錄
+    理論上不該重複，這裡用DISTINCT保險。回傳{實際job_code: n}，沒有資料的
+    代碼不會出現在結果裡。
     """
     today = datetime.date.today().isoformat()
     conn = get_conn()
@@ -88,10 +91,10 @@ def get_epoxy_done_by_jcode():
         g = _group_for_machine(r["machine_id"])
         if g not in ("ESEC", "DB"):
             continue
-        label = _epoxy_jcode_category(r["job_code"])
-        if label is None:
+        if _epoxy_jcode_category(r["job_code"]) is None:
             continue
-        result[label] = result.get(label, 0) + 1
+        jc = (r["job_code"] or "").upper()
+        result[jc] = result.get(jc, 0) + 1
     return result
 
 
@@ -330,7 +333,9 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
     parts = [title]
 
     # 🔧 今日改機統計：依機型群組(EPOXY=ESEC+DB、LOC、FlipChip)列出今日已完成/
-    # 改機中/待改的台數；EPOXY另外依job_code分CED/CEE/CD機台三類細項。
+    # 改機中/待改的台數；EPOXY另外逐一列出實際job_code(CED/CEDO/CD...)各自的
+    # 台數細項，數字由多到少排序，加總起來要等於EPOXY的改機總數(2026/08/09
+    # 使用者要求，方便肉眼核對)。
     setup_stats = get_setup_group_stats()
     esec, db, loc, fc = setup_stats["ESEC"], setup_stats["DB"], setup_stats["LOC"], setup_stats["FC"]
     epoxy = {k: esec[k] + db[k] for k in ("done", "in_progress", "waiting")}
@@ -338,7 +343,10 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
     parts.append("🔧 今日改機統計")
     parts.append(_setup_stats_line("EPOXY", epoxy))
     epoxy_jcode = get_epoxy_done_by_jcode()
-    jcode_parts = [f"{label}{n}" for label, n in epoxy_jcode.items() if n]
+    jcode_parts = [
+        f"{code}{n}台" for code, n in sorted(epoxy_jcode.items(), key=lambda kv: (-kv[1], kv[0]))
+        if n
+    ]
     if jcode_parts:
         parts.append("  " + " ".join(jcode_parts))
     parts.append(_setup_stats_line("├ESEC", esec, " "))

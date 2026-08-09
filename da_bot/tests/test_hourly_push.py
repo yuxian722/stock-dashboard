@@ -176,7 +176,7 @@ class TestGroupForMachine(unittest.TestCase):
 
 
 class TestGetEpoxyDoneByJcode(unittest.TestCase):
-    """EPOXY(ESEC+DB)今日已完成的改機次數依job_code分CED機台/CEE機台/CD機台。"""
+    """EPOXY(ESEC+DB)今日已完成的改機次數，依「實際job_code」逐一列出台數。"""
 
     def setUp(self):
         self._orig_db_path = hourly_push.DB_PATH
@@ -184,20 +184,21 @@ class TestGetEpoxyDoneByJcode(unittest.TestCase):
     def tearDown(self):
         hourly_push.DB_PATH = self._orig_db_path
 
-    def test_classifies_epoxy_done_records_by_jcode_prefix(self):
+    def test_groups_by_actual_jcode_not_broad_category(self):
+        # 2026/08/09使用者要求要看到CED/CEDO/CD這些「實際代碼」各自的台數，
+        # 不要收斂成CED機台/CEE機台/CD機台三個大類，把CEDO藏在CED機台裡看不到
         today = datetime.date.today().isoformat()
         hourly_push.DB_PATH = _make_db_with_records([
-            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "CED-1"},   # ESEC
-            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "job_code": "CEE123"},  # DB
-            {"machine_id": "BA401", "e_tag": "S", "end_date": today, "job_code": "CD-2"},    # ESEC
-            {"machine_id": "BA801", "e_tag": "S", "end_date": today, "job_code": "CED"},     # LOC, 不算EPOXY
-            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "INK"},     # ESEC，但INK不是真正改機，不算
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "CED"},    # ESEC
+            {"machine_id": "BA401", "e_tag": "S", "end_date": today, "job_code": "CEDO"},   # ESEC
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "job_code": "CEDO"},   # DB
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": today, "job_code": "CD"},     # DB
+            {"machine_id": "BA801", "e_tag": "S", "end_date": today, "job_code": "CED"},    # LOC, 不算EPOXY
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "INK"},    # ESEC，但INK不是真正改機，不算
         ])
         result = hourly_push.get_epoxy_done_by_jcode()
-        self.assertEqual(result.get("CED機台"), 1)
-        self.assertEqual(result.get("CEE機台"), 1)
-        self.assertEqual(result.get("CD機台"), 1)
-        self.assertNotIn("其他", result)
+        self.assertEqual(result, {"CED": 1, "CEDO": 2, "CD": 1})
+        self.assertEqual(sum(result.values()), 4)
 
     def test_non_changeover_jcode_not_counted(self):
         # CPIS的e_tag='S'不是每一筆都是機型改機，補墨水(INK)/AI視覺校正(AING)/
@@ -300,11 +301,15 @@ class TestBuildHourlyPushMessageNewSections(unittest.TestCase):
         hourly_push.DB_PATH = _make_db_with_records([
             {"machine_id": "BA205", "e_tag": "S", "bgn_date": "2026-08-08", "bgn_time": "10:00",
              "end_date": today, "end_time": "12:00", "job_code": "CED"},
+            {"machine_id": "BAA01", "e_tag": "S", "bgn_date": "2026-08-08", "bgn_time": "10:00",
+             "end_date": today, "end_time": "12:00", "job_code": "CEDO"},
         ])
         msg = hourly_push.build_hourly_push_message()
         self.assertIn("🔧 今日改機統計", msg)
-        self.assertIn("EPOXY   改機1 | 改機中0 | 待改0", msg)
-        self.assertIn("CED機台1", msg)
+        self.assertIn("EPOXY   改機2 | 改機中0 | 待改0", msg)
+        # 逐一列出實際job_code(不再收斂成CED機台這種大類)，加總要等於改機總數
+        self.assertIn("CED1台", msg)
+        self.assertIn("CEDO1台", msg)
 
     def test_overtime_section_shows_placeholder_when_no_pm_monitor_data(self):
         hourly_push.DB_PATH = _make_db_with_records([])
