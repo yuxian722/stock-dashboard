@@ -587,6 +587,27 @@ def health_reply(machine_id: str) -> str:
     return "\n".join(lines)
 
 
+def full_info_reply(machine_id: str) -> str:
+    """
+    回傳機台的完整資訊：即時狀態 + 修機/改機統計摘要 + 最新稼動率 + 設備健康監控
+    (有資料才附上)。單純打機台代號、沒加其他關鍵字時用這個，取代原本只回即時狀態。
+    """
+    parts = [
+        live_status_reply(machine_id),
+        "",
+        summary_reply(machine_id),
+        "",
+        utilization_reply(machine_id),
+    ]
+
+    health = health_reply(machine_id)
+    if "查無設備健康監控資料" not in health and "資料表還不存在" not in health:
+        parts.append("")
+        parts.append(health)
+
+    return "\n".join(parts)
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1].upper() == "DB":
         print(db_group_reply())
@@ -621,5 +642,7 @@ if __name__ == "__main__":
         print(downrate_reply(machine))
     elif mode == "health":
         print(health_reply(machine))
+    elif mode == "full":
+        print(full_info_reply(machine))
     else:
         print(summary_reply(machine))

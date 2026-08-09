@@ -44,7 +44,7 @@ def get_ongoing_records():
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT machine_id, bgn_date, bgn_time, job_code, e_tag, engineer_id
+        SELECT machine_id, bgn_date, bgn_time, job_code, e_tag, engineer_id, cause
         FROM ee_maintenance_record
         WHERE (end_date IS NULL OR end_date = '' OR end_time IS NULL OR end_time = '')
           AND e_tag IN ('R', 'S')
@@ -139,7 +139,9 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
         else:
             status_note = ""
 
-        line = f"{r['machine_id']}  {hrs:.2f}hr{status_note}  {r['job_code']}"
+        engineer = r["engineer_id"] or "未指定"
+        cause = r["cause"] or "無"
+        line = f"{r['machine_id']}  {hrs:.2f}hr{status_note}  {r['job_code']}  工程師:{engineer}  原因:{cause}"
 
         if r["e_tag"] == "S":
             setup_lines.append(line)

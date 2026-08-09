@@ -9,3 +9,9 @@ apg_password=your_apg_password
 # Utilization Analysis 用的 APG 子系統帳密（tncpis.tn.chipmos.com.tw）
 util_user=your_util_account
 util_password=your_util_password
+
+# (選填) team+整點推播除了預設的「機器人推播」室，還要多推播到哪些聊天室，
+# 逗號分隔，可填多個。ChatID取得方式：到目標聊天室畫面，F12開發者工具->
+# 網路分頁->送出一則訊息->找SendMsgHandler.ashx那個請求->表單資料裡的ChatID欄位。
+# 不填的話維持只推播到teamplus_api.py裡CHAT_ID那一間，行為不變。
+# teamplus_extra_chat_ids=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx,yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy

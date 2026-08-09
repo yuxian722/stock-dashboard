@@ -5,7 +5,7 @@ team+「機器人推播」室 - 即時問答監聽腳本 (08/06改版：HTTP API
       不需要「查」開頭，例如「BA220」「BA220今天」「BAA02今天狀態」都可以。
 
 指令關鍵字(可加在機台代號前後，不用空格也可以):
-    (不加關鍵字)      -> 即時狀態(有沒有在修機/改機中，沒有的話顯示最近一筆)
+    (不加關鍵字)      -> 完整資訊(即時狀態+修機/改機統計摘要+最新稼動率+設備健康監控)
     今天              -> 今天的修機/改機明細
     昨天              -> 昨天的修機/改機明細
     上週              -> 過去7天(不含今天)的統計摘要
@@ -174,8 +174,8 @@ def parse_query(text):
         except ValueError:
             pass
 
-    # 沒抓到時間相關關鍵字(包含「故障」「狀態」這類詞)，預設回即時狀態
-    return {"machine": machine, "mode": "live"}
+    # 沒抓到時間相關關鍵字(包含「故障」「狀態」這類詞)，預設回完整資訊
+    return {"machine": machine, "mode": "full"}
 
 
 def build_reply(cmd):
@@ -196,8 +196,8 @@ def build_reply(cmd):
     machine = cmd["machine"]
 
     try:
-        if mode == "live":
-            return query_bot.live_status_reply(machine)
+        if mode == "full":
+            return query_bot.full_info_reply(machine)
         if mode == "detail":
             return query_bot.detail_reply(machine, date=cmd["date"])
         if mode == "range":

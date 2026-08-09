@@ -15,13 +15,20 @@ team+這部分的穩定性應該會好非常多。
 用法：
     import teamplus_api
     texts, new_cursor = teamplus_api.read_new_messages(cursor)
-    ok, desc = teamplus_api.send_message("要送出的文字")
+    ok, desc = teamplus_api.send_message("要送出的文字")          # 只送到機器人推播室
+    results = teamplus_api.broadcast_message("要送出的文字")      # 送到機器人推播室+額外聊天室
 
 前置：
     da_bot資料夾下要有 teamplus_cookie.txt，內容是從瀏覽器F12開發者工具->
     網路分頁->任一個team+請求->標頭->要求標頭->cookie 那一整串複製出來的。
     這組cookie有時效性，過期時send_message/read_new_messages會回傳失敗，
     訊息會提示需要重新用F12抓一次新的cookie。
+
+多推播幾個聊天室：
+    到目標聊天室畫面，用同樣的F12方式抓出該室的ChatID(網路分頁->送訊息的
+    請求->表單資料裡的ChatID欄位)，填進config.txt的teamplus_extra_chat_ids
+    (逗號分隔，可以填多個)，broadcast_message()就會一起送。沒設定的話維持
+    只送到CHAT_ID(機器人推播室)這一間，行為跟改版前一樣。
 """
 import os
 import sys
@@ -30,6 +37,8 @@ import uuid
 import ssl
 import urllib.request
 import urllib.parse
+
+import config
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 COOKIE_PATH = os.path.join(SCRIPT_DIR, "teamplus_cookie.txt")
@@ -108,9 +117,19 @@ def read_new_messages(cursor=None):
     return texts, new_cursor
 
 
-def send_message(message):
+def _load_extra_chat_ids():
+    """讀config.txt的teamplus_extra_chat_ids(逗號分隔ChatID清單)，沒設定就回傳空清單。"""
+    try:
+        cfg = config.load()
+    except FileNotFoundError:
+        return []
+    raw = cfg.get("teamplus_extra_chat_ids", "")
+    return [c.strip() for c in raw.split(",") if c.strip()]
+
+
+def send_message(message, chat_id=None):
     """
-    送一則訊息到「機器人推播」室。
+    送一則訊息到指定聊天室(預設CHAT_ID，「機器人推播」室)。
     回傳 (ok: bool, desc: str)。
     """
     cookie = load_cookie()
@@ -118,7 +137,7 @@ def send_message(message):
         "action": "sendChatMessage",
         "batchID": str(uuid.uuid4()),
         "ChannelType": CHANNEL_TYPE,
-        "ChatID": CHAT_ID,
+        "ChatID": chat_id or CHAT_ID,
         "Recipients": json.dumps(RECIPIENTS, ensure_ascii=False, separators=(",", ":")),
         "GroupList": "[]",
         "MsgContent": message,
@@ -149,8 +168,21 @@ def send_message(message):
         return False, f"{type(e).__name__}: {e}"
 
 
+def broadcast_message(message):
+    """
+    送到CHAT_ID(機器人推播室)以及config.txt裡teamplus_extra_chat_ids設定的所有
+    額外聊天室。回傳list of (chat_id, ok, desc)，方便呼叫端逐一檢查有沒有哪個
+    房間送失敗。沒設定額外聊天室時，效果等同只呼叫send_message(message)一次。
+    """
+    results = []
+    for chat_id in [CHAT_ID] + _load_extra_chat_ids():
+        ok, desc = send_message(message, chat_id=chat_id)
+        results.append((chat_id, ok, desc))
+    return results
+
+
 if __name__ == "__main__":
-    # 簡單測試：python teamplus_api.py 送一則測試訊息
+    # 簡單測試：python teamplus_api.py 送一則測試訊息(含額外聊天室)
     msg = sys.argv[1] if len(sys.argv) > 1 else "[測試] teamplus_api.py 連線測試"
-    ok, desc = send_message(msg)
-    print(("✓" if ok else "✗"), desc)
+    for chat_id, ok, desc in broadcast_message(msg):
+        print(("✓" if ok else "✗"), f"[{chat_id}]", desc)
