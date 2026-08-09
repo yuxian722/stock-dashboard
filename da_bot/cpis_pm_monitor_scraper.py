@@ -99,8 +99,62 @@ def _find_grid_html(driver, max_depth=5, log=None):
     return None
 
 
-def fetch_pm_monitor_html(wait_seconds=WAIT_SECONDS):
-    """開無頭瀏覽器，等JS畫出機況表格，回傳渲染後含目標表格的那一層HTML。
+def _switch_to_frame_with_element(driver, element_id, max_depth=5):
+    """
+    遞迴切換進每一層frame，找到含指定id元素的那一層就停在那一層(留在那一層
+    不切回去，方便呼叫端直接操作該元素)，回傳True；找不到的話切回最外層、
+    回傳False。
+    """
+    try:
+        driver.find_element("id", element_id)
+        return True
+    except Exception:
+        pass
+    if max_depth <= 0:
+        return False
+
+    frame_count = len(driver.find_elements("tag name", "frame") + driver.find_elements("tag name", "iframe"))
+    for i in range(frame_count):
+        frames = driver.find_elements("tag name", "frame") + driver.find_elements("tag name", "iframe")
+        try:
+            driver.switch_to.frame(frames[i])
+        except Exception:
+            continue
+        if _switch_to_frame_with_element(driver, element_id, max_depth - 1):
+            return True
+        driver.switch_to.parent_frame()
+    return False
+
+
+def _select_oper_kind_and_fetch(driver, oper_kind):
+    """
+    截圖發現：全新開的無頭瀏覽器一開始Oper Kind預設是"FRONT END"、下面的
+    機況表格整個是空的，完全沒有資料——實際使用者手動操作時之所以一開頁面
+    就有資料，是瀏覽器記得之前選過"D/A"、按過Fetch的緣故(session/ViewState)，
+    全新session沒有這個記憶。這裡就是補上這個動作：切進控制項所在的那個
+    frame，把Oper Kind下拉選單選成oper_kind、按下Fetch按鈕，觸發JS真正
+    去要一次資料。選不到/按不到就算了(結構跟預期不同)，讓呼叫端自己決定
+    要不要退回用預設值繼續嘗試找表格。
+    """
+    driver.switch_to.default_content()
+    if not _switch_to_frame_with_element(driver, "ddlOperKind"):
+        return False
+    try:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import Select
+
+        Select(driver.find_element(By.ID, "ddlOperKind")).select_by_visible_text(oper_kind)
+        driver.find_element(By.ID, "btnFetch").click()
+        return True
+    except Exception:
+        return False
+    finally:
+        driver.switch_to.default_content()
+
+
+def fetch_pm_monitor_html(wait_seconds=WAIT_SECONDS, oper_kind="D/A"):
+    """開無頭瀏覽器，選好Oper Kind、按Fetch觸發JS載入，等機況表格畫出來，
+    回傳渲染後含目標表格的那一層HTML。
 
     找不到表格時，會先存一張目前畫面的截圖(SCREENSHOT_PATH)再丟例外——
     比起純文字的錯誤訊息，截圖能直接看出JS到底畫出了什麼(卡在載入中、
@@ -109,6 +163,8 @@ def fetch_pm_monitor_html(wait_seconds=WAIT_SECONDS):
     driver = _make_driver()
     try:
         driver.get(PM_MONITOR_URL)
+        time.sleep(3)  # 先讓frame結構載入完，才找得到裡面的控制項
+        _select_oper_kind_and_fetch(driver, oper_kind)
         time.sleep(wait_seconds)
         log = []
         html = _find_grid_html(driver, log=log)
@@ -155,8 +211,8 @@ def parse_pm_monitor_html(html):
     return []
 
 
-def fetch_pm_monitor_records(wait_seconds=WAIT_SECONDS):
-    html = fetch_pm_monitor_html(wait_seconds)
+def fetch_pm_monitor_records(wait_seconds=WAIT_SECONDS, oper_kind="D/A"):
+    html = fetch_pm_monitor_html(wait_seconds, oper_kind)
     return parse_pm_monitor_html(html)
 
 
