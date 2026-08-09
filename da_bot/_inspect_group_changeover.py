@@ -65,12 +65,16 @@ if __name__ == "__main__":
     conn.close()
 
     done_matched = []
-    done_wrong_group = []
     done_not_real_changeover = []
     for r in all_done:
         if not _group_matches(r["machine_id"], group):
             continue
-        if hourly_push._epoxy_jcode_category(r["job_code"]) is None:
+        # 用機台實際對應到的機型群組(不是CLI輸入的group，那可能是"EPOXY"這種
+        # 涵蓋ESEC+DB的複合群組，不是_changeover_jcode_category()認得的key)
+        # 去查該群組自己的真正改機job_code標準(ESEC/DB是CED/CEE/CD/CE，
+        # LOC是CN/CD)
+        real_group = hourly_push._group_for_machine(r["machine_id"])
+        if hourly_push._changeover_jcode_category(real_group, r["job_code"]) is None:
             done_not_real_changeover.append(r)
             continue
         done_matched.append(r)
@@ -81,7 +85,7 @@ if __name__ == "__main__":
               f"end={r['end_date']} {r['end_time']}  job_code={r['job_code']}  "
               f"工號={r['engineer_id']}  dur={r['dur']}")
     if done_not_real_changeover:
-        print(f"  (另外有 {len(done_not_real_changeover)} 筆job_code不是CED/CEE/CD真正改機類別，不計入，如下)")
+        print(f"  (另外有 {len(done_not_real_changeover)} 筆job_code不是該群組真正改機類別，不計入，如下)")
         for r in done_not_real_changeover:
             print(f"    [排除] {r['machine_id']}  end={r['end_date']} {r['end_time']}  job_code={r['job_code']}")
 
@@ -91,14 +95,40 @@ if __name__ == "__main__":
     if not pm_rows:
         print("【PM Monitor】尚未抓到資料(pm_monitor_record是空的或還沒抓過)")
     else:
-        setup_rows = [r for r in pm_rows if _group_matches(r["entity"], group) and r["status"] == "SETUP"]
-        wait_rows = [r for r in pm_rows if _group_matches(r["entity"], group) and r["status"] == "WAIT-SETUP"]
+        def _is_real_changeover(r):
+            real_group = hourly_push._group_for_machine(r["entity"])
+            return hourly_push._changeover_jcode_category(real_group, r["jcode"]) is not None
+
+        setup_rows = [
+            r for r in pm_rows
+            if _group_matches(r["entity"], group) and r["status"] == "SETUP" and _is_real_changeover(r)
+        ]
+        wait_rows = [
+            r for r in pm_rows
+            if _group_matches(r["entity"], group) and r["status"] == "WAIT-SETUP" and _is_real_changeover(r)
+        ]
+        setup_excluded = [
+            r for r in pm_rows
+            if _group_matches(r["entity"], group) and r["status"] == "SETUP" and not _is_real_changeover(r)
+        ]
+        wait_excluded = [
+            r for r in pm_rows
+            if _group_matches(r["entity"], group) and r["status"] == "WAIT-SETUP" and not _is_real_changeover(r)
+        ]
         print(f"【改機中(PM Monitor, STATUS=SETUP)】{group} 共 {len(setup_rows)} 筆:")
         for r in setup_rows:
             print(f"  {r['entity']}  jcode={r['jcode']}  in_time={r['in_time']}  operator={r['operator']}")
+        if setup_excluded:
+            print(f"  (另外有 {len(setup_excluded)} 筆job_code不是該群組真正改機類別，不計入，如下)")
+            for r in setup_excluded:
+                print(f"    [排除] {r['entity']}  jcode={r['jcode']}  in_time={r['in_time']}")
         print(f"【待改(PM Monitor, STATUS=WAIT-SETUP)】{group} 共 {len(wait_rows)} 筆:")
         for r in wait_rows:
             print(f"  {r['entity']}  jcode={r['jcode']}  in_time={r['in_time']}  operator={r['operator']}")
+        if wait_excluded:
+            print(f"  (另外有 {len(wait_excluded)} 筆job_code不是該群組真正改機類別，不計入，如下)")
+            for r in wait_excluded:
+                print(f"    [排除] {r['entity']}  jcode={r['jcode']}  in_time={r['in_time']}")
 
         # 順便列出這個群組裡PM Monitor所有其他狀態(ENG/QC/IN-REPAIR等)，
         # 避免使用者拿PM Monitor整張表逐行數、把非SETUP的狀態也算成改機中
