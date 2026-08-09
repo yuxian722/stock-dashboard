@@ -13,7 +13,10 @@ DB_PATH = "da_maintenance.db"
 
 # 標準工時對照表(與 query_bot.py 保持一致)
 JOB_CODE_STD_HOURS = {
-    "CED": 2.3,
+    "CED-M2": 2.9,  # Multi step(2 dies)，2026/08/09使用者提供
+    "CED-M3": 2.9,  # Multi step(3 dies)，2026/08/09使用者提供
+    "CED-M4": 2.9,  # Multi step(4 dies)，2026/08/09使用者提供
+    "CED": 2.3,     # 頂針(CED-1等)，2026/08/09使用者提供
     "CE": 3.0,
     "CEE": 3.0,
 }

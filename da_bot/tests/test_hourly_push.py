@@ -173,6 +173,17 @@ class TestGetStdHours(unittest.TestCase):
     def test_empty_returns_none(self):
         self.assertIsNone(hourly_push.get_std_hours(""))
 
+    def test_ced_1_uses_generic_ced_prefix_2_3(self):
+        # CED-1(頂針)沒有專屬key，退回用"CED"前綴比對，2026/08/09使用者確認2.3hr
+        self.assertEqual(hourly_push.get_std_hours("CED-1"), 2.3)
+
+    def test_ced_m2_m3_m4_use_2_9_not_generic_ced_prefix(self):
+        # CED-M2/M3/M4(Multi step)有自己的標準工時2.9hr，不能被"CED"前綴
+        # 攔截成2.3hr——2026/08/09使用者提供
+        self.assertEqual(hourly_push.get_std_hours("CED-M2"), 2.9)
+        self.assertEqual(hourly_push.get_std_hours("CED-M3"), 2.9)
+        self.assertEqual(hourly_push.get_std_hours("CED-M4"), 2.9)
+
 
 class TestGroupForMachine(unittest.TestCase):
     """機台代號→機型群組(ESEC/DB/LOC/FC)，對齊同事Dashboard的getEntityGroup規則。"""

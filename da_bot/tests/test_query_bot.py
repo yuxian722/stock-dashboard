@@ -69,5 +69,18 @@ class TestFullInfoReply(unittest.TestCase):
         self.assertIn("健康分:80", reply)
 
 
+class TestGetStdHours(unittest.TestCase):
+    """2026/08/09使用者提供：CED-1(頂針)2.3hr、CED-M2/M3/M4(Multi step)2.9hr，
+    跟hourly_push.py保持一致。"""
+
+    def test_ced_1_uses_generic_ced_prefix_2_3(self):
+        self.assertEqual(query_bot.get_std_hours("CED-1"), 2.3)
+
+    def test_ced_m2_m3_m4_use_2_9_not_generic_ced_prefix(self):
+        self.assertEqual(query_bot.get_std_hours("CED-M2"), 2.9)
+        self.assertEqual(query_bot.get_std_hours("CED-M3"), 2.9)
+        self.assertEqual(query_bot.get_std_hours("CED-M4"), 2.9)
+
+
 if __name__ == "__main__":
     unittest.main()
