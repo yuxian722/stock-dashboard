@@ -3,6 +3,8 @@ team+「機器人推播」室 - 即時問答監聽腳本 (08/06改版：HTTP API
 
 用法: 在「機器人推播」對話畫面打任何含有機台代號的訊息，機器人會自動回覆。
       不需要「查」開頭，例如「BA220」「BA220今天」「BAA02今天狀態」都可以。
+      忘記關鍵字怎麼打的話，直接打「查詢」或「help」，機器人會回完整的
+      關鍵字說明清單(見下方HELP_TEXT)。
 
 指令關鍵字(可加在機台代號前後，不用空格也可以):
     (不加關鍵字)      -> 完整資訊(即時狀態+修機/改機統計摘要+最新稼動率+設備健康監控)
@@ -12,6 +14,7 @@ team+「機器人推播」室 - 即時問答監聽腳本 (08/06改版：HTTP API
     本週              -> 本週一到今天的統計摘要
     07/24~07/30       -> 指定區間的統計摘要
     稼動              -> 最新一筆稼動率資料
+    查詢 / help       -> 叫出關鍵字說明清單(HELP_TEXT)
 
 範例: BA220 / BA220今天 / 查BA220上週 / BAA02稼動
 
@@ -73,6 +76,40 @@ _OFFICIAL_GROUP_PATTERNS = [(label, _build_official_group_pattern(label)) for la
 # 在某一處判斷式裡漏比對到(容忍空格、大小寫都要跟這裡一致)
 _DOWNRATE_KW_RE = re.compile(r"down\s*rate|停機明細|稼動明細", re.IGNORECASE)
 
+# 打這些字(整句、不含其他內容)就叫出關鍵字說明清單，忘記怎麼查的時候用
+HELP_TRIGGERS = {"查詢", "說明", "help", "指令", "用法", "選單", "?", "？"}
+
+HELP_TEXT = (
+    "【DA機器人 查詢關鍵字說明】\n"
+    "機台代號(例如BAA08、BA220)可加在關鍵字前後，不用空格也可以：\n"
+    "\n"
+    "(不加關鍵字)                     完整資訊(即時狀態+統計摘要+稼動率+健康監控)\n"
+    "今天                             今天的修機/改機明細\n"
+    "昨天                             昨天的修機/改機明細\n"
+    "上週 / 上周                      過去7天(不含今天)統計摘要\n"
+    "本週 / 本周                      本週一到今天統計摘要\n"
+    "07/24~07/30                      指定區間統計摘要\n"
+    "稼動 / 稼動率                    最新一筆稼動率資料\n"
+    "downrate / down rate / 停機明細  該機台稼動細項(改機/工程/停機/閒置...)\n"
+    "健康                             設備健康監控資料\n"
+    "\n"
+    "機型群組查詢(不用加機台代號)：\n"
+    "DB          DB800+DB830+DB700 三組彙總\n"
+    "Epoxy       Esec2100+EPOXY(DB) 全部加總\n"
+    "EPOXY(DB)   DB700+DB800+DB830 加總\n"
+    "CM700       CM700機型群組\n"
+    "Esec2100    2100advi+2100SD機型群組\n"
+    "\n"
+    "官方GROUP彙總表原始數字(不是我們自己逐台平均算的)：\n"
+    "<官方群組名稱> + downrate/稼動明細/停機明細，例如「DB800 downrate」\n"
+    "官方群組名稱: 2100SD / DATACON8800 / DB700 / DB800 / DB830 /\n"
+    "              EPOXY(DB) / Epoxy / Flip Chip / LOC\n"
+    "\n"
+    "範例: BA220 / BA220今天 / BAA02上週 / BAA08 down rate / DB800downrate\n"
+    "\n"
+    "打「查詢」「說明」「help」「指令」都可以再叫出這份清單"
+)
+
 
 def parse_query(text):
     """
@@ -84,6 +121,9 @@ def parse_query(text):
     text = text.strip()
     if not text:
         return None
+
+    if text.lower() in HELP_TRIGGERS:
+        return {"mode": "help"}
 
     # 官方GROUP彙總表數字查詢：「<官方群組名稱> + downrate/稼動明細/停機明細」關鍵字，
     # 回傳CPIS Utilization Analysis頁面最下方GROUP彙總表該群組的官方原始一列數字
@@ -180,6 +220,9 @@ def parse_query(text):
 
 def build_reply(cmd):
     mode = cmd["mode"]
+
+    if mode == "help":
+        return HELP_TEXT
 
     if mode == "db_group":
         try:

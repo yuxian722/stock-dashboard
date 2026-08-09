@@ -47,5 +47,28 @@ class TestParseQueryDownrate(unittest.TestCase):
         self.assertEqual(cmd, {"mode": "group_official_downrate", "group_label": "DB800"})
 
 
+class TestHelpTrigger(unittest.TestCase):
+    def test_chinese_trigger(self):
+        self.assertEqual(listener.parse_query("查詢"), {"mode": "help"})
+
+    def test_english_trigger_case_insensitive(self):
+        self.assertEqual(listener.parse_query("HELP"), {"mode": "help"})
+        self.assertEqual(listener.parse_query("Help"), {"mode": "help"})
+
+    def test_other_trigger_words(self):
+        for word in ("說明", "指令", "用法", "選單", "?", "？"):
+            self.assertEqual(listener.parse_query(word), {"mode": "help"}, msg=word)
+
+    def test_trigger_word_as_part_of_longer_message_not_matched(self):
+        # 只有整句完全等於觸發字才叫出說明清單，不要在正常查詢句子裡誤觸發
+        cmd = listener.parse_query("BAA08查詢一下狀態")
+        self.assertNotEqual(cmd.get("mode"), "help")
+
+    def test_build_reply_returns_help_text(self):
+        reply = listener.build_reply({"mode": "help"})
+        self.assertEqual(reply, listener.HELP_TEXT)
+        self.assertIn("今天", reply)
+
+
 if __name__ == "__main__":
     unittest.main()
