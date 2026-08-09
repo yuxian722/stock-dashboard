@@ -69,6 +69,10 @@ def _build_official_group_pattern(label):
 
 _OFFICIAL_GROUP_PATTERNS = [(label, _build_official_group_pattern(label)) for label in _OFFICIAL_GROUP_LABELS]
 
+# downrate關鍵字判斷全部共用這一份，避免像"DOWN RATE"(中間有空格)這種寫法
+# 在某一處判斷式裡漏比對到(容忍空格、大小寫都要跟這裡一致)
+_DOWNRATE_KW_RE = re.compile(r"down\s*rate|停機明細|稼動明細", re.IGNORECASE)
+
 
 def parse_query(text):
     """
@@ -91,13 +95,9 @@ def parse_query(text):
     # 「DB800downrate」這種中間沒空格的寫法：關鍵字緊貼著群組名稱時，
     # 群組名稱右邊的英文字母會讓邊界判斷失敗，拿掉關鍵字後邊界就正常了。
     stripped = text
-    has_downrate_kw = False
-    for kw_pattern in (re.compile(r"down\s*rate", re.IGNORECASE),
-                       re.compile(r"停機明細"), re.compile(r"稼動明細")):
-        if kw_pattern.search(stripped):
-            has_downrate_kw = True
-            stripped = kw_pattern.sub(" ", stripped)
+    has_downrate_kw = bool(_DOWNRATE_KW_RE.search(stripped))
     if has_downrate_kw:
+        stripped = _DOWNRATE_KW_RE.sub(" ", stripped)
         for label, pattern in _OFFICIAL_GROUP_PATTERNS:
             if pattern.search(stripped):
                 return {"mode": "group_official_downrate", "group_label": label}
@@ -138,7 +138,7 @@ def parse_query(text):
     if "稼動" in text or "稼動率" in text:
         return {"machine": machine, "mode": "util"}
 
-    if "downrate" in text.lower() or "停機明細" in text or "稼動明細" in text:
+    if _DOWNRATE_KW_RE.search(text):
         return {"machine": machine, "mode": "downrate"}
 
     if "健康" in text:

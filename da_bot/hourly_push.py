@@ -74,11 +74,17 @@ def _to_float_percent(s):
         return None
 
 
-def get_latest_utilization_summary():
+# 整點推播要列出的機型分組，對應CPIS Utilization Analysis頁面最下方「GROUP」
+# 官方彙總表(跟query_bot.OFFICIAL_GROUP_LABELS共用同一份官方名稱/大小寫)
+PUSH_GROUP_LABELS = ["EPOXY(DB)", "Epoxy", "DB700", "DB800", "DB830", "2100SD"]
+
+
+def get_official_group_rates():
     """
-    從 utilization_record 抓最新一批資料，算出稼動率(UTIL)和改機比重(SETUP)的平均值。
-    優先用網頁本身算好的 SUM(小計)列；若這批資料沒有SUM列，退回用所有機台明細列自算平均。
-    抓不到資料就回傳 None，呼叫端顯示「暫無」。
+    從 utilization_record 抓最新一批資料裡，PUSH_GROUP_LABELS這幾個官方GROUP
+    彙總列(ENTITY為空、MODEL=群組名)的UTIL/SETUP，回傳
+    {group_label: {"util":.., "setup":..}}；抓不到資料的分組不會出現在結果裡，
+    整批都沒抓到資料時回傳空dict。
     """
     conn = get_conn()
     cur = conn.cursor()
@@ -88,33 +94,24 @@ def get_latest_utilization_summary():
     latest_fetched_at = row[0] if row else None
     if not latest_fetched_at:
         conn.close()
-        return None
+        return {}
 
-    cur.execute("""
-        SELECT UTIL, SETUP, ENTITY FROM utilization_record
-        WHERE fetched_at = ?
-    """, (latest_fetched_at,))
-    rows = cur.fetchall()
+    result = {}
+    for label in PUSH_GROUP_LABELS:
+        cur.execute("""
+            SELECT UTIL, SETUP FROM utilization_record
+            WHERE fetched_at = ? AND MODEL = ? AND (ENTITY IS NULL OR ENTITY = '')
+        """, (latest_fetched_at, label))
+        r = cur.fetchone()
+        if r is None:
+            continue
+        util = _to_float_percent(r["UTIL"])
+        if util is None:
+            continue
+        result[label] = {"util": util, "setup": _to_float_percent(r["SETUP"])}
+
     conn.close()
-
-    if not rows:
-        return None
-
-    sum_rows = [r for r in rows if (r["ENTITY"] or "").strip().upper() == "SUM"]
-    target_rows = sum_rows if sum_rows else [
-        r for r in rows if (r["ENTITY"] or "").strip().upper() not in ("SUM", "TARGET")
-    ]
-
-    util_vals = [v for v in (_to_float_percent(r["UTIL"]) for r in target_rows) if v is not None]
-    setup_vals = [v for v in (_to_float_percent(r["SETUP"]) for r in target_rows) if v is not None]
-
-    if not util_vals:
-        return None
-
-    avg_util = sum(util_vals) / len(util_vals)
-    avg_setup = sum(setup_vals) / len(setup_vals) if setup_vals else None
-
-    return {"util": avg_util, "setup": avg_setup, "n": len(target_rows)}
+    return result
 
 
 def build_hourly_push_message(now: datetime.datetime = None) -> str:
@@ -160,18 +157,22 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
     if not setup_lines and not repair_lines:
         parts.append("(目前無進行中的改機/修機紀錄)")
 
-    # 稼動/改機 rate 統計，來源是 CPIS APG Utilization Analysis 這個資料源
+    # 稼動/改機 rate，來源是CPIS APG Utilization Analysis頁面最下方的官方GROUP彙總表
     parts.append("")
     parts.append("【稼動 / 改機】")
-    util_summary = get_latest_utilization_summary()
-    if util_summary is None:
+    group_rates = get_official_group_rates()
+    if not group_rates:
         parts.append("(rates 暫無，尚未抓取Utilization Analysis資料)")
     else:
-        util_line = f"稼動(UTIL) 平均 {util_summary['util']:.1f}%"
-        if util_summary["setup"] is not None:
-            util_line += f" ｜ 改機(SETUP) 平均 {util_summary['setup']:.1f}%"
-        util_line += f"　(共{util_summary['n']}筆)"
-        parts.append(util_line)
+        for label in PUSH_GROUP_LABELS:
+            g = group_rates.get(label)
+            if g is None:
+                parts.append(f"{label}: 暫無資料")
+                continue
+            line = f"{label}  稼動{g['util']:.1f}%"
+            if g["setup"] is not None:
+                line += f"  改機{g['setup']:.1f}%"
+            parts.append(line)
 
     return "\n".join(parts)
 
