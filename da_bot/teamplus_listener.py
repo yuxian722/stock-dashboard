@@ -264,19 +264,38 @@ MAX_REPLIES_PER_WINDOW = 8
 RATE_LIMIT_WINDOW_SECONDS = 60
 
 
+BOOT_MESSAGE = "🤖 DA機器人已上線，輸入「查詢」看關鍵字說明"
+
+
 def init_listener_state():
     """
     初始化監聽狀態(第一次啟動時呼叫一次)。
-    透過teamplus_api拿目前最新的訊息游標(cursor)，把當下已存在的訊息都當作
-    「已處理」，避免舊訊息被誤觸發回覆；之後每輪呼叫poll_once()時傳入state，
-    並會被就地更新，讓da_bot_service.py合併服務也能重用同一套監聽邏輯。
+
+    重要：team+的getNewestMessageList這支API，NewestBatchID傳空字串/隨便產生
+    一個跟訊息紀錄無關的值，都不保證能拿到正確、穩定可用的cursor(甚至可能直接
+    被拒絕、參數錯誤)。同事逆向出來的teamplus_bot.py開機時的做法，是先送一則
+    「已上線」的訊息，用這則訊息真正的batchID(team+親自確認、真實存在於訊息
+    紀錄裡的值)當第一個cursor，之後的訊息只要比這個batchID新就一定抓得到。
+    這裡照做，不再靠讀取空cursor去猜「目前最新」是什麼。
+
+    如果連上線通知都送失敗(例如cookie過期)，退回用read_new_messages(None)
+    (teamplus_api內部會自動用隨機UUID當NewestBatchID，至少不會直接卡死)，
+    讓服務還能啟動、之後靠[警告]訊息提示需要重新抓cookie。
     """
-    texts, cursor = teamplus_api.read_new_messages(None)
-    print(f"[啟動] 已同步至最新訊息(略過{len(texts)}則既有訊息)，之後只會回應新出現的訊息")
+    ok, desc, bid = teamplus_api.send_message_get_batch_id(BOOT_MESSAGE)
+    bot_sent_norms = []
+    if ok:
+        cursor = bid
+        bot_sent_norms.append(normalize_for_dedup(BOOT_MESSAGE))
+        print("[啟動] 已送出上線通知，之後只會回應這則之後才出現的新訊息")
+    else:
+        print(f"[警告] 上線通知送出失敗({desc})，改用備援方式啟動")
+        texts, cursor = teamplus_api.read_new_messages(None)
+        print(f"[啟動] 已同步至最新訊息(略過{len(texts)}則既有訊息)，之後只會回應新出現的訊息")
     return {
         "cursor": cursor,
-        "bot_sent_norms": [],       # 記住機器人自己最近送出的回覆內容(正規化後)，避免自問自答
-        "recent_reply_times": [],   # 防暴衝保護用的時間戳記錄
+        "bot_sent_norms": bot_sent_norms,  # 記住機器人自己最近送出的回覆內容(正規化後)，避免自問自答
+        "recent_reply_times": [],          # 防暴衝保護用的時間戳記錄
     }
 
 

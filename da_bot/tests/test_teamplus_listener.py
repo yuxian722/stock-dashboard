@@ -114,5 +114,54 @@ class TestPollOnceFloodProtection(unittest.TestCase):
         self.assertEqual(state["cursor"], "cursor-new")
 
 
+class TestInitListenerStateBootstrap(unittest.TestCase):
+    """team+的getNewestMessageList這支API，NewestBatchID傳空字串會直接被拒絕
+    (參數錯誤)——這是即時問答從一開始就完全沒反應的真正原因：cursor第一次
+    永遠初始化不了。同事逆向出來的teamplus_bot.py改用「先送一則上線通知，
+    拿這則訊息真正的batchID當第一個cursor」，這裡鎖定init_listener_state()
+    照做，而且完全不會去呼叫read_new_messages(None)這條容易出事的路徑。
+    """
+
+    def setUp(self):
+        self._orig_send_bid = listener.teamplus_api.send_message_get_batch_id
+        self._orig_read = listener.teamplus_api.read_new_messages
+
+    def tearDown(self):
+        listener.teamplus_api.send_message_get_batch_id = self._orig_send_bid
+        listener.teamplus_api.read_new_messages = self._orig_read
+
+    def test_bootstraps_cursor_from_boot_message_batch_id(self):
+        listener.teamplus_api.send_message_get_batch_id = (
+            lambda message, chat_id=None: (True, "發送成功", "real-batch-id-123")
+        )
+
+        def boom(cursor):
+            self.fail("開機通知送出成功的話，不該再去呼叫read_new_messages(None)")
+
+        listener.teamplus_api.read_new_messages = boom
+
+        state = listener.init_listener_state()
+        self.assertEqual(state["cursor"], "real-batch-id-123")
+
+    def test_boot_message_added_to_dedup_list(self):
+        listener.teamplus_api.send_message_get_batch_id = (
+            lambda message, chat_id=None: (True, "發送成功", "real-batch-id-123")
+        )
+        listener.teamplus_api.read_new_messages = lambda cursor: self.fail("不該呼叫")
+
+        state = listener.init_listener_state()
+        self.assertIn(listener.normalize_for_dedup(listener.BOOT_MESSAGE), state["bot_sent_norms"])
+
+    def test_falls_back_to_read_new_messages_when_boot_message_fails(self):
+        # cookie過期之類的狀況，上線通知送不出去，至少服務還是要能啟動
+        listener.teamplus_api.send_message_get_batch_id = (
+            lambda message, chat_id=None: (False, "cookie過期", "unused-bid")
+        )
+        listener.teamplus_api.read_new_messages = lambda cursor: ([], "fallback-cursor")
+
+        state = listener.init_listener_state()
+        self.assertEqual(state["cursor"], "fallback-cursor")
+
+
 if __name__ == "__main__":
     unittest.main()

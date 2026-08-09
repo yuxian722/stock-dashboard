@@ -139,6 +139,45 @@ class TestReadNewMessagesCursorBootstrap(unittest.TestCase):
         self.assertEqual(captured["NewestBatchID"], cursor1)
 
 
+class TestSendMessageGetBatchId(unittest.TestCase):
+    """同事的teamplus_bot.py開機時靠「送一則上線通知、拿這則訊息真正的
+    batchID當cursor」來啟動監聽，比讀空cursor可靠(那條路線被team+直接
+    拒絕、參數錯誤)。這裡鎖定send_message_get_batch_id()回傳的batch_id
+    就是實際送出去那筆請求裡真正用的batchID，呼叫端才能拿去當cursor用。
+    """
+
+    def setUp(self):
+        self._orig_load_cookie = teamplus_api.load_cookie
+        self._orig_urlopen = teamplus_api.urllib.request.urlopen
+        teamplus_api.load_cookie = lambda: "fake_cookie=1"
+
+    def tearDown(self):
+        teamplus_api.load_cookie = self._orig_load_cookie
+        teamplus_api.urllib.request.urlopen = self._orig_urlopen
+
+    def test_returned_batch_id_matches_what_was_actually_sent(self):
+        captured = {}
+
+        def fake_urlopen(req, context=None, timeout=None):
+            body = req.data.decode("utf-8")
+            captured["batchID"] = teamplus_api.urllib.parse.parse_qs(body)["batchID"][0]
+            return _FakeResponse({"IsSuccess": True})
+
+        teamplus_api.urllib.request.urlopen = fake_urlopen
+        ok, desc, bid = teamplus_api.send_message_get_batch_id("上線通知")
+        self.assertTrue(ok)
+        self.assertEqual(bid, captured["batchID"])
+
+    def test_failure_still_returns_the_batch_id_that_was_attempted(self):
+        def fake_urlopen(req, context=None, timeout=None):
+            return _FakeResponse({"IsSuccess": False, "Description": "cookie過期"})
+
+        teamplus_api.urllib.request.urlopen = fake_urlopen
+        ok, desc, bid = teamplus_api.send_message_get_batch_id("上線通知")
+        self.assertFalse(ok)
+        self.assertTrue(bid)
+
+
 class TestLoadExtraChatIds(unittest.TestCase):
     def setUp(self):
         self._orig_load = teamplus_api.config.load

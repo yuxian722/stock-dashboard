@@ -145,15 +145,13 @@ def _load_extra_chat_ids():
     return [c.strip() for c in raw.split(",") if c.strip()]
 
 
-def send_message(message, chat_id=None):
-    """
-    送一則訊息到指定聊天室(預設CHAT_ID，「機器人推播」室)。
-    回傳 (ok: bool, desc: str)。
-    """
+def _send(message, chat_id, batch_id):
+    """實際送出訊息的底層邏輯，batch_id由呼叫端決定(送訊息時自己產生的批次ID，
+    team+會直接拿這個值當這則訊息的BatchID)。回傳 (ok: bool, desc: str)。"""
     cookie = load_cookie()
     data = {
         "action": "sendChatMessage",
-        "batchID": str(uuid.uuid4()),
+        "batchID": batch_id,
         "ChannelType": CHANNEL_TYPE,
         "ChatID": chat_id or CHAT_ID,
         "Recipients": json.dumps(RECIPIENTS, ensure_ascii=False, separators=(",", ":")),
@@ -184,6 +182,30 @@ def send_message(message, chat_id=None):
             return False, result.get("Description", "未知錯誤(可能cookie過期，需要重新用F12抓一組新的)")
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
+
+
+def send_message(message, chat_id=None):
+    """
+    送一則訊息到指定聊天室(預設CHAT_ID，「機器人推播」室)。
+    回傳 (ok: bool, desc: str)。
+    """
+    return _send(message, chat_id, str(uuid.uuid4()))
+
+
+def send_message_get_batch_id(message, chat_id=None):
+    """
+    跟send_message()一樣送一則訊息，但額外把這次送出實際用的batchID回傳。
+
+    同事逆向出來的teamplus_bot.py開機時，就是靠「先送一則上線通知，拿這則
+    訊息真正的batchID當第一個cursor」來啟動監聽，從來不會用空字串或跟訊息
+    紀錄無關的隨機值去問team+「目前最新的cursor」。這個函式就是給
+    init_listener_state()做同樣的事情用的。
+
+    回傳 (ok: bool, desc: str, batch_id: str)。
+    """
+    bid = str(uuid.uuid4())
+    ok, desc = _send(message, chat_id, bid)
+    return ok, desc, bid
 
 
 def broadcast_message(message):
