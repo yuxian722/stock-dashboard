@@ -243,10 +243,35 @@ def fetch_pm_monitor_records(wait_seconds=WAIT_SECONDS, oper_kind="D/A"):
     return parse_pm_monitor_html(html)
 
 
+def _dump_entity_context(html, needle="ENTITY", radius=250, max_hits=3):
+    """
+    診斷用：直接把html裡"ENTITY"字樣附近的原始內容印出來(而不是再猜表格
+    結構去改程式碼)，這樣可以直接看到真實的HTML長什麼樣，不用再靠猜的。
+    """
+    upper = html.upper()
+    start = 0
+    hits = 0
+    print(f"\n[診斷] 在HTML裡搜尋\"{needle}\"字樣附近的原始內容(前{max_hits}筆)：")
+    while hits < max_hits:
+        idx = upper.find(needle, start)
+        if idx == -1:
+            break
+        s, e = max(0, idx - radius), min(len(html), idx + radius)
+        print(f"\n--- 第{hits + 1}筆(位置{idx}) ---")
+        print(html[s:e])
+        start = idx + len(needle)
+        hits += 1
+    if hits == 0:
+        print(f"(完全沒找到\"{needle}\"字樣，HTML長度={len(html)})")
+
+
 if __name__ == "__main__":
-    records = fetch_pm_monitor_records()
+    html = fetch_pm_monitor_html()
+    records = parse_pm_monitor_html(html)
     print(f"共擷取到 {len(records)} 筆")
     print("[STATUS統計]", dict(Counter(r.get("STATUS", "") for r in records)))
     print("\n[前5筆原始資料]")
     for r in records[:5]:
         print(r)
+    if not records:
+        _dump_entity_context(html)
