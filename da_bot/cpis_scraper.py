@@ -164,8 +164,18 @@ def parse_ee_maintenance_xls(raw_bytes):
     return _rows_to_records(_xls_bytes_to_rows(raw_bytes))
 
 
-def save_to_db(records):
-    """把抓到的資料存進SQLite,對應到跟query_bot.py共用的ee_maintenance_record結構。"""
+def save_to_db(records, date_start=None, date_end=None):
+    """
+    把抓到的資料存進SQLite,對應到跟query_bot.py共用的ee_maintenance_record結構。
+
+    重要：run_pipeline.py每小時都重抓「昨天~今天」這個有重疊的查詢區間，
+    這裡以前只有INSERT、從來沒有DELETE，導致同一筆真實紀錄每小時都被
+    重複塞進資料庫一次，累積下來會讓「今日改機統計」這類依日期彙總的
+    查詢數字暴增到離譜的程度(實測過EPOXY改機次數膨脹到2645次)。
+    這裡改成：如果有帶date_start/date_end(YYYYMMDD)，先刪掉這個查詢
+    區間內已經存在的舊資料，再插入這次抓到的新資料，讓同一區間重複
+    抓取時是「覆蓋」而不是「疊加」，之後重抓同一天不會再重複計入。
+    """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
@@ -181,6 +191,16 @@ def save_to_db(records):
     )
     """)
     conn.commit()
+
+    if date_start and date_end:
+        ds = f"{date_start[:4]}-{date_start[4:6]}-{date_start[6:8]}"
+        de = f"{date_end[:4]}-{date_end[4:6]}-{date_end[6:8]}"
+        cur.execute("""
+            DELETE FROM ee_maintenance_record
+            WHERE (bgn_date BETWEEN ? AND ?)
+               OR (bgn_date IS NULL AND wait_date BETWEEN ? AND ?)
+        """, (ds, de, ds, de))
+        conn.commit()
 
     n = 0
     for r in records:
@@ -229,4 +249,4 @@ if __name__ == "__main__":
         records.extend(parse_ee_maintenance_xls(raw))
 
     print(f"共擷取 {len(records)} 筆")
-    save_to_db(records)
+    save_to_db(records, date_start, date_end)

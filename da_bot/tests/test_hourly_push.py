@@ -1,5 +1,6 @@
-"""hourly_push.py 的離線單元測試(不連網)：用暫存SQLite驗證超時機台訊息格式
-有帶上工程師/原因，以及官方GROUP分組稼動率統計邏輯。"""
+"""hourly_push.py 的離線單元測試(不連網)：驗證今日改機統計(EE Maintenance完成數
++PM Monitor改機中/待改數+EPOXY依job_code分類)、即時機況機台明細、PM Monitor
+JCODE超時判斷、以及官方GROUP分組稼動率統計邏輯。"""
 
 import conftest  # noqa: F401  (設定 sys.path)
 
@@ -19,8 +20,9 @@ _UTIL_TABLE_SQL = """
 """
 
 
-def _make_db_with_ongoing_record(machine_id="BA205", bgn_offset_hours=5.0, job_code="CED",
-                                  e_tag="R", engineer_id="ENG1", cause="cause text"):
+def _make_db_with_records(rows):
+    """rows是list of dict，每個dict可包含machine_id/wait_date/wait_time/bgn_date/
+    bgn_time/end_date/end_time/job_code/e_tag/engineer_id/cause，缺的欄位當NULL。"""
     path = tempfile.mktemp(suffix=".db")
     conn = sqlite3.connect(path)
     conn.execute("""
@@ -30,58 +32,44 @@ def _make_db_with_ongoing_record(machine_id="BA205", bgn_offset_hours=5.0, job_c
             engineer_id TEXT, cause TEXT
         )
     """)
-    now = datetime.datetime.now()
-    bgn = now - datetime.timedelta(hours=bgn_offset_hours)
-    conn.execute(
-        "INSERT INTO ee_maintenance_record VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (machine_id, None, None, bgn.strftime("%Y-%m-%d"), bgn.strftime("%H:%M"),
-         None, None, job_code, e_tag, engineer_id, cause),
-    )
     conn.execute(_UTIL_TABLE_SQL)
+    cols = ["machine_id", "wait_date", "wait_time", "bgn_date", "bgn_time",
+            "end_date", "end_time", "job_code", "e_tag", "engineer_id", "cause"]
+    for row in rows:
+        conn.execute(
+            f"INSERT INTO ee_maintenance_record ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+            tuple(row.get(c) for c in cols),
+        )
     conn.commit()
     conn.close()
     return path
 
 
-class TestBuildHourlyPushMessage(unittest.TestCase):
-    def setUp(self):
-        self._orig_db_path = hourly_push.DB_PATH
-
-    def tearDown(self):
-        hourly_push.DB_PATH = self._orig_db_path
-
-    def test_overtime_line_includes_engineer_and_cause(self):
-        # 預設e_tag="R"(修機)，修機才會顯示原因；改機沒有「原因」這個概念
-        hourly_push.DB_PATH = _make_db_with_ongoing_record(
-            engineer_id="ENG42", cause="Bad identification value setting"
+def _add_pm_monitor_rows(db_path, rows, fetched_at="2026-08-09T17:00:00"):
+    """rows是list，每個元素可以是(entity, status)這種2-tuple(其餘欄位當NULL)，
+    也可以是包含entity/status/jcode/operator/in_time等鍵的dict(缺的鍵當NULL)，
+    寫進db_path的pm_monitor_record表(同一批fetched_at)。"""
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pm_monitor_record (
+            oper TEXT, entity TEXT, model TEXT, status TEXT,
+            lot_no TEXT, bond_id TEXT, wip TEXT, in_time TEXT,
+            outplan TEXT, jcode TEXT, operator TEXT, fetched_at TEXT
         )
-        msg = hourly_push.build_hourly_push_message()
-        self.assertIn("人員ENG42", msg)
-        self.assertIn("原因:Bad identification value setting", msg)
-
-    def test_missing_engineer_and_cause_show_placeholder(self):
-        hourly_push.DB_PATH = _make_db_with_ongoing_record(engineer_id=None, cause=None)
-        msg = hourly_push.build_hourly_push_message()
-        self.assertIn("人員未指定", msg)
-        self.assertIn("原因:無", msg)
-
-    def test_no_ongoing_records_shows_placeholder_message(self):
-        path = tempfile.mktemp(suffix=".db")
-        conn = sqlite3.connect(path)
-        conn.execute("""
-            CREATE TABLE ee_maintenance_record (
-                machine_id TEXT, wait_date TEXT, wait_time TEXT, bgn_date TEXT, bgn_time TEXT,
-                end_date TEXT, end_time TEXT, job_code TEXT, e_tag TEXT,
-                engineer_id TEXT, cause TEXT
-            )
-        """)
-        conn.execute(_UTIL_TABLE_SQL)
-        conn.commit()
-        conn.close()
-        hourly_push.DB_PATH = path
-
-        msg = hourly_push.build_hourly_push_message()
-        self.assertIn("目前無進行中/等待中的改機/修機紀錄", msg)
+    """)
+    for row in rows:
+        if isinstance(row, dict):
+            d = row
+        else:
+            entity, status = row
+            d = {"entity": entity, "status": status}
+        conn.execute(
+            "INSERT INTO pm_monitor_record (entity, status, jcode, operator, in_time, fetched_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (d.get("entity"), d.get("status"), d.get("jcode"), d.get("operator"), d.get("in_time"), fetched_at),
+        )
+    conn.commit()
+    conn.close()
 
 
 def _make_db_with_group_rates(rows):
@@ -160,31 +148,6 @@ class TestGetOfficialGroupRates(unittest.TestCase):
         self.assertNotIn("改機", msg.split("DB800")[1].split("\n")[0])
 
 
-class TestGetStdHours(unittest.TestCase):
-    def test_exact_match(self):
-        self.assertEqual(hourly_push.get_std_hours("CED"), 2.3)
-
-    def test_prefix_match(self):
-        self.assertEqual(hourly_push.get_std_hours("CEE123"), 3.0)
-
-    def test_unknown_returns_none(self):
-        self.assertIsNone(hourly_push.get_std_hours("XYZ"))
-
-    def test_empty_returns_none(self):
-        self.assertIsNone(hourly_push.get_std_hours(""))
-
-    def test_ced_1_uses_generic_ced_prefix_2_3(self):
-        # CED-1(頂針)沒有專屬key，退回用"CED"前綴比對，2026/08/09使用者確認2.3hr
-        self.assertEqual(hourly_push.get_std_hours("CED-1"), 2.3)
-
-    def test_ced_m2_m3_m4_use_2_9_not_generic_ced_prefix(self):
-        # CED-M2/M3/M4(Multi step)有自己的標準工時2.9hr，不能被"CED"前綴
-        # 攔截成2.3hr——2026/08/09使用者提供
-        self.assertEqual(hourly_push.get_std_hours("CED-M2"), 2.9)
-        self.assertEqual(hourly_push.get_std_hours("CED-M3"), 2.9)
-        self.assertEqual(hourly_push.get_std_hours("CED-M4"), 2.9)
-
-
 class TestGroupForMachine(unittest.TestCase):
     """機台代號→機型群組(ESEC/DB/LOC/FC)，對齊同事Dashboard的getEntityGroup規則。"""
 
@@ -212,35 +175,8 @@ class TestGroupForMachine(unittest.TestCase):
         self.assertIsNone(hourly_push._group_for_machine(None))
 
 
-def _make_db_with_records(rows):
-    """rows是list of dict，每個dict可包含machine_id/wait_date/wait_time/bgn_date/
-    bgn_time/end_date/end_time/job_code/e_tag/engineer_id/cause，缺的欄位當NULL。"""
-    path = tempfile.mktemp(suffix=".db")
-    conn = sqlite3.connect(path)
-    conn.execute("""
-        CREATE TABLE ee_maintenance_record (
-            machine_id TEXT, wait_date TEXT, wait_time TEXT, bgn_date TEXT, bgn_time TEXT,
-            end_date TEXT, end_time TEXT, job_code TEXT, e_tag TEXT,
-            engineer_id TEXT, cause TEXT
-        )
-    """)
-    conn.execute(_UTIL_TABLE_SQL)
-    cols = ["machine_id", "wait_date", "wait_time", "bgn_date", "bgn_time",
-            "end_date", "end_time", "job_code", "e_tag", "engineer_id", "cause"]
-    for row in rows:
-        conn.execute(
-            f"INSERT INTO ee_maintenance_record ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
-            tuple(row.get(c) for c in cols),
-        )
-    conn.commit()
-    conn.close()
-    return path
-
-
-class TestGetSetupGroupStats(unittest.TestCase):
-    """今日改機統計：wait_date/wait_time這些欄位資料庫裡本來就有存(EJP報表解析
-    時就寫進去了)，只是之前的整點推播沒有查詢/顯示過。這裡鎖定done(今日完成)/
-    in_progress(改機中)/waiting(待改)三種狀態依機台代號正確分類到ESEC/DB/LOC/FC。"""
+class TestGetEpoxyDoneByJcode(unittest.TestCase):
+    """EPOXY(ESEC+DB)今日已完成的改機次數依job_code分CED機台/CEE機台/CD機台。"""
 
     def setUp(self):
         self._orig_db_path = hourly_push.DB_PATH
@@ -248,18 +184,64 @@ class TestGetSetupGroupStats(unittest.TestCase):
     def tearDown(self):
         hourly_push.DB_PATH = self._orig_db_path
 
-    def test_classifies_done_in_progress_waiting_by_group(self):
+    def test_classifies_epoxy_done_records_by_jcode_prefix(self):
+        today = datetime.date.today().isoformat()
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "CED-1"},   # ESEC
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "job_code": "CEE123"},  # DB
+            {"machine_id": "BA401", "e_tag": "S", "end_date": today, "job_code": "CD-2"},    # ESEC
+            {"machine_id": "BA801", "e_tag": "S", "end_date": today, "job_code": "CED"},     # LOC, 不算EPOXY
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "XYZ"},     # ESEC, 其他
+        ])
+        result = hourly_push.get_epoxy_done_by_jcode()
+        self.assertEqual(result.get("CED機台"), 1)
+        self.assertEqual(result.get("CEE機台"), 1)
+        self.assertEqual(result.get("CD機台"), 1)
+        self.assertEqual(result.get("其他"), 1)
+
+    def test_non_epoxy_group_excluded(self):
+        today = datetime.date.today().isoformat()
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA801", "e_tag": "S", "end_date": today, "job_code": "CED"},  # LOC
+        ])
+        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(), {})
+
+    def test_e_tag_r_excluded(self):
+        today = datetime.date.today().isoformat()
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "R", "end_date": today, "job_code": "CED"},
+        ])
+        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(), {})
+
+    def test_not_completed_today_excluded(self):
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": "2026-08-01", "job_code": "CED"},
+        ])
+        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(), {})
+
+
+class TestGetSetupGroupStats(unittest.TestCase):
+    """今日改機統計：done(今日完成)算自ee_maintenance_record；in_progress(改機中)/
+    waiting(待改)改成算自pm_monitor_record的即時快照(SETUP/WAIT-SETUP)。"""
+
+    def setUp(self):
+        self._orig_db_path = hourly_push.DB_PATH
+
+    def tearDown(self):
+        hourly_push.DB_PATH = self._orig_db_path
+
+    def test_done_from_ee_maintenance_in_progress_and_waiting_from_pm_monitor(self):
         today = datetime.date.today().isoformat()
         hourly_push.DB_PATH = _make_db_with_records([
             {"machine_id": "BA205", "e_tag": "S", "bgn_date": "2026-08-08", "bgn_time": "10:00",
              "end_date": today, "end_time": "12:00", "job_code": "CED"},   # ESEC, 今日完成
-            {"machine_id": "BAA01", "e_tag": "S", "bgn_date": "2026-08-09", "bgn_time": "10:00",
-             "job_code": "CED"},                                          # DB, 改機中
-            {"machine_id": "BA801", "e_tag": "S", "wait_date": "2026-08-09", "wait_time": "09:00",
-             "job_code": "CED"},                                          # LOC, 待改
             # e_tag=R的紀錄不該被算進改機統計
             {"machine_id": "BA512", "e_tag": "R", "bgn_date": "2026-08-09", "bgn_time": "10:00",
              "job_code": "CE"},
+        ])
+        _add_pm_monitor_rows(hourly_push.DB_PATH, [
+            ("BAA01", "SETUP"),       # DB, 改機中
+            ("BA801", "WAIT-SETUP"),  # LOC, 待改
         ])
         stats = hourly_push.get_setup_group_stats()
         self.assertEqual(stats["ESEC"], {"done": 1, "in_progress": 0, "waiting": 0})
@@ -275,26 +257,11 @@ class TestGetSetupGroupStats(unittest.TestCase):
         stats = hourly_push.get_setup_group_stats()
         self.assertEqual(stats["ESEC"]["done"], 0)
 
-
-class TestGetWaitingRecords(unittest.TestCase):
-    def setUp(self):
-        self._orig_db_path = hourly_push.DB_PATH
-
-    def tearDown(self):
-        hourly_push.DB_PATH = self._orig_db_path
-
-    def test_only_returns_records_that_have_not_started_yet(self):
-        hourly_push.DB_PATH = _make_db_with_records([
-            {"machine_id": "BA801", "e_tag": "S", "wait_date": "2026-08-09", "wait_time": "09:00",
-             "job_code": "CED"},                                          # 待改：只有wait，符合
-            {"machine_id": "BA205", "e_tag": "S", "wait_date": "2026-08-09", "wait_time": "08:00",
-             "bgn_date": "2026-08-09", "bgn_time": "09:00", "job_code": "CED"},  # 已經開始動工了，不算待改
-            {"machine_id": "BA512", "e_tag": "R", "wait_date": "2026-08-09", "wait_time": "07:00",
-             "job_code": "CE"},                                           # 待修
-        ])
-        rows = hourly_push.get_waiting_records()
-        machine_ids = {r["machine_id"] for r in rows}
-        self.assertEqual(machine_ids, {"BA801", "BA512"})
+    def test_no_pm_monitor_table_leaves_in_progress_and_waiting_zero(self):
+        hourly_push.DB_PATH = _make_db_with_records([])
+        stats = hourly_push.get_setup_group_stats()
+        for g in ("ESEC", "DB", "LOC", "FC"):
+            self.assertEqual(stats[g], {"done": 0, "in_progress": 0, "waiting": 0})
 
 
 class TestBuildHourlyPushMessageNewSections(unittest.TestCase):
@@ -304,38 +271,22 @@ class TestBuildHourlyPushMessageNewSections(unittest.TestCase):
     def tearDown(self):
         hourly_push.DB_PATH = self._orig_db_path
 
-    def test_includes_setup_stats_and_waiting_sections(self):
+    def test_includes_setup_stats_and_epoxy_jcode_breakdown(self):
         today = datetime.date.today().isoformat()
         hourly_push.DB_PATH = _make_db_with_records([
             {"machine_id": "BA205", "e_tag": "S", "bgn_date": "2026-08-08", "bgn_time": "10:00",
              "end_date": today, "end_time": "12:00", "job_code": "CED"},
-            {"machine_id": "BA801", "e_tag": "S", "wait_date": "2026-08-09", "wait_time": "09:00",
-             "job_code": "CED"},
         ])
         msg = hourly_push.build_hourly_push_message()
         self.assertIn("🔧 今日改機統計", msg)
         self.assertIn("EPOXY   改機1 | 改機中0 | 待改0", msg)
-        self.assertIn("⏳待改", msg)
-        self.assertIn("BA801  待改", msg)
+        self.assertIn("CED機台1", msg)
 
-
-def _add_pm_monitor_rows(db_path, rows, fetched_at="2026-08-09T17:00:00"):
-    """rows是list of (entity, status)，寫進db_path的pm_monitor_record表(同一批fetched_at)。"""
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS pm_monitor_record (
-            oper TEXT, entity TEXT, model TEXT, status TEXT,
-            lot_no TEXT, bond_id TEXT, wip TEXT, in_time TEXT,
-            outplan TEXT, jcode TEXT, operator TEXT, fetched_at TEXT
-        )
-    """)
-    for entity, status in rows:
-        conn.execute(
-            "INSERT INTO pm_monitor_record (entity, status, fetched_at) VALUES (?,?,?)",
-            (entity, status, fetched_at),
-        )
-    conn.commit()
-    conn.close()
+    def test_overtime_section_shows_placeholder_when_no_pm_monitor_data(self):
+        hourly_push.DB_PATH = _make_db_with_records([])
+        msg = hourly_push.build_hourly_push_message()
+        self.assertIn("⏰ 超時機台", msg)
+        self.assertIn("目前無超過標準工時的機台，或PM Monitor資料尚未抓取", msg)
 
 
 class TestGetPmMonitorGroupStats(unittest.TestCase):
@@ -363,9 +314,12 @@ class TestGetPmMonitorGroupStats(unittest.TestCase):
         self.assertEqual(stats["LOC"], {"WAIT-SETUP": 1})
         self.assertEqual(stats["FC"], {})
 
-    def test_missing_table_returns_empty_dict(self):
+    def test_missing_table_returns_empty_group_dict(self):
         hourly_push.DB_PATH = _make_db_with_records([])
-        self.assertEqual(hourly_push.get_pm_monitor_group_stats(), {})
+        self.assertEqual(
+            hourly_push.get_pm_monitor_group_stats(),
+            {"ESEC": {}, "DB": {}, "LOC": {}, "FC": {}},
+        )
 
     def test_push_message_includes_pm_monitor_section_when_data_available(self):
         hourly_push.DB_PATH = _make_db_with_records([])
@@ -374,11 +328,153 @@ class TestGetPmMonitorGroupStats(unittest.TestCase):
         self.assertIn("⚡ 即時機況(PM Monitor)", msg)
         self.assertIn("EPOXY  修機中1", msg)
         self.assertIn("├ESEC  修機中1", msg)
+        self.assertIn("機台明細:", msg)
 
-    def test_push_message_skips_pm_monitor_section_when_no_data(self):
+    def test_push_message_skips_pm_monitor_status_section_when_no_data(self):
         hourly_push.DB_PATH = _make_db_with_records([])
         msg = hourly_push.build_hourly_push_message()
-        self.assertNotIn("PM Monitor", msg)
+        self.assertNotIn("⚡ 即時機況(PM Monitor)", msg)
+        self.assertNotIn("機台明細", msg)
+
+
+class TestGetPmMonitorRecords(unittest.TestCase):
+    def setUp(self):
+        self._orig_db_path = hourly_push.DB_PATH
+
+    def tearDown(self):
+        hourly_push.DB_PATH = self._orig_db_path
+
+    def test_missing_table_returns_empty_list(self):
+        hourly_push.DB_PATH = _make_db_with_records([])
+        self.assertEqual(hourly_push.get_pm_monitor_records(), [])
+
+    def test_only_returns_latest_fetched_at_batch(self):
+        hourly_push.DB_PATH = _make_db_with_records([])
+        _add_pm_monitor_rows(hourly_push.DB_PATH, [("BA205", "IN-REPAIR")], fetched_at="2026-08-09T16:00:00")
+        _add_pm_monitor_rows(hourly_push.DB_PATH, [("BAA01", "SETUP")], fetched_at="2026-08-09T17:00:00")
+        rows = hourly_push.get_pm_monitor_records()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["entity"], "BAA01")
+
+
+class TestGetPmJcodeStdHours(unittest.TestCase):
+    """PM Monitor JCODE的標準工時對照表，跟query_bot.py/舊hourly_push.py的
+    EE Maintenance用JOB_CODE_STD_HOURS是不同體系，這裡鎖定使用者2026/08/09
+    提供的PM Monitor專用數字。"""
+
+    def test_exact_matches(self):
+        self.assertEqual(hourly_push.get_pm_jcode_std_hours("CED-1"), 2.3)
+        self.assertEqual(hourly_push.get_pm_jcode_std_hours("CED"), 2.3)
+        self.assertEqual(hourly_push.get_pm_jcode_std_hours("CEDO"), 2.3)
+        self.assertEqual(hourly_push.get_pm_jcode_std_hours("CEE"), 4.17)
+        self.assertEqual(hourly_push.get_pm_jcode_std_hours("CN"), 3.38)
+        self.assertEqual(hourly_push.get_pm_jcode_std_hours("CD"), 0.5)
+        self.assertEqual(hourly_push.get_pm_jcode_std_hours("CES"), 0.5)
+        self.assertEqual(hourly_push.get_pm_jcode_std_hours("BMP"), 0.5)
+
+    def test_case_insensitive(self):
+        self.assertEqual(hourly_push.get_pm_jcode_std_hours("cee"), 4.17)
+
+    def test_unknown_returns_none(self):
+        self.assertIsNone(hourly_push.get_pm_jcode_std_hours("XYZ"))
+
+    def test_none_or_empty_returns_none(self):
+        self.assertIsNone(hourly_push.get_pm_jcode_std_hours(None))
+        self.assertIsNone(hourly_push.get_pm_jcode_std_hours(""))
+
+
+class TestPmElapsedHours(unittest.TestCase):
+    def test_computes_hours_between_in_time_and_now(self):
+        now = datetime.datetime(2026, 8, 9, 17, 30)
+        self.assertAlmostEqual(hourly_push._pm_elapsed_hours("2026/08/09 15:30", now), 2.0)
+
+    def test_invalid_format_returns_none(self):
+        now = datetime.datetime(2026, 8, 9, 17, 30)
+        self.assertIsNone(hourly_push._pm_elapsed_hours("2026-08-09 15:30", now))
+
+    def test_none_returns_none(self):
+        now = datetime.datetime(2026, 8, 9, 17, 30)
+        self.assertIsNone(hourly_push._pm_elapsed_hours(None, now))
+
+
+class TestPmDetailLines(unittest.TestCase):
+    def test_formats_entity_status_and_elapsed_time(self):
+        now = datetime.datetime(2026, 8, 9, 17, 30)
+        rows = [{"entity": "BA205", "status": "IN-REPAIR", "in_time": "2026/08/09 15:30"}]
+        lines = hourly_push._pm_detail_lines(rows, now)
+        self.assertEqual(lines, ["BA205  修機中  2.00hr"])
+
+    def test_unparseable_in_time_shows_question_mark(self):
+        now = datetime.datetime(2026, 8, 9, 17, 30)
+        rows = [{"entity": "BA205", "status": "SETUP", "in_time": None}]
+        lines = hourly_push._pm_detail_lines(rows, now)
+        self.assertEqual(lines, ["BA205  改機中  ?"])
+
+    def test_unknown_status_shown_as_is(self):
+        now = datetime.datetime(2026, 8, 9, 17, 30)
+        rows = [{"entity": "BA205", "status": "WEIRD", "in_time": None}]
+        lines = hourly_push._pm_detail_lines(rows, now)
+        self.assertEqual(lines, ["BA205  WEIRD  ?"])
+
+
+class TestPmOvertimeLines(unittest.TestCase):
+    def test_machine_over_standard_hours_included_with_operator(self):
+        now = datetime.datetime(2026, 8, 9, 17, 30)
+        # CEE標準4.17hr，經過5hr超時
+        rows = [{"entity": "BA205", "status": "SETUP", "in_time": "2026/08/09 12:30",
+                  "jcode": "CEE", "operator": "E12345"}]
+        lines = hourly_push._pm_overtime_lines(rows, now)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("BA205", lines[0])
+        self.assertIn("CEE", lines[0])
+        self.assertIn("人員E12345", lines[0])
+
+    def test_missing_operator_shows_placeholder(self):
+        now = datetime.datetime(2026, 8, 9, 17, 30)
+        rows = [{"entity": "BA205", "status": "SETUP", "in_time": "2026/08/09 12:30",
+                  "jcode": "CEE", "operator": None}]
+        lines = hourly_push._pm_overtime_lines(rows, now)
+        self.assertIn("人員未指定", lines[0])
+
+    def test_machine_within_standard_hours_excluded(self):
+        now = datetime.datetime(2026, 8, 9, 17, 30)
+        # CD標準0.5hr，只過了0.2hr，還沒超時
+        rows = [{"entity": "BA205", "status": "SETUP", "in_time": "2026/08/09 17:18",
+                  "jcode": "CD", "operator": "E1"}]
+        lines = hourly_push._pm_overtime_lines(rows, now)
+        self.assertEqual(lines, [])
+
+    def test_unknown_jcode_excluded(self):
+        now = datetime.datetime(2026, 8, 9, 17, 30)
+        rows = [{"entity": "BA205", "status": "SETUP", "in_time": "2026/08/09 10:00",
+                  "jcode": "UNKNOWN", "operator": "E1"}]
+        lines = hourly_push._pm_overtime_lines(rows, now)
+        self.assertEqual(lines, [])
+
+
+class TestPmMonitorIntegrationInPushMessage(unittest.TestCase):
+    """完整走build_hourly_push_message()，驗證機台明細+超時機台(帶機台號碼跟
+    operator工號)都有出現在推播訊息裡。"""
+
+    def setUp(self):
+        self._orig_db_path = hourly_push.DB_PATH
+
+    def tearDown(self):
+        hourly_push.DB_PATH = self._orig_db_path
+
+    def test_push_message_includes_machine_detail_and_overtime_with_operator(self):
+        hourly_push.DB_PATH = _make_db_with_records([])
+        _add_pm_monitor_rows(hourly_push.DB_PATH, [
+            {"entity": "BA205", "status": "SETUP", "jcode": "CEE", "operator": "E12345",
+             "in_time": "2026/08/09 12:30"},
+        ], fetched_at="2026-08-09T17:00:00")
+        now = datetime.datetime(2026, 8, 9, 17, 30)
+        msg = hourly_push.build_hourly_push_message(now=now)
+        self.assertIn("機台明細:", msg)
+        self.assertIn("BA205  改機中  5.00hr", msg)
+        overtime_section = msg.split("⏰ 超時機台")[1]
+        self.assertIn("BA205", overtime_section)
+        self.assertIn("人員E12345", overtime_section)
 
 
 if __name__ == "__main__":

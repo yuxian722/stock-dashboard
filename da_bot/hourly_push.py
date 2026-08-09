@@ -22,86 +22,11 @@ import datetime
 
 DB_PATH = "da_maintenance.db"
 
-# 標準工時對照表(與 query_bot.py 保持一致)
-JOB_CODE_STD_HOURS = {
-    "CED-M2": 2.9,  # Multi step(2 dies)，2026/08/09使用者提供
-    "CED-M3": 2.9,  # Multi step(3 dies)，2026/08/09使用者提供
-    "CED-M4": 2.9,  # Multi step(4 dies)，2026/08/09使用者提供
-    "CED": 2.3,     # 頂針(CED-1等)，2026/08/09使用者提供
-    "CE": 3.0,
-    "CEE": 3.0,
-}
-
-
-def get_std_hours(job_code: str):
-    if not job_code:
-        return None
-    if job_code in JOB_CODE_STD_HOURS:
-        return JOB_CODE_STD_HOURS[job_code]
-    for prefix, std in JOB_CODE_STD_HOURS.items():
-        if job_code.startswith(prefix):
-            return std
-    return None
-
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
-
-def get_ongoing_records():
-    """
-    抓「進行中」的紀錄：bgn_date/bgn_time 已填(已經開始動工)、end_date/end_time
-    還是空的(還沒結束)。只看 e_tag = R(修機)或 S(改機)，其他分類(保養/工程異常/
-    品保)不列入超時機台清單。
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT machine_id, bgn_date, bgn_time, job_code, e_tag, engineer_id, cause
-        FROM ee_maintenance_record
-        WHERE (end_date IS NULL OR end_date = '' OR end_time IS NULL OR end_time = '')
-          AND e_tag IN ('R', 'S')
-          AND bgn_date IS NOT NULL AND bgn_time IS NOT NULL
-        ORDER BY bgn_date, bgn_time
-    """)
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def get_waiting_records():
-    """
-    抓「排隊等待中」的紀錄：wait_date/wait_time已填(已經排入等待)，
-    但bgn_date還是空的(還沒真的開始動工)、也還沒結束。
-    這批資料本來就存在ee_maintenance_record裡(cpis_scraper.py解析EJP報表時
-    wait_date/wait_time欄位就有存)，只是之前的整點推播沒有查詢/顯示過。
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT machine_id, wait_date, wait_time, job_code, e_tag
-        FROM ee_maintenance_record
-        WHERE wait_date IS NOT NULL AND wait_date != ''
-          AND (bgn_date IS NULL OR bgn_date = '')
-          AND (end_date IS NULL OR end_date = '')
-          AND e_tag IN ('R', 'S')
-        ORDER BY wait_date, wait_time
-    """)
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def elapsed_hours(date_str: str, time_str: str, now: datetime.datetime) -> float:
-    """計算從 date_str+time_str 到現在經過的小時數(bgn/wait兩種時間戳記都能用)"""
-    try:
-        dt = datetime.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-    except ValueError:
-        return 0.0
-    delta = now - dt
-    return delta.total_seconds() / 3600.0
 
 
 # 機台代號→機型群組(ESEC/DB/LOC/FC)，依代號前3碼分類，對齊同事Dashboard的
@@ -119,35 +44,47 @@ def _group_for_machine(machine_id):
     return _ENTITY_GROUP_PREFIXES.get(p3)
 
 
-def get_setup_group_stats():
+# EPOXY(=ESEC+DB)的「今日改機」要依job_code分CED/CEE/CD三類顯示，
+# 2026/08/09使用者提供
+_EPOXY_JCODE_CATEGORIES = [("CED", "CED機台"), ("CEE", "CEE機台"), ("CD", "CD機台")]
+
+
+def _epoxy_jcode_category(job_code):
+    jc = (job_code or "").upper()
+    for prefix, label in _EPOXY_JCODE_CATEGORIES:
+        if jc.startswith(prefix):
+            return label
+    return None
+
+
+def get_epoxy_done_by_jcode():
     """
-    今日改機統計，依機型群組(ESEC/DB/LOC/FC)分組。回傳
-    {group: {"done": 今日已完成次數, "in_progress": 改機中台數, "waiting": 待改台數}}。
+    EPOXY(ESEC+DB)今日已完成的改機次數，依job_code分CED機台/CEE機台/CD機台
+    三類(對不到這三類的算"其他")。用SELECT DISTINCT防重複——run_pipeline.py
+    每小時重抓「昨天~今天」這個有重疊的區間，cpis_scraper.py以前存檔時沒有
+    去重，同一筆真實紀錄可能被重複INSERT很多次(已經修好，但既有資料庫裡
+    可能還殘留舊的重複列，這裡用DISTINCT保險)。回傳{"CED機台":n, ...}，
+    沒有資料的類別不會出現在結果裡。
     """
     today = datetime.date.today().isoformat()
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT machine_id, wait_date, bgn_date, end_date
+        SELECT DISTINCT machine_id, bgn_date, bgn_time, job_code
         FROM ee_maintenance_record
-        WHERE e_tag = 'S'
-    """)
+        WHERE e_tag = 'S' AND end_date = ?
+    """, (today,))
     rows = cur.fetchall()
     conn.close()
 
-    stats = {g: {"done": 0, "in_progress": 0, "waiting": 0} for g in ("ESEC", "DB", "LOC", "FC")}
+    result = {}
     for r in rows:
         g = _group_for_machine(r["machine_id"])
-        if g is None:
+        if g not in ("ESEC", "DB"):
             continue
-        if r["end_date"]:
-            if r["end_date"] == today:
-                stats[g]["done"] += 1
-        elif r["bgn_date"]:
-            stats[g]["in_progress"] += 1
-        elif r["wait_date"]:
-            stats[g]["waiting"] += 1
-    return stats
+        label = _epoxy_jcode_category(r["job_code"]) or "其他"
+        result[label] = result.get(label, 0) + 1
+    return result
 
 
 # PM/REPAIR/SETUP Monitor頁面的STATUS代碼(cpis_pm_monitor_scraper.py抓的
@@ -158,15 +95,36 @@ _PM_STATUS_LABELS = [
     ("PM", "保養中"), ("ENG", "工程異常"),
 ]
 
+# PM Monitor JCODE的標準工時對照表(2026/08/09使用者提供)，跟query_bot.py/
+# 原本hourly_push.py的JOB_CODE_STD_HOURS(EE Maintenance用)是不同的體系，
+# 不要混用——這裡的key是PM/REPAIR/SETUP Monitor頁面JCODE欄位實際出現的代碼
+PM_JCODE_STD_HOURS = {
+    "CED-1": 2.3, "CED": 2.3, "CEDO": 2.3,
+    "CEE": 4.17,
+    "CN": 3.38,
+    "CD": 0.5, "CES": 0.5, "BMP": 0.5,
+}
 
-def get_pm_monitor_group_stats():
+
+def get_pm_jcode_std_hours(jcode):
+    if not jcode:
+        return None
+    jc = jcode.upper()
+    if jc in PM_JCODE_STD_HOURS:
+        return PM_JCODE_STD_HOURS[jc]
+    for prefix, std in PM_JCODE_STD_HOURS.items():
+        if jc.startswith(prefix):
+            return std
+    return None
+
+
+def get_pm_monitor_records():
     """
-    從pm_monitor_record最新一批快照(cpis_pm_monitor_scraper.py抓的PM/REPAIR/
-    SETUP Monitor即時機況)依機型群組(ESEC/DB/LOC/FC)統計各STATUS台數，是CPIS
-    當下真正的異常機況清單，不是像get_setup_group_stats()那樣從EE Maintenance
-    歷史紀錄推算的近似值。回傳{group: {status_code: 台數}}；這個資料表用
-    Selenium無頭瀏覽器抓，比較容易受環境影響、可能還沒抓過，資料表不存在或
-    是空的時候回傳空dict(呼叫端要優雅跳過，不能讓整個推播訊息掛掉)。
+    回傳pm_monitor_record最新一批快照(cpis_pm_monitor_scraper.py抓的
+    PM/REPAIR/SETUP Monitor即時機況)的所有列(entity/model/status/jcode/
+    operator/in_time)。這個資料表用Selenium無頭瀏覽器抓，比較容易受環境
+    影響、可能還沒抓過，資料表不存在或是空的時候回傳[](呼叫端要優雅跳過，
+    不能讓整個推播訊息掛掉)。
     """
     conn = get_conn()
     cur = conn.cursor()
@@ -174,17 +132,24 @@ def get_pm_monitor_group_stats():
         cur.execute("SELECT MAX(fetched_at) FROM pm_monitor_record")
     except sqlite3.OperationalError:
         conn.close()
-        return {}
+        return []
     row = cur.fetchone()
     latest = row[0] if row else None
     if not latest:
         conn.close()
-        return {}
+        return []
 
-    cur.execute("SELECT entity, status FROM pm_monitor_record WHERE fetched_at = ?", (latest,))
+    cur.execute("""
+        SELECT entity, model, status, jcode, operator, in_time
+        FROM pm_monitor_record WHERE fetched_at = ?
+    """, (latest,))
     rows = cur.fetchall()
     conn.close()
+    return rows
 
+
+def _pm_group_stats_from_rows(rows):
+    """依機型群組(ESEC/DB/LOC/FC)統計PM Monitor各STATUS台數，回傳{group: {status_code: 台數}}。"""
     stats = {g: {} for g in ("ESEC", "DB", "LOC", "FC")}
     for r in rows:
         g = _group_for_machine(r["entity"])
@@ -194,11 +159,91 @@ def get_pm_monitor_group_stats():
     return stats
 
 
+def get_pm_monitor_group_stats():
+    """get_pm_monitor_records()的分組統計版，是CPIS當下真正的異常機況清單，
+    不是像EE Maintenance歷史紀錄那樣推算的近似值。"""
+    return _pm_group_stats_from_rows(get_pm_monitor_records())
+
+
+def get_setup_group_stats():
+    """
+    今日改機統計，依機型群組(ESEC/DB/LOC/FC)分組。"改機"(今日已完成)算自
+    ee_maintenance_record(用SELECT DISTINCT防重複)；"改機中"/"待改"改成
+    算自PM Monitor的即時快照(SETUP/WAIT-SETUP狀態)，比EE Maintenance的
+    wait_date/bgn_date推算法準確，是當下真正的狀態，不是歷史推論的。
+    回傳{group: {"done": int, "in_progress": int, "waiting": int}}。
+    """
+    today = datetime.date.today().isoformat()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT machine_id, bgn_date, bgn_time, job_code
+        FROM ee_maintenance_record
+        WHERE e_tag = 'S' AND end_date = ?
+    """, (today,))
+    done_rows = cur.fetchall()
+    conn.close()
+
+    stats = {g: {"done": 0, "in_progress": 0, "waiting": 0} for g in ("ESEC", "DB", "LOC", "FC")}
+    for r in done_rows:
+        g = _group_for_machine(r["machine_id"])
+        if g:
+            stats[g]["done"] += 1
+
+    pm_stats = get_pm_monitor_group_stats()
+    for g in ("ESEC", "DB", "LOC", "FC"):
+        stats[g]["in_progress"] = pm_stats.get(g, {}).get("SETUP", 0)
+        stats[g]["waiting"] = pm_stats.get(g, {}).get("WAIT-SETUP", 0)
+    return stats
+
+
 def _pm_stats_line(label, group_stats, indent=""):
     field_parts = [f"{zh}{group_stats[code]}" for code, zh in _PM_STATUS_LABELS if group_stats.get(code)]
     if not field_parts:
         return None
     return f"{indent}{label}  " + " ".join(field_parts)
+
+
+def _pm_elapsed_hours(in_time_str, now):
+    """PM Monitor的IN TIME是"2026/08/09 17:29"這種格式，算到now經過幾小時。"""
+    try:
+        dt = datetime.datetime.strptime(in_time_str, "%Y/%m/%d %H:%M")
+    except (TypeError, ValueError):
+        return None
+    return (now - dt).total_seconds() / 3600.0
+
+
+def _pm_detail_lines(rows, now):
+    """PM Monitor機台明細：每一台機台的狀態+目前已等待/進行的時數(IN TIME到現在)。"""
+    status_zh = dict(_PM_STATUS_LABELS)
+    lines = []
+    for r in rows:
+        elapsed = _pm_elapsed_hours(r["in_time"], now)
+        elapsed_txt = f"{elapsed:.2f}hr" if elapsed is not None else "?"
+        zh = status_zh.get(r["status"], r["status"])
+        lines.append(f"{r['entity']}  {zh}  {elapsed_txt}")
+    return lines
+
+
+def _pm_overtime_lines(rows, now):
+    """
+    超時機台：PM Monitor每一列的jcode對應標準工時(PM_JCODE_STD_HOURS)，
+    IN TIME到現在的經過時數超過標準就算超時，列出機台代號+經過時數+超時
+    時數+jcode+operator工號。
+    """
+    lines = []
+    for r in rows:
+        elapsed = _pm_elapsed_hours(r["in_time"], now)
+        if elapsed is None:
+            continue
+        std = get_pm_jcode_std_hours(r["jcode"])
+        if std is None or elapsed <= std:
+            continue
+        operator = r["operator"] or "未指定"
+        lines.append(
+            f"{r['entity']}  {elapsed:.2f}hr(超時{elapsed - std:.2f}hr)  {r['jcode']}  人員{operator}"
+        )
+    return lines
 
 
 def _to_float_percent(s):
@@ -265,26 +310,6 @@ def _setup_stats_line(label, s, indent=""):
     return f"{indent}{label}   改機{s['done']} | 改機中{s['in_progress']} | 待改{s['waiting']}"
 
 
-def _overtime_line(r, hrs, show_cause=False):
-    """
-    超時機台清單裡的一行(改機中/修機中共用)：機台 經過時數(超時Xhr) 代碼 人員xxx。
-    改機沒有「原因」這種概念(排定的正常換線，不是故障)，只有修機才顯示
-    原因(show_cause=True)，沿用之前"修機過久要看修機人員/修機內容"的需求。
-    """
-    std = get_std_hours(r["job_code"])
-    status_note = f"(超時{hrs - std:.2f}hr)" if (std is not None and hrs > std) else ""
-    engineer = r["engineer_id"] or "未指定"
-    line = f"{r['machine_id']}  {hrs:.2f}hr{status_note}  {r['job_code']}  人員{engineer}"
-    if show_cause:
-        cause = r["cause"] or "無"
-        line += f"  原因:{cause}"
-    return line
-
-
-def _waiting_line(r, hrs, label):
-    return f"{r['machine_id']}  {label}{hrs:.2f}hr  {r['job_code']}"
-
-
 def build_hourly_push_message(now: datetime.datetime = None) -> str:
     """組出整點推播訊息文字(格式比照同事的推播範本)"""
     if now is None:
@@ -294,24 +319,30 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
     parts = [title]
 
     # 🔧 今日改機統計：依機型群組(EPOXY=ESEC+DB、LOC、FlipChip)列出今日已完成/
-    # 改機中/待改的台數，wait_date這些欄位其實資料庫裡早就有存，只是之前的
-    # 整點推播沒有查詢/顯示過
+    # 改機中/待改的台數；EPOXY另外依job_code分CED/CEE/CD機台三類細項。
     setup_stats = get_setup_group_stats()
     esec, db, loc, fc = setup_stats["ESEC"], setup_stats["DB"], setup_stats["LOC"], setup_stats["FC"]
     epoxy = {k: esec[k] + db[k] for k in ("done", "in_progress", "waiting")}
     parts.append("")
     parts.append("🔧 今日改機統計")
     parts.append(_setup_stats_line("EPOXY", epoxy))
+    epoxy_jcode = get_epoxy_done_by_jcode()
+    jcode_parts = [f"{label}{n}" for label, n in epoxy_jcode.items() if n]
+    if jcode_parts:
+        parts.append("  " + " ".join(jcode_parts))
     parts.append(_setup_stats_line("├ESEC", esec, " "))
     parts.append(_setup_stats_line("└DB", db, " "))
     parts.append(_setup_stats_line("LOC", loc))
     parts.append(_setup_stats_line("FlipChip", fc))
 
     # ⚡ 即時機況：來源是PM/REPAIR/SETUP Monitor頁面的真實快照(不是像上面
-    # 「今日改機統計」那樣用EE Maintenance歷史紀錄推算的近似值)。這個資料源
-    # 可能還沒抓過或抓取失敗，抓不到資料時整段跳過，不影響其他推播內容
-    pm_stats = get_pm_monitor_group_stats()
-    if any(pm_stats.get(g) for g in ("ESEC", "DB", "LOC", "FC")):
+    # 「今日改機統計」那樣用EE Maintenance歷史紀錄推算的近似值)。除了依
+    # 群組彙總的台數，也列出每台機台的機台號碼+目前狀態+已等待/進行時數
+    # (IN TIME到現在)。這個資料源可能還沒抓過或抓取失敗，抓不到資料時
+    # 整段跳過，不影響其他推播內容
+    pm_rows = get_pm_monitor_records()
+    if pm_rows:
+        pm_stats = _pm_group_stats_from_rows(pm_rows)
         epoxy_pm = {}
         for g in ("ESEC", "DB"):
             for code, cnt in pm_stats.get(g, {}).items():
@@ -328,36 +359,19 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
             parts.append("")
             parts.append("⚡ 即時機況(PM Monitor)")
             parts.extend(lines)
+            parts.append("機台明細:")
+            parts.extend(_pm_detail_lines(pm_rows, now))
 
-    # ⏰ 超時機台：改機中/修機中(進行中且超過標準工時) + 待改/待修(還在排隊等待中)
-    ongoing = get_ongoing_records()
-    waiting = get_waiting_records()
-
-    setup_ongoing = [r for r in ongoing if r["e_tag"] == "S"]
-    repair_ongoing = [r for r in ongoing if r["e_tag"] == "R"]
-    setup_waiting = [r for r in waiting if r["e_tag"] == "S"]
-    repair_waiting = [r for r in waiting if r["e_tag"] == "R"]
-
+    # ⏰ 超時機台：PM Monitor每一列的jcode對應標準工時(PM_JCODE_STD_HOURS)，
+    # IN TIME到現在的經過時數超過標準就算超時——是即時判斷，不是像之前那樣
+    # 用EE Maintenance歷史紀錄的bgn_date/wait_date推算
     parts.append("")
     parts.append("⏰ 超時機台")
-    if setup_ongoing:
-        parts.append("🔧改機中")
-        for r in setup_ongoing:
-            parts.append(_overtime_line(r, elapsed_hours(r["bgn_date"], r["bgn_time"], now)))
-    if setup_waiting:
-        parts.append("⏳待改")
-        for r in setup_waiting:
-            parts.append(_waiting_line(r, elapsed_hours(r["wait_date"], r["wait_time"], now), "待改"))
-    if repair_ongoing:
-        parts.append("🔨修機中")
-        for r in repair_ongoing:
-            parts.append(_overtime_line(r, elapsed_hours(r["bgn_date"], r["bgn_time"], now), show_cause=True))
-    if repair_waiting:
-        parts.append("⏳待修")
-        for r in repair_waiting:
-            parts.append(_waiting_line(r, elapsed_hours(r["wait_date"], r["wait_time"], now), "待修"))
-    if not (setup_ongoing or setup_waiting or repair_ongoing or repair_waiting):
-        parts.append("(目前無進行中/等待中的改機/修機紀錄)")
+    overtime_lines = _pm_overtime_lines(pm_rows, now) if pm_rows else []
+    if overtime_lines:
+        parts.extend(overtime_lines)
+    else:
+        parts.append("(目前無超過標準工時的機台，或PM Monitor資料尚未抓取)")
 
     # 稼動/改機 rate，來源是CPIS APG Utilization Analysis頁面最下方的官方GROUP彙總表
     parts.append("")
