@@ -427,9 +427,88 @@ MODEL_GROUPS = {
 MODEL_GROUPS["EPOXY(DB)"] = MODEL_GROUPS["DB700"] + MODEL_GROUPS["DB800"] + MODEL_GROUPS["DB830"]
 MODEL_GROUPS["Epoxy"] = MODEL_GROUPS["Esec2100"] + MODEL_GROUPS["EPOXY(DB)"]
 
+# DB700/DB800/DB830的MODEL名稱跟utilization_record.MODEL欄位的值完全對應，
+# 可以直接查CPIS官方回報的真實機台清單，不用像Esec2100/CM700那樣手動維護
+# 固定範圍的代號清單——手動清單容易跟實際機台增減不同步(2026/08/09使用者
+# 就抓到DB830這樣手動清單多算了1台，寫54台但CPIS Utilization Analysis頁面
+# 實際只有53台)
+_DYNAMIC_MODEL_GROUPS = ("DB700", "DB800", "DB830")
 
-def _machine_live_status_short(cur, machine_id):
-    """簡化版即時狀態，只回傳簡短標記(修機中/改機中/正常)，供群組彙總用"""
+
+def _group_machine_ids(cur, group_name):
+    """
+    取得群組實際機台清單。DB700/DB800/DB830直接查utilization_record最新一批
+    資料裡MODEL=group_name的真實ENTITY清單；EPOXY(DB)/Epoxy這種複合群組是
+    底下子群組清單加總；其餘群組(Esec2100/CM700)沒有可以1:1對應的MODEL欄位值，
+    還是用MODEL_GROUPS裡手動維護的代號清單。utilization_record還沒抓過資料時，
+    退回用MODEL_GROUPS的清單當備援，不會讓查詢整個失敗。
+    """
+    if group_name == "EPOXY(DB)":
+        result = []
+        for base in ("DB700", "DB800", "DB830"):
+            result.extend(_group_machine_ids(cur, base))
+        return result
+    if group_name == "Epoxy":
+        result = list(MODEL_GROUPS["Esec2100"])
+        result.extend(_group_machine_ids(cur, "EPOXY(DB)"))
+        return result
+
+    if group_name not in _DYNAMIC_MODEL_GROUPS:
+        return MODEL_GROUPS.get(group_name, [])
+
+    cur.execute("SELECT MAX(fetched_at) FROM utilization_record")
+    row = cur.fetchone()
+    latest = row[0] if row else None
+    if not latest:
+        return MODEL_GROUPS.get(group_name, [])
+
+    cur.execute("""
+        SELECT DISTINCT ENTITY FROM utilization_record
+        WHERE fetched_at = ? AND MODEL = ? AND ENTITY IS NOT NULL AND ENTITY != ''
+    """, (latest, group_name))
+    ids = [r["ENTITY"] for r in cur.fetchall()]
+    return ids or MODEL_GROUPS.get(group_name, [])
+
+
+def _pm_status_map(cur):
+    """
+    回傳目前PM/REPAIR/SETUP Monitor快照的{機台代號: STATUS}對照表，以及
+    有沒有抓過PM Monitor資料的旗標(has_data)。
+
+    has_data=False代表cpis_pm_monitor_scraper.py還沒跑過(資料表不存在或
+    完全沒資料)，這種情況呼叫端要整批退回用EE Maintenance歷史紀錄推論；
+    has_data=True則代表這是當下真正完整的異常機台清單，不在對照表裡的機台
+    就是正常，不用再退回EE Maintenance——不然機台已經在PM Monitor上恢復
+    正常後，還可能被EE Maintenance裡沒關閉的舊紀錄誤判成仍在修機/改機
+    (這正是2026/08/09使用者回報「修機0‧改機0」不準的根因，之前是逐台各自
+    查PM Monitor有沒有這台，查不到就當「這個資料表還沒抓過」退回EE Maintenance，
+    沒辦法區分「這台真的正常」跟「PM Monitor整批都沒資料」)。
+    """
+    try:
+        cur.execute("SELECT MAX(fetched_at) FROM pm_monitor_record")
+    except sqlite3.OperationalError:
+        return {}, False
+    row = cur.fetchone()
+    latest = row[0] if row else None
+    if not latest:
+        return {}, False
+    cur.execute("SELECT entity, status FROM pm_monitor_record WHERE fetched_at = ?", (latest,))
+    return {r["entity"]: r["status"] for r in cur.fetchall()}, True
+
+
+def _machine_live_status_short(cur, machine_id, pm_status_map=None, pm_has_data=False):
+    """
+    簡化版即時狀態，只回傳簡短標記(修機中/改機中/正常)，供群組彙總用。
+    pm_has_data=True時優先用_pm_status_map()查到的PM Monitor即時快照(是當下
+    真正的機況，不是推論的)；pm_has_data=False(PM Monitor整批都還沒抓過資料)
+    才退回用EE Maintenance歷史紀錄推論，維持原本行為。
+    """
+    if pm_has_data:
+        status = (pm_status_map or {}).get(machine_id)
+        if status is None:
+            return "正常"
+        return _PM_STATUS_ZH.get(status, status)
+
     cur.execute("""
         SELECT e_tag FROM ee_maintenance_record
         WHERE machine_id = ? AND (end_time IS NULL OR end_time = '')
@@ -524,13 +603,18 @@ def db_group_reply(group_names=None) -> str:
     now_str = datetime.datetime.now().strftime("%m/%d %H:%M")
     lines = [f"【{'/'.join(group_names)}機型群組】{now_str}"]
 
+    pm_status_map, pm_has_data = _pm_status_map(cur)
+
     for group_name in group_names:
-        machine_ids = MODEL_GROUPS.get(group_name)
+        machine_ids = _group_machine_ids(cur, group_name)
         if not machine_ids:
             lines.append("")
             lines.append(f"▶{group_name}  (查無此機型群組定義)")
             continue
-        statuses = {mid: _machine_live_status_short(cur, mid) for mid in machine_ids}
+        statuses = {
+            mid: _machine_live_status_short(cur, mid, pm_status_map, pm_has_data)
+            for mid in machine_ids
+        }
 
         repair_cnt = sum(1 for s in statuses.values() if s == "修機中")
         setup_cnt = sum(1 for s in statuses.values() if s == "改機中")
