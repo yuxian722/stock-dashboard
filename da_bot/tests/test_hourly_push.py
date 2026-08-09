@@ -398,21 +398,27 @@ class TestPmElapsedHours(unittest.TestCase):
 
 
 class TestPmDetailLines(unittest.TestCase):
-    def test_formats_entity_status_and_elapsed_time(self):
+    def test_formats_entity_status_elapsed_time_and_jcode(self):
         now = datetime.datetime(2026, 8, 9, 17, 30)
-        rows = [{"entity": "BA205", "status": "IN-REPAIR", "in_time": "2026/08/09 15:30"}]
+        rows = [{"entity": "BA205", "status": "IN-REPAIR", "in_time": "2026/08/09 15:30", "jcode": "CEDO"}]
+        lines = hourly_push._pm_detail_lines(rows, now)
+        self.assertEqual(lines, ["BA205  修機中  2.00hr  CEDO"])
+
+    def test_missing_jcode_omits_jcode_field(self):
+        now = datetime.datetime(2026, 8, 9, 17, 30)
+        rows = [{"entity": "BA205", "status": "IN-REPAIR", "in_time": "2026/08/09 15:30", "jcode": None}]
         lines = hourly_push._pm_detail_lines(rows, now)
         self.assertEqual(lines, ["BA205  修機中  2.00hr"])
 
     def test_unparseable_in_time_shows_question_mark(self):
         now = datetime.datetime(2026, 8, 9, 17, 30)
-        rows = [{"entity": "BA205", "status": "SETUP", "in_time": None}]
+        rows = [{"entity": "BA205", "status": "SETUP", "in_time": None, "jcode": None}]
         lines = hourly_push._pm_detail_lines(rows, now)
         self.assertEqual(lines, ["BA205  改機中  ?"])
 
     def test_unknown_status_shown_as_is(self):
         now = datetime.datetime(2026, 8, 9, 17, 30)
-        rows = [{"entity": "BA205", "status": "WEIRD", "in_time": None}]
+        rows = [{"entity": "BA205", "status": "WEIRD", "in_time": None, "jcode": None}]
         lines = hourly_push._pm_detail_lines(rows, now)
         self.assertEqual(lines, ["BA205  WEIRD  ?"])
 
@@ -471,7 +477,7 @@ class TestPmMonitorIntegrationInPushMessage(unittest.TestCase):
         now = datetime.datetime(2026, 8, 9, 17, 30)
         msg = hourly_push.build_hourly_push_message(now=now)
         self.assertIn("機台明細:", msg)
-        self.assertIn("BA205  改機中  5.00hr", msg)
+        self.assertIn("BA205  改機中  5.00hr  CEE", msg)
         overtime_section = msg.split("⏰ 超時機台")[1]
         self.assertIn("BA205", overtime_section)
         self.assertIn("人員E12345", overtime_section)

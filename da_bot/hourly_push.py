@@ -214,14 +214,15 @@ def _pm_elapsed_hours(in_time_str, now):
 
 
 def _pm_detail_lines(rows, now):
-    """PM Monitor機台明細：每一台機台的狀態+目前已等待/進行的時數(IN TIME到現在)。"""
+    """PM Monitor機台明細：每一台機台的狀態+目前已等待/進行的時數(IN TIME到現在)+JCODE。"""
     status_zh = dict(_PM_STATUS_LABELS)
     lines = []
     for r in rows:
         elapsed = _pm_elapsed_hours(r["in_time"], now)
         elapsed_txt = f"{elapsed:.2f}hr" if elapsed is not None else "?"
         zh = status_zh.get(r["status"], r["status"])
-        lines.append(f"{r['entity']}  {zh}  {elapsed_txt}")
+        jcode_txt = f"  {r['jcode']}" if r["jcode"] else ""
+        lines.append(f"{r['entity']}  {zh}  {elapsed_txt}{jcode_txt}")
     return lines
 
 
