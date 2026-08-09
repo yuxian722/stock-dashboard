@@ -20,8 +20,6 @@ for _s in (sys.stdout, sys.stderr):
 import sqlite3
 import datetime
 
-import query_bot
-
 DB_PATH = "da_maintenance.db"
 
 
@@ -31,28 +29,24 @@ def get_conn():
     return conn
 
 
-# 機台代號→機型群組(ESEC/DB/LOC/FC/CM700)，依代號前3碼分類，對齊同事Dashboard
-# 的getEntityGroup規則(APG_TeamplusBot/teamplus_bot.py的_entity_group())。
-# 2026/08/09使用者更正：BA8開頭不是全部都是LOC，query_bot.MODEL_GROUPS裡
-# 已經有一份實測驗證過的CM700專屬機台代號清單(BA802~BA893裡的特定機台)，
-# BA8開頭但不在這份CM700清單裡的才是LOC(例如BA801)——直接沿用同一份清單，
-# 不要自己另外維護一份容易兜不起來的BA8範圍規則。
+# 機台代號→機型群組(ESEC/DB/LOC/FC)，依代號前3碼分類，對齊同事Dashboard的
+# getEntityGroup規則(APG_TeamplusBot/teamplus_bot.py的_entity_group())。
+# 2026/08/09使用者確認：LOC就是CM700機型的官方GROUP分類名稱(CPIS Utilization
+# Analysis頁面GROUP彙總表裡就是叫"LOC"，不是另外獨立的機型)，BA8開頭全部
+# 都算LOC，不用再拆成CM700跟LOC兩組(query_bot.MODEL_GROUPS["CM700"]那份
+# 清單是給查詢功能用"CM700"關鍵字查詢時用的，跟這裡的分組彙總是兩回事，
+# 不影響這裡的判斷)。
 _ENTITY_GROUP_PREFIXES = {
     "BA2": "ESEC", "BA4": "ESEC",
     "BA7": "DB", "BAA": "DB", "BAB": "DB",
+    "BA8": "LOC",
     "BA5": "FC", "FC5": "FC", "BAD": "FC", "FC1": "FC",
 }
 
-_CM700_MACHINE_IDS = frozenset(query_bot.MODEL_GROUPS["CM700"])
-
 
 def _group_for_machine(machine_id):
-    mid = (machine_id or "").upper()
-    if mid in _CM700_MACHINE_IDS:
-        return "CM700"
-    p3 = mid[:3]
-    if p3 == "BA8":
-        return "LOC"
+    p3 = (machine_id or "").upper()[:3]
+    return _ENTITY_GROUP_PREFIXES.get(p3)
     return _ENTITY_GROUP_PREFIXES.get(p3)
 
 
@@ -172,8 +166,8 @@ def get_pm_monitor_records():
 
 
 def _pm_group_stats_from_rows(rows):
-    """依機型群組(ESEC/DB/LOC/FC/CM700)統計PM Monitor各STATUS台數，回傳{group: {status_code: 台數}}。"""
-    stats = {g: {} for g in ("ESEC", "DB", "LOC", "FC", "CM700")}
+    """依機型群組(ESEC/DB/LOC/FC)統計PM Monitor各STATUS台數，回傳{group: {status_code: 台數}}。"""
+    stats = {g: {} for g in ("ESEC", "DB", "LOC", "FC")}
     for r in rows:
         g = _group_for_machine(r["entity"])
         if g is None:
@@ -190,7 +184,7 @@ def get_pm_monitor_group_stats():
 
 def get_setup_group_stats():
     """
-    今日改機統計，依機型群組(ESEC/DB/LOC/FC/CM700)分組。"改機"(今日已完成)算自
+    今日改機統計，依機型群組(ESEC/DB/LOC/FC)分組。"改機"(今日已完成)算自
     ee_maintenance_record，只算job_code屬於CED/CEE/CD三類真正改機的紀錄
     (跟get_epoxy_done_by_jcode()同一套篩選標準，理由見該函式docstring—
     e_tag='S'裡混了很多生產中的小動作，不能整批當改機算)；"改機中"/"待改"
@@ -209,14 +203,14 @@ def get_setup_group_stats():
     done_rows = cur.fetchall()
     conn.close()
 
-    stats = {g: {"done": 0, "in_progress": 0, "waiting": 0} for g in ("ESEC", "DB", "LOC", "FC", "CM700")}
+    stats = {g: {"done": 0, "in_progress": 0, "waiting": 0} for g in ("ESEC", "DB", "LOC", "FC")}
     for r in done_rows:
         g = _group_for_machine(r["machine_id"])
         if g and _epoxy_jcode_category(r["job_code"]) is not None:
             stats[g]["done"] += 1
 
     pm_stats = get_pm_monitor_group_stats()
-    for g in ("ESEC", "DB", "LOC", "FC", "CM700"):
+    for g in ("ESEC", "DB", "LOC", "FC"):
         stats[g]["in_progress"] = pm_stats.get(g, {}).get("SETUP", 0)
         stats[g]["waiting"] = pm_stats.get(g, {}).get("WAIT-SETUP", 0)
     return stats
@@ -344,15 +338,12 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
     title = f"【APG DA 整點推播】{now.strftime('%m/%d %H:%M')}"
     parts = [title]
 
-    # 🔧 今日改機統計：依機型群組(EPOXY=ESEC+DB、LOC、FlipChip、CM700)列出今日
-    # 已完成/改機中/待改的台數；EPOXY另外逐一列出實際job_code(CED/CEDO/CD...)
-    # 各自的台數細項，數字由多到少排序，加總起來要等於EPOXY的改機總數
-    # (2026/08/09使用者要求，方便肉眼核對)。
+    # 🔧 今日改機統計：依機型群組(EPOXY=ESEC+DB、LOC、FlipChip)列出今日已完成/
+    # 改機中/待改的台數；EPOXY另外逐一列出實際job_code(CED/CEDO/CD...)各自的
+    # 台數細項，數字由多到少排序，加總起來要等於EPOXY的改機總數(2026/08/09
+    # 使用者要求，方便肉眼核對)。
     setup_stats = get_setup_group_stats()
-    esec, db, loc, fc, cm700 = (
-        setup_stats["ESEC"], setup_stats["DB"], setup_stats["LOC"],
-        setup_stats["FC"], setup_stats["CM700"],
-    )
+    esec, db, loc, fc = setup_stats["ESEC"], setup_stats["DB"], setup_stats["LOC"], setup_stats["FC"]
     epoxy = {k: esec[k] + db[k] for k in ("done", "in_progress", "waiting")}
     parts.append("")
     parts.append("🔧 今日改機統計")
@@ -368,7 +359,6 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
     parts.append(_setup_stats_line("└DB", db, " "))
     parts.append(_setup_stats_line("LOC", loc))
     parts.append(_setup_stats_line("FlipChip", fc))
-    parts.append(_setup_stats_line("CM700", cm700))
 
     # ⚡ 即時機況：來源是PM/REPAIR/SETUP Monitor頁面的真實快照(不是像上面
     # 「今日改機統計」那樣用EE Maintenance歷史紀錄推算的近似值)。除了依
@@ -388,7 +378,6 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
             _pm_stats_line("└DB", pm_stats.get("DB", {}), " "),
             _pm_stats_line("LOC", pm_stats.get("LOC", {})),
             _pm_stats_line("FlipChip", pm_stats.get("FC", {})),
-            _pm_stats_line("CM700", pm_stats.get("CM700", {})),
         ]
         lines = [ln for ln in lines if ln is not None]
         if lines:
