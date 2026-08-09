@@ -1,11 +1,13 @@
 """
 CPIS「PM/REPAIR/SETUP Monitor」頁面診斷工具(一次性使用，確認能不能直接GET到資料)
 
-用途：使用者提供的網址帶了UserName=EQS01這種看起來像共用顯示帳號的query
-string，懷疑這頁不需要像EE Maintenance/Utilization那樣先登入，這裡直接
-發一次GET，把結果印出來確認：
-  1. 有沒有被導去登入頁(is_auth_fail)
-  2. 有沒有抓到<table>，抓到的話印前幾列驗證欄位對不對得起來
+第一輪測試發現：直接GET這個網址不會被導向登入頁(不用登入)，但抓到的<table>
+內容是「公佈欄異常處理」那些欄位，不是畫面上看到的OPER/ENTITY/MODEL/STATUS
+機況表格——研判跟Utilization Analysis一樣，真正的資料表其實在裡面的
+iframe(子頁面)，不是同一份HTML。這裡改用cpis_api.py既有的iframe遞迴掃描
+邏輯(_collect_html_recursive，跟抓Utilization Analysis用的是同一套)，
+把主頁面裡所有iframe/frame也一併抓下來，逐一列出每一層抓到的<table>，
+確認哪一層才是真正的機況表格。
 
 用法: python diagnose_pm_monitor.py
 """
@@ -19,6 +21,38 @@ PM_MONITOR_URL = (
 )
 
 
+def _print_tables(html, label):
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        print(f"[{label}] 沒裝bs4，改用陽春字串統計<table>/<tr>數量")
+        print(f"[{label}] <table>數量:", html.count("<table"))
+        return
+
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
+    print(f"\n{'=' * 60}\n[{label}] HTML長度={len(html)}字元，找到{len(tables)}個<table>\n{'=' * 60}")
+
+    hit_target = False
+    for i, table in enumerate(tables):
+        rows = table.find_all("tr")
+        if len(rows) < 3:
+            continue
+        header_text = " ".join(c.get_text(strip=True) for c in rows[0].find_all(["td", "th"]))
+        is_target = ("ENTITY" in header_text.upper() and "STATUS" in header_text.upper())
+        if is_target:
+            hit_target = True
+        marker = "  <== 看起來就是這個！(表頭含ENTITY+STATUS)" if is_target else ""
+        print(f"\n--- table[{i}]: {len(rows)} 列{marker} ---")
+        for row in rows[:6]:
+            cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+            if any(cells):
+                print(cells)
+
+    if hit_target:
+        print(f"\n[{label}] *** 找到目標表格，就是這一層！把上面完整輸出貼給Claude即可 ***")
+
+
 def main():
     print("=" * 60)
     print("GET:", PM_MONITOR_URL)
@@ -28,7 +62,6 @@ def main():
     html, final_url = cpis_api._read(opener, PM_MONITOR_URL, timeout=30)
 
     print(f"[最終網址] {final_url}")
-    print(f"[HTML長度] {len(html)} 字元")
 
     if cpis_api.is_auth_fail(html, final_url):
         print("[結果] 被導向登入/逾時頁，這個網址不能匿名直接GET，需要先登入拿cookie")
@@ -38,29 +71,16 @@ def main():
 
     print("[結果] 沒有被導向登入頁，看起來是可以直接GET到資料的")
 
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        print("[提示] 沒裝bs4，改用陽春字串統計<table>/<tr>數量")
-        print("<table>數量:", html.count("<table"))
-        print("<tr>數量:", html.count("<tr"))
-        print("[前3000字內容，找不到bs4沒辦法结構化解析]")
-        print(html[:3000])
-        return
+    iframe_srcs = cpis_api._iframe_srcs(html)
+    print(f"[主頁面裡的iframe/frame數量] {len(iframe_srcs)}")
+    for src in iframe_srcs:
+        print("  -", src)
 
-    soup = BeautifulSoup(html, "html.parser")
-    tables = soup.find_all("table")
-    print(f"[找到 {len(tables)} 個 <table>]")
+    _print_tables(html, "主頁面")
 
-    for i, table in enumerate(tables):
-        rows = table.find_all("tr")
-        if len(rows) < 3:
-            continue
-        print(f"\n--- table[{i}]: {len(rows)} 列 ---")
-        for row in rows[:6]:
-            cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
-            if any(cells):
-                print(cells)
+    all_htmls = cpis_api._collect_html_recursive(opener, html, final_url, cpis_api.MAX_FRAME_DEPTH)
+    for i, frame_html in enumerate(all_htmls[1:], start=1):  # [0]就是主頁面，已經印過了
+        _print_tables(frame_html, f"iframe第{i}層")
 
 
 if __name__ == "__main__":
