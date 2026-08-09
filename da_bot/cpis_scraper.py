@@ -31,13 +31,19 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "da_maintenan
 
 
 def parse_result_table(html):
-    """解析查詢結果頁裡的結果表格,回傳 list of dict(跟Selenium版邏輯完全一致)"""
+    """
+    解析查詢結果頁裡的結果表格,回傳 list of dict。
+    優先用同事crawler.py已驗證可行的table id(ContentPlaceHolder1_gvData/gvData)去抓，
+    抓不到才退回原本Selenium版「挑列數最多的table」heuristic當備援(原始HTTP回應
+    可能夾帶版面用的table，用biggest-table heuristic在0筆結果時容易挑錯表格)。
+    """
     soup = BeautifulSoup(html, "html.parser")
-    tables = soup.find_all("table")
-    if not tables:
-        return []
-    # 通常結果表格是欄位最多、列數最多的那個,挑最大的
-    table = max(tables, key=lambda t: len(t.find_all("tr")))
+    table = soup.find("table", id="ContentPlaceHolder1_gvData") or soup.find("table", id="gvData")
+    if table is None:
+        tables = soup.find_all("table")
+        if not tables:
+            return []
+        table = max(tables, key=lambda t: len(t.find_all("tr")))
     rows = table.find_all("tr")
     if len(rows) < 2:
         return []

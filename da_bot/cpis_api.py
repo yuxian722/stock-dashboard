@@ -31,8 +31,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from bs4 import BeautifulSoup
-
 import config
 
 DOMAINS = {
@@ -113,45 +111,6 @@ def extract_input(html, name):
     return vm.group(1) if vm else ""
 
 
-def extract_form_fields(html):
-    """
-    把HTML裡第一個<form>目前的欄位狀態(name -> value)整理成dict，包含
-    __VIEWSTATE等隱藏欄位、文字框目前的值、下拉選單目前選到的選項、
-    已勾選的checkbox/radio。用來複製「表單上沒特別去改的欄位維持原樣送出」
-    這種真實瀏覽器postback的行為，只要再覆蓋我們真正要改的幾個欄位就好，
-    不用每個欄位都自己猜值。
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    form = soup.find("form")
-    if not form:
-        return {}
-
-    fields = {}
-    for tag in form.find_all(["input", "select", "textarea"]):
-        name = tag.get("name")
-        if not name:
-            continue
-        tag_name = tag.name
-        if tag_name == "input":
-            input_type = (tag.get("type") or "text").lower()
-            if input_type in ("checkbox", "radio"):
-                if tag.has_attr("checked"):
-                    fields[name] = tag.get("value", "on")
-            elif input_type in ("submit", "button", "image", "reset", "file"):
-                continue
-            else:
-                fields[name] = tag.get("value", "")
-        elif tag_name == "select":
-            options = tag.find_all("option")
-            selected = next((o for o in options if o.has_attr("selected")), None)
-            if selected is None and options:
-                selected = options[0]
-            fields[name] = selected.get("value", selected.get_text(strip=True)) if selected else ""
-        elif tag_name == "textarea":
-            fields[name] = tag.get_text()
-    return fields
-
-
 def decode_best(raw):
     """頁面混用utf-8/big5/cp950，挑亂碼字元數最少的編碼。"""
     best, best_bad, best_enc = "", float("inf"), _ENCODINGS[0]
@@ -218,14 +177,56 @@ def login():
 # EE Maintenance Record：查詢表單頁 -> POST查詢條件 -> 回傳結果HTML
 # ---------------------------------------------------------------------------
 
-def fetch_ee_maintenance_html(date_start, date_end, entity_pattern="*", opener=None):
+# Operation是多選勾選框：每個勾選各送一欄 DropDownCheckBoxes1$<index> = 站別代碼
+# (不是"on"！送出去的value就是站別代碼本身，這點跟一般checkbox不一樣)。
+# 這份內建對照是保險，每次會先試著從表單HTML動態解析(_ee_oper_index_from_form)，
+# 解析不到才用這份，避免站別代碼改版後對照失準。
+_EE_OPER_INDEX = {
+    "DA": 7, "DA10": 8, "DA3": 9, "DA4": 10, "DA5": 11, "DA6": 12,
+    "DA7": 13, "DA8": 14, "DA9": 15, "PRT": 48, "SA": 51, "SLM": 56,
+}
+
+
+def _ee_oper_index_from_form(html):
+    """從EE表單HTML解析Operation各項：站別代碼 -> 欄位index。解析不到回{}。"""
+    m = {}
+    html = html or ""
+    for mo in re.finditer(r'name="DropDownCheckBoxes1\$(\d+)"[^>]*?value="([^"]+)"', html):
+        m[mo.group(2).strip()] = int(mo.group(1))
+    for mo in re.finditer(r'value="([^"]+)"[^>]*?name="DropDownCheckBoxes1\$(\d+)"', html):
+        m.setdefault(mo.group(1).strip(), int(mo.group(2)))
+    return m
+
+
+def _ee_oper_fields(html_form, ee_entity):
+    """
+    依ee_entity(逗號分隔多站，或"ALL"/"*"代表全選)組出要送的DropDownCheckBoxes欄位dict。
+    「全選」才不會讓查詢條件互相打架變成No Data；如果只想篩特定站別，把ee_entity
+    改成該站代碼(例如"DA")即可。
+    """
+    idx_map = dict(_EE_OPER_INDEX)
+    idx_map.update(_ee_oper_index_from_form(html_form))  # 表單解析優先(較新、能涵蓋新站)
+    want = [o.strip() for o in (ee_entity or "").split(",") if o.strip()]
+    if len(want) == 1 and want[0].upper() in ("ALL", "*"):
+        want = list(idx_map.keys())
+    fields = {}
+    for code in want:
+        idx = idx_map.get(code)
+        if idx is not None:
+            fields[f"DropDownCheckBoxes1${idx}"] = code
+    return fields
+
+
+def fetch_ee_maintenance_html(date_start, date_end, entity_pattern="*", ee_entity="ALL", opener=None):
     """
     登入APG站並查詢EE Maintenance Record，回傳查詢結果頁的原始HTML(字串)，
     交給cpis_scraper.py用BeautifulSoup解析(跟原本Selenium版的parse_result_table
     邏輯完全一致，只是HTML的來源從driver.page_source換成這裡回傳的字串)。
 
     date_start/date_end格式跟原本Selenium版一致，YYYYMMDD。
-    entity_pattern是機台代號萬用字元查詢(例如"B*")，對應原始表單裡的txtentity欄位。
+    entity_pattern是機台代號萬用字元查詢(例如"B*")，對應表單裡的txtentity欄位。
+    ee_entity是Operation多選要勾哪些站別，預設"ALL"(全選，等同原本Selenium版點
+    「Select all」的效果)，機台範圍改用entity_pattern篩選。
     """
     opener = opener or login()
 
@@ -235,24 +236,27 @@ def fetch_ee_maintenance_html(date_start, date_end, entity_pattern="*", opener=N
     if is_auth_fail(html_form, form_url):
         raise CpisAuthError("EE驗證失敗(取表單)")
 
-    # 先複製表單目前所有欄位的值(包含VIEWSTATE等隱藏欄位)，只覆蓋我們真正要改的幾個，
-    # 其餘欄位維持頁面預設值，避免亂猜欄位值反而讓查詢條件跟預期不同
-    fields = extract_form_fields(html_form)
-    fields["txtStart_date"] = date_start
-    fields["txtEnd_date"] = date_end
-    if "txtentity" in fields:
-        fields["txtentity"] = entity_pattern
-
-    # Operation「Select all」：原始頁面用DropDownCheckBoxes1_sll這個checkbox觸發JS
-    # 把底下每個站別checkbox(DropDownCheckBoxes1$xxx)全部勾選，這裡直接把偵測到的
-    # 每一個都設成"on"，效果相同(勾「Select all」全選才不會讓查詢條件互相打架變成No Data)
-    if "DropDownCheckBoxes1_sll" in fields:
-        fields["DropDownCheckBoxes1_sll"] = "on"
-    for name in list(fields):
-        if name.startswith("DropDownCheckBoxes1$"):
-            fields[name] = "on"
-
-    fields["btnFetch"] = fields.get("btnFetch") or "Fetch"
+    fields = {
+        "__VIEWSTATE": extract_input(html_form, "__VIEWSTATE"),
+        "__VIEWSTATEGENERATOR": extract_input(html_form, "__VIEWSTATEGENERATOR"),
+        "__EVENTVALIDATION": extract_input(html_form, "__EVENTVALIDATION"),
+        "txtStart_date": date_start,
+        "txtEnd_date": date_end,
+        "ddl_shift": "None",
+        "ddl_floor": "A2",
+        "ddl_etag": "None(P,R,S,QC)",
+        "dllDept": "None",
+        "ddl_bd_id": "None",
+        "oper_type": "WD",
+        "txt_oper_type": "0",
+        "txtentity": entity_pattern,
+        "txtJobCode": "",
+        "txtEngineer": "",
+        "txtAssyLot": "",
+        "txtProduct": "",
+        "btnFetch": "Fetch",
+    }
+    fields.update(_ee_oper_fields(html_form, ee_entity))
 
     html_result, final_url = _post_form(opener, EE_FRAME_URL, fields, referer=EE_FRAME_URL, timeout=60)
     if is_auth_fail(html_result, final_url):

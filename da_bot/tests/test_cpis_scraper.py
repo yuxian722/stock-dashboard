@@ -36,6 +36,32 @@ class TestParseResultTable(unittest.TestCase):
         self.assertEqual(records[0]["col_1"], "BA205")
         self.assertEqual(records[0]["col_2"], "2026/08/01 07:00")
 
+    def test_prefers_known_table_id_over_biggest_table(self):
+        html = """
+        <table id="layoutMenu">
+            <tr><td>1</td></tr><tr><td>2</td></tr><tr><td>3</td></tr>
+            <tr><td>4</td></tr><tr><td>5</td></tr>
+        </table>
+        <table id="ContentPlaceHolder1_gvData">
+            <tr><th></th><th></th></tr>
+            <tr><td>B2</td><td>BA205</td></tr>
+        </table>
+        """
+        records = cpis_scraper.parse_result_table(html)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["col_0"], "B2")
+
+    def test_falls_back_to_gvData_id(self):
+        html = """
+        <table id="gvData">
+            <tr><th></th><th></th></tr>
+            <tr><td>B2</td><td>BA206</td></tr>
+        </table>
+        """
+        records = cpis_scraper.parse_result_table(html)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["col_1"], "BA206")
+
     def test_no_tables_returns_empty(self):
         self.assertEqual(cpis_scraper.parse_result_table("<html><body></body></html>"), [])
 

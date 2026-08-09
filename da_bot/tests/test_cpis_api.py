@@ -21,68 +21,6 @@ class TestExtractInput(unittest.TestCase):
         self.assertEqual(cpis_api.extract_input(html, "__EVENTVALIDATION"), "")
 
 
-class TestExtractFormFields(unittest.TestCase):
-    def test_text_and_hidden_inputs(self):
-        html = """
-        <form id="form1">
-            <input type="hidden" name="__VIEWSTATE" value="vs123" />
-            <input type="text" name="txtStart_date" value="20260101" />
-        </form>
-        """
-        fields = cpis_api.extract_form_fields(html)
-        self.assertEqual(fields["__VIEWSTATE"], "vs123")
-        self.assertEqual(fields["txtStart_date"], "20260101")
-
-    def test_checkbox_only_included_when_checked(self):
-        html = """
-        <form>
-            <input type="checkbox" name="cbA" value="on" checked />
-            <input type="checkbox" name="cbB" value="on" />
-        </form>
-        """
-        fields = cpis_api.extract_form_fields(html)
-        self.assertEqual(fields.get("cbA"), "on")
-        self.assertNotIn("cbB", fields)
-
-    def test_select_uses_selected_option(self):
-        html = """
-        <form>
-            <select name="ddl_floor">
-                <option value="None">None</option>
-                <option value="A2" selected>A2</option>
-            </select>
-        </form>
-        """
-        fields = cpis_api.extract_form_fields(html)
-        self.assertEqual(fields["ddl_floor"], "A2")
-
-    def test_select_defaults_to_first_option_when_none_selected(self):
-        html = """
-        <form>
-            <select name="ddl_shift">
-                <option value="None">None</option>
-                <option value="Day">Day</option>
-            </select>
-        </form>
-        """
-        fields = cpis_api.extract_form_fields(html)
-        self.assertEqual(fields["ddl_shift"], "None")
-
-    def test_submit_buttons_excluded(self):
-        html = """
-        <form>
-            <input type="submit" name="btnFetch" value="Fetch" />
-            <input type="text" name="txtEngineer" value="" />
-        </form>
-        """
-        fields = cpis_api.extract_form_fields(html)
-        self.assertNotIn("btnFetch", fields)
-        self.assertIn("txtEngineer", fields)
-
-    def test_no_form_returns_empty_dict(self):
-        self.assertEqual(cpis_api.extract_form_fields("<div>no form</div>"), {})
-
-
 class TestIsAuthFail(unittest.TestCase):
     def test_by_url(self):
         self.assertTrue(cpis_api.is_auth_fail("<html></html>", "http://host/CPISWeb/Logon.aspx"))
@@ -124,6 +62,47 @@ class TestIframeSrcs(unittest.TestCase):
 
     def test_no_frames_returns_empty(self):
         self.assertEqual(cpis_api._iframe_srcs("<div>no frames</div>"), [])
+
+
+class TestEeOperIndexFromForm(unittest.TestCase):
+    def test_name_then_value_order(self):
+        html = '<input type="checkbox" name="DropDownCheckBoxes1$7" value="DA" />'
+        self.assertEqual(cpis_api._ee_oper_index_from_form(html), {"DA": 7})
+
+    def test_value_then_name_order(self):
+        html = '<input type="checkbox" value="DA" name="DropDownCheckBoxes1$7" />'
+        self.assertEqual(cpis_api._ee_oper_index_from_form(html), {"DA": 7})
+
+    def test_no_matches_returns_empty(self):
+        self.assertEqual(cpis_api._ee_oper_index_from_form("<div>nothing here</div>"), {})
+
+
+class TestEeOperFields(unittest.TestCase):
+    def test_single_code_uses_index(self):
+        fields = cpis_api._ee_oper_fields("", "DA")
+        self.assertEqual(fields, {"DropDownCheckBoxes1$7": "DA"})
+
+    def test_multiple_comma_separated_codes(self):
+        fields = cpis_api._ee_oper_fields("", "DA,PRT")
+        self.assertEqual(fields, {"DropDownCheckBoxes1$7": "DA", "DropDownCheckBoxes1$48": "PRT"})
+
+    def test_all_selects_every_known_code(self):
+        fields = cpis_api._ee_oper_fields("", "ALL")
+        self.assertEqual(len(fields), len(cpis_api._EE_OPER_INDEX))
+        self.assertEqual(fields["DropDownCheckBoxes1$7"], "DA")
+
+    def test_wildcard_star_also_selects_all(self):
+        fields = cpis_api._ee_oper_fields("", "*")
+        self.assertEqual(len(fields), len(cpis_api._EE_OPER_INDEX))
+
+    def test_unknown_code_skipped_silently(self):
+        fields = cpis_api._ee_oper_fields("", "NOT_A_REAL_CODE")
+        self.assertEqual(fields, {})
+
+    def test_form_html_overrides_fallback_index(self):
+        html = '<input type="checkbox" name="DropDownCheckBoxes1$99" value="DA" />'
+        fields = cpis_api._ee_oper_fields(html, "DA")
+        self.assertEqual(fields, {"DropDownCheckBoxes1$99": "DA"})
 
 
 if __name__ == "__main__":
