@@ -20,6 +20,13 @@ for _s in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# 「<群組>改機」「工時」查詢要沿用hourly_push.py裡已經對過、修正過好幾次的
+# 機台代號→機型群組對照(_group_for_machine)、真正改機job_code判斷
+# (_epoxy_jcode_category)、跟班別對齊的「今日」定義(_shift_day_bounds)，
+# 不要在這裡自己重新猜一份、重蹈之前LOC/CM700分類搞錯的覆轍。這幾個都是
+# 不碰資料庫的純函式，直接import沿用沒有交互汙染DB_PATH的疑慮。
+import hourly_push
+
 DB_PATH = "da_maintenance.db"
 
 # 各 JOB CODE 的標準工時(小時)，用來判斷是否超時
@@ -763,6 +770,162 @@ def full_info_reply(machine_id: str) -> str:
         parts.append(health)
 
     return "\n".join(parts)
+
+
+# 「<群組>改機」查詢：呼叫端(teamplus_listener.py)要直接傳內部代號進來，
+# 內部代號要跟hourly_push._group_for_machine()回傳的值完全一致(ESEC/DB/
+# LOC/FC)，"EPOXY"是ESEC+DB合併(跟hourly_push.py的EPOXY定義一致)。注意
+# _group_for_machine()對FlipChip機台回傳的是"FC"不是"FlipChip"，呼叫端
+# 傳"FlipChip"字面近來會永遠比對不到、查詢結果是空的。
+# 內部代號→顯示用名稱，只用在回覆文字的標題。
+_CHANGEOVER_GROUP_DISPLAY = {
+    "EPOXY": "EPOXY", "ESEC": "ESEC", "DB": "DB", "LOC": "LOC", "FC": "FlipChip",
+}
+
+
+def _changeover_rows_for_group(cur, group_name, now):
+    """
+    回傳指定機型群組今日(跟班別對齊，見hourly_push._shift_day_bounds())已
+    完成的真正改機(job_code屬於CED/CEE/CD類別)紀錄原始列(machine_id/
+    job_code/engineer_id/dur)，group_name="EPOXY"時涵蓋ESEC+DB。
+    """
+    shift_date, next_date = hourly_push._shift_day_bounds(now)
+    cur.execute("""
+        SELECT DISTINCT machine_id, bgn_date, bgn_time, job_code, engineer_id, dur
+        FROM ee_maintenance_record
+        WHERE e_tag = 'S' AND (
+            (end_date = ? AND end_time >= ?)
+            OR (end_date = ? AND end_time < ?)
+        )
+    """, (shift_date, hourly_push.SHIFT_CHANGE_TIME, next_date, hourly_push.SHIFT_CHANGE_TIME))
+
+    rows = []
+    for r in cur.fetchall():
+        g = hourly_push._group_for_machine(r["machine_id"])
+        if group_name == "EPOXY":
+            if g not in ("ESEC", "DB"):
+                continue
+        elif g != group_name:
+            continue
+        if hourly_push._epoxy_jcode_category(r["job_code"]) is None:
+            continue
+        rows.append(r)
+    return rows
+
+
+def _category_avg_parts(rows):
+    """把rows依CED機台/CEE機台/CD機台分類，回傳["CED機台3台平均1.2hr", ...]這種
+    字串清單(照CED/CEE/CD固定順序，沒有資料的類別不顯示)。"""
+    by_cat = {}
+    for r in rows:
+        cat = hourly_push._epoxy_jcode_category(r["job_code"])
+        by_cat.setdefault(cat, []).append(r["dur"] or 0.0)
+    parts = []
+    for _, label in hourly_push._EPOXY_JCODE_CATEGORIES:
+        durs = by_cat.get(label)
+        if not durs:
+            continue
+        parts.append(f"{label}{len(durs)}台平均{sum(durs) / len(durs):.1f}hr")
+    return parts
+
+
+def group_changeover_detail_reply(group_name: str, now: datetime.datetime = None) -> str:
+    """
+    「<群組>改機」查詢(例如"DB改機")：今日該機型群組已完成的真正改機明細，
+    包含總台數、依CED/CEE/CD分類的平均改機工時，以及依人員(工號)分類的
+    改機台數+各分類平均工時(2026/08/09使用者要求)。「今日」跟班別對齊。
+    group_name要用內部代號(ESEC/DB/LOC/FC/EPOXY)，顯示文字會轉成
+    _CHANGEOVER_GROUP_DISPLAY對應的名稱(FC顯示成FlipChip)。
+    """
+    if now is None:
+        now = datetime.datetime.now()
+    display_name = _CHANGEOVER_GROUP_DISPLAY.get(group_name, group_name)
+    conn = get_conn()
+    cur = conn.cursor()
+    rows = _changeover_rows_for_group(cur, group_name, now)
+    conn.close()
+
+    if not rows:
+        return f"{display_name}改機 今日目前沒有完成的改機紀錄"
+
+    lines = [f"【{display_name}改機】今日共{len(rows)}台"]
+    cat_parts = _category_avg_parts(rows)
+    if cat_parts:
+        lines.append(" ".join(cat_parts))
+
+    by_engineer = {}
+    for r in rows:
+        eng = r["engineer_id"] or "未指定"
+        by_engineer.setdefault(eng, []).append(r)
+
+    lines.append("")
+    lines.append("人員明細:")
+    for eng, eng_rows in sorted(by_engineer.items(), key=lambda kv: -len(kv[1])):
+        eng_cat_parts = _category_avg_parts(eng_rows)
+        lines.append(f"{eng}  改機{len(eng_rows)}台  " + " ".join(eng_cat_parts))
+
+    return "\n".join(lines)
+
+
+def _workhours_rows(cur, now, engineer_id=None):
+    """
+    回傳今日(跟班別對齊)所有e_tag屬於R(修機)/S(改機)的紀錄(e_tag/engineer_id/
+    dur)。engineer_id有指定時只查該工號，不指定時回傳全部工號的紀錄。
+    e_tag='S'的紀錄要另外篩掉job_code不是CED/CEE/CD真正改機類別的(INK補
+    墨水/AING視覺校正這類生產中小動作)，跟這個檔案其他「改機」統計的認定
+    標準一致(e_tag='R'的修機紀錄不用篩，全部都算修機工時)。
+    """
+    shift_date, next_date = hourly_push._shift_day_bounds(now)
+    params = [shift_date, hourly_push.SHIFT_CHANGE_TIME, next_date, hourly_push.SHIFT_CHANGE_TIME]
+    sql = """
+        SELECT DISTINCT machine_id, bgn_date, bgn_time, e_tag, job_code, engineer_id, dur
+        FROM ee_maintenance_record
+        WHERE e_tag IN ('R', 'S') AND (
+            (end_date = ? AND end_time >= ?)
+            OR (end_date = ? AND end_time < ?)
+        )
+    """
+    if engineer_id:
+        sql += " AND engineer_id = ?"
+        params.append(engineer_id)
+    cur.execute(sql, params)
+
+    rows = []
+    for r in cur.fetchall():
+        if r["e_tag"] == "S" and hourly_push._epoxy_jcode_category(r["job_code"]) is None:
+            continue
+        rows.append(r)
+    return rows
+
+
+def workhours_reply(engineer_id: str = None, now: datetime.datetime = None) -> str:
+    """
+    「工時」查詢：今日各工號人員的修機+改機總工時(2026/08/09使用者要求)。
+    engineer_id指定時只顯示該工號；不指定時列出今日所有有紀錄的工號，
+    依總工時由多到少排序。「今日」跟班別對齊。
+    """
+    if now is None:
+        now = datetime.datetime.now()
+    conn = get_conn()
+    cur = conn.cursor()
+    rows = _workhours_rows(cur, now, engineer_id)
+    conn.close()
+
+    if not rows:
+        target = f"{engineer_id} " if engineer_id else ""
+        return f"{target}今日目前沒有修機/改機紀錄"
+
+    by_engineer = {}
+    for r in rows:
+        eng = r["engineer_id"] or "未指定"
+        hrs = by_engineer.setdefault(eng, {"R": 0.0, "S": 0.0})
+        hrs[r["e_tag"]] += r["dur"] or 0.0
+
+    lines = ["【工時】今日修機+改機總工時"]
+    for eng, hrs in sorted(by_engineer.items(), key=lambda kv: -(kv[1]["R"] + kv[1]["S"])):
+        total = hrs["R"] + hrs["S"]
+        lines.append(f"{eng}  修機{hrs['R']:.1f}hr + 改機{hrs['S']:.1f}hr = 總{total:.1f}hr")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

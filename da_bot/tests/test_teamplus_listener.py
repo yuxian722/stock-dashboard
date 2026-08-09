@@ -2,8 +2,10 @@
 
 import conftest  # noqa: F401  (設定 sys.path)
 
+import tempfile
 import unittest
 
+import query_bot
 import teamplus_listener as listener
 
 
@@ -45,6 +47,67 @@ class TestParseQueryDownrate(unittest.TestCase):
         # 要優先判斷成group_official_downrate，不能被機台規則搶先攔截
         cmd = listener.parse_query("DB800 down rate")
         self.assertEqual(cmd, {"mode": "group_official_downrate", "group_label": "DB800"})
+
+
+class TestParseQueryChangeoverGroupDetail(unittest.TestCase):
+    """「<群組>改機」查詢(2026/08/09使用者要求)，必須排在「DB」等機型群組bare
+    關鍵字判斷之前，不然"DB改機"會被db_group規則搶先攔截。"""
+
+    def test_db_changeover_takes_priority_over_bare_db_group(self):
+        cmd = listener.parse_query("DB改機")
+        self.assertEqual(cmd, {"mode": "group_changeover_detail", "group_name": "DB"})
+
+    def test_esec_changeover(self):
+        cmd = listener.parse_query("ESEC改機")
+        self.assertEqual(cmd, {"mode": "group_changeover_detail", "group_name": "ESEC"})
+
+    def test_loc_changeover(self):
+        cmd = listener.parse_query("LOC改機")
+        self.assertEqual(cmd, {"mode": "group_changeover_detail", "group_name": "LOC"})
+
+    def test_epoxy_changeover(self):
+        cmd = listener.parse_query("EPOXY改機")
+        self.assertEqual(cmd, {"mode": "group_changeover_detail", "group_name": "EPOXY"})
+
+    def test_flipchip_changeover_normalizes_to_fc(self):
+        cmd = listener.parse_query("FlipChip改機")
+        self.assertEqual(cmd, {"mode": "group_changeover_detail", "group_name": "FC"})
+
+    def test_build_reply_dispatches_to_query_bot(self):
+        orig_db_path = query_bot.DB_PATH
+        query_bot.DB_PATH = tempfile.mktemp(suffix=".db")
+        try:
+            reply = listener.build_reply({"mode": "group_changeover_detail", "group_name": "DB"})
+            # 資料庫裡沒有ee_maintenance_record表時應該回傳錯誤說明文字，不應該整個掛掉
+            self.assertIsInstance(reply, str)
+        finally:
+            query_bot.DB_PATH = orig_db_path
+
+
+class TestParseQueryWorkhours(unittest.TestCase):
+    """「工時」查詢(2026/08/09使用者要求)，必須排在機台代號規則之前，避免
+    "s10435"這種帶字母前綴的工號被誤判成機台代號。"""
+
+    def test_engineer_id_with_letter_prefix_before_keyword(self):
+        cmd = listener.parse_query("s10435工時")
+        self.assertEqual(cmd, {"mode": "workhours", "engineer_id": "s10435"})
+
+    def test_numeric_engineer_id_before_keyword_zong(self):
+        cmd = listener.parse_query("27512總工時")
+        self.assertEqual(cmd, {"mode": "workhours", "engineer_id": "27512"})
+
+    def test_bare_keyword_with_no_engineer_id(self):
+        cmd = listener.parse_query("工時")
+        self.assertEqual(cmd, {"mode": "workhours", "engineer_id": None})
+
+    def test_build_reply_dispatches_to_query_bot(self):
+        orig_db_path = query_bot.DB_PATH
+        query_bot.DB_PATH = tempfile.mktemp(suffix=".db")
+        try:
+            reply = listener.build_reply({"mode": "workhours", "engineer_id": "s10435"})
+            self.assertIsInstance(reply, str)
+        finally:
+            query_bot.DB_PATH = orig_db_path
 
 
 class TestHelpTrigger(unittest.TestCase):

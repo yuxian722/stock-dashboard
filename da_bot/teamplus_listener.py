@@ -79,6 +79,34 @@ _OFFICIAL_GROUP_PATTERNS = [(label, _build_official_group_pattern(label)) for la
 # 在某一處判斷式裡漏比對到(容忍空格、大小寫都要跟這裡一致)
 _DOWNRATE_KW_RE = re.compile(r"down\s*rate|停機明細|稼動明細", re.IGNORECASE)
 
+# 「<機型群組>改機」查詢(例如"DB改機"、"ESEC改機")：今日該群組改機明細，
+# 包含台數、CED/CEE/CD分類平均工時、依人員(工號)分類的台數+平均工時
+# (2026/08/09使用者要求)。key是使用者輸入時比對用的字樣，value是
+# query_bot.group_changeover_detail_reply()認得的內部群組代號——一定要跟
+# hourly_push._group_for_machine()回傳的值一致(ESEC/DB/LOC/FC)，FlipChip
+# 機台回傳的是"FC"不是"FlipChip"/"FLIPCHIP"，這裡不能對到錯的代號，不然
+# 查詢永遠是空的
+_CHANGEOVER_GROUP_KEYWORDS = [
+    ("EPOXY", "EPOXY"), ("ESEC", "ESEC"), ("DB", "DB"),
+    ("LOC", "LOC"), ("FLIP CHIP", "FC"), ("FLIPCHIP", "FC"), ("FC", "FC"),
+]
+
+
+def _build_changeover_group_pattern(label):
+    escaped = re.escape(label).replace(r"\ ", r"\s*")
+    return re.compile(r"(?<![A-Za-z0-9])" + escaped + r"\s*改機(?![A-Za-z0-9])", re.IGNORECASE)
+
+
+_CHANGEOVER_GROUP_PATTERNS = [
+    (internal, _build_changeover_group_pattern(label)) for label, internal in _CHANGEOVER_GROUP_KEYWORDS
+]
+
+# 「工時」查詢(例如"s10435工時"、"27512總工時")：今日該工號人員的修機+改機
+# 總工時(2026/08/09使用者要求)。工號格式不固定(純數字或字母開頭+數字)，
+# 用寬鬆一點的樣式抓緊貼在"工時"前面的那一段
+_WORKHOURS_RE = re.compile(r"(?:總)?工時")
+_WORKHOURS_ENGINEER_RE = re.compile(r"([A-Za-z]?\d{4,6})\s*(?:總)?工時")
+
 # 打這些字(整句、不含其他內容)就叫出關鍵字說明清單，忘記怎麼查的時候用
 HELP_TRIGGERS = {"查詢", "說明", "help", "指令", "用法", "選單", "?", "？"}
 
@@ -99,6 +127,12 @@ HELP_TEXT = (
     "• EPOXY(DB) → DB700+DB800+DB830 加總\n"
     "• CM700 → CM700機型群組\n"
     "• Esec2100 → 2100advi+2100SD機型群組\n"
+    "\n"
+    "改機明細/工時查詢：\n"
+    "• <群組>改機 → 今日該群組改機台數＋CED/CEE/CD分類平均工時＋依人員(工號)分類明細\n"
+    "  群組：EPOXY(=ESEC+DB) / ESEC / DB / LOC / FlipChip，例：DB改機\n"
+    "• <工號>工時 → 該工號今日修機＋改機總工時，例：s10435工時\n"
+    "• 工時（不加工號） → 列出今日所有有紀錄工號的總工時\n"
     "\n"
     "官方GROUP彙總表原始數字（CPIS Utilization Analysis頁面原始列，不是我們自己逐台平均算的）：\n"
     "• <官方群組名稱>＋downrate/稼動明細/停機明細 → 例：DB800 downrate\n"
@@ -123,6 +157,21 @@ def parse_query(text):
 
     if text.lower() in HELP_TRIGGERS:
         return {"mode": "help"}
+
+    # 「<機型群組>改機」查詢(例如"DB改機")：今日該群組改機明細(台數+CED/CEE/CD
+    # 分類平均工時+依人員分類的台數跟平均工時，2026/08/09使用者要求)。必須排在
+    # 最前面判斷，否則"DB改機"會先被後面「DB」單獨出現的規則攔截，變成觸發
+    # db_group彙總查詢而不是這裡的改機明細查詢
+    for internal, pattern in _CHANGEOVER_GROUP_PATTERNS:
+        if pattern.search(text):
+            return {"mode": "group_changeover_detail", "group_name": internal}
+
+    # 「工時」查詢(例如"s10435工時"、"27512總工時"，或單獨打"工時"列出今天所有
+    # 人員)：今日該工號人員的修機+改機總工時(2026/08/09使用者要求)。也要排在
+    # 機台代號規則前面，避免"s10435"這種字串被誤判成機台代號
+    if _WORKHOURS_RE.search(text):
+        m = _WORKHOURS_ENGINEER_RE.search(text)
+        return {"mode": "workhours", "engineer_id": m.group(1) if m else None}
 
     # 官方GROUP彙總表數字查詢：「<官方群組名稱> + downrate/稼動明細/停機明細」關鍵字，
     # 回傳CPIS Utilization Analysis頁面最下方GROUP彙總表該群組的官方原始一列數字
@@ -234,6 +283,18 @@ def build_reply(cmd):
             return query_bot.group_official_downrate_reply(cmd["group_label"])
         except Exception as e:
             return f"{cmd['group_label']} 官方GROUP彙總查詢時發生錯誤: {type(e).__name__}: {e}"
+
+    if mode == "group_changeover_detail":
+        try:
+            return query_bot.group_changeover_detail_reply(cmd["group_name"])
+        except Exception as e:
+            return f"{cmd['group_name']}改機查詢時發生錯誤: {type(e).__name__}: {e}"
+
+    if mode == "workhours":
+        try:
+            return query_bot.workhours_reply(cmd.get("engineer_id"))
+        except Exception as e:
+            return f"工時查詢時發生錯誤: {type(e).__name__}: {e}"
 
     machine = cmd["machine"]
 

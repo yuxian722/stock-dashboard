@@ -4,6 +4,7 @@
 
 import conftest  # noqa: F401  (設定 sys.path)
 
+import datetime
 import sqlite3
 import tempfile
 import unittest
@@ -304,6 +305,149 @@ class TestGetStdHours(unittest.TestCase):
         self.assertEqual(query_bot.get_std_hours("CED-M2"), 2.9)
         self.assertEqual(query_bot.get_std_hours("CED-M3"), 2.9)
         self.assertEqual(query_bot.get_std_hours("CED-M4"), 2.9)
+
+
+def _make_db_for_changeover_tests(rows):
+    """rows是list of dict，可含machine_id/e_tag/job_code/engineer_id/dur/
+    end_date/end_time(缺的欄位當NULL)，寫進ee_maintenance_record。"""
+    path = tempfile.mktemp(suffix=".db")
+    conn = sqlite3.connect(path)
+    conn.execute("""
+        CREATE TABLE ee_maintenance_record (
+            machine_id TEXT, bgn_date TEXT, bgn_time TEXT, end_date TEXT, end_time TEXT,
+            job_code TEXT, e_tag TEXT, engineer_id TEXT, dur REAL
+        )
+    """)
+    for row in rows:
+        conn.execute(
+            "INSERT INTO ee_maintenance_record "
+            "(machine_id, bgn_date, bgn_time, end_date, end_time, job_code, e_tag, engineer_id, dur) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (row.get("machine_id"), row.get("bgn_date"), row.get("bgn_time"), row.get("end_date"),
+             row.get("end_time"), row.get("job_code"), row.get("e_tag"), row.get("engineer_id"),
+             row.get("dur")),
+        )
+    conn.commit()
+    conn.close()
+    return path
+
+
+class TestGroupChangeoverDetailReply(unittest.TestCase):
+    """「<群組>改機」查詢：今日該群組改機台數＋CED/CEE/CD分類平均工時＋依人員
+    (工號)分類明細(2026/08/09使用者要求)。"""
+
+    def setUp(self):
+        self._orig_db_path = query_bot.DB_PATH
+
+    def tearDown(self):
+        query_bot.DB_PATH = self._orig_db_path
+
+    def test_shows_total_count_category_avg_and_per_engineer_breakdown(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "s10435", "dur": 1.0},
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": today, "end_time": "11:00",
+             "job_code": "CED", "engineer_id": "s10435", "dur": 1.4},
+            {"machine_id": "BAA03", "e_tag": "S", "end_date": today, "end_time": "12:00",
+             "job_code": "CEE", "engineer_id": "s10435", "dur": 1.0},
+        ])
+        reply = query_bot.group_changeover_detail_reply("DB", now)
+        self.assertIn("【DB改機】今日共3台", reply)
+        self.assertIn("CED機台2台平均1.2hr", reply)
+        self.assertIn("CEE機台1台平均1.0hr", reply)
+        self.assertIn("s10435  改機3台", reply)
+
+    def test_non_changeover_jcode_excluded(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "INK", "engineer_id": "s10435", "dur": 0.5},
+        ])
+        reply = query_bot.group_changeover_detail_reply("DB", now)
+        self.assertIn("今日目前沒有完成的改機紀錄", reply)
+
+    def test_flipchip_internal_code_fc_maps_to_display_name(self):
+        # _group_for_machine()對FlipChip機台回傳內部代號"FC"，顯示文字要轉成
+        # "FlipChip"，2026/08/09發現這個坑，避免"FlipChip"字面比對不到"FC"
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BA512", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "27512", "dur": 1.0},
+        ])
+        reply = query_bot.group_changeover_detail_reply("FC", now)
+        self.assertIn("【FlipChip改機】今日共1台", reply)
+
+    def test_epoxy_combines_esec_and_db_but_not_loc(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "e1", "dur": 1.0},   # ESEC
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "e2", "dur": 1.0},   # DB
+            {"machine_id": "BA801", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "e3", "dur": 1.0},   # LOC，不算EPOXY
+        ])
+        reply = query_bot.group_changeover_detail_reply("EPOXY", now)
+        self.assertIn("【EPOXY改機】今日共2台", reply)
+
+
+class TestWorkhoursReply(unittest.TestCase):
+    """「工時」查詢：今日各工號人員修機+改機總工時(2026/08/09使用者要求)。"""
+
+    def setUp(self):
+        self._orig_db_path = query_bot.DB_PATH
+
+    def tearDown(self):
+        query_bot.DB_PATH = self._orig_db_path
+
+    def test_sums_repair_and_changeover_hours_for_one_engineer(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BA205", "e_tag": "R", "end_date": today, "end_time": "10:00",
+             "engineer_id": "s10435", "dur": 2.0},
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "11:00",
+             "job_code": "CED", "engineer_id": "s10435", "dur": 1.5},
+        ])
+        reply = query_bot.workhours_reply("s10435", now)
+        self.assertIn("s10435  修機2.0hr + 改機1.5hr = 總3.5hr", reply)
+
+    def test_non_changeover_jcode_excluded_from_changeover_hours(self):
+        # e_tag='S'但job_code是INK這種生產中小動作，不算進改機工時
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BA205", "e_tag": "R", "end_date": today, "end_time": "10:00",
+             "engineer_id": "s10435", "dur": 2.0},
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "11:00",
+             "job_code": "INK", "engineer_id": "s10435", "dur": 1.5},
+        ])
+        reply = query_bot.workhours_reply("s10435", now)
+        self.assertIn("s10435  修機2.0hr + 改機0.0hr = 總2.0hr", reply)
+
+    def test_no_engineer_id_lists_everyone_sorted_by_total_hours(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BA205", "e_tag": "R", "end_date": today, "end_time": "10:00",
+             "engineer_id": "s10435", "dur": 2.0},
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "11:00",
+             "job_code": "CED", "engineer_id": "27512", "dur": 1.0},
+        ])
+        reply = query_bot.workhours_reply(None, now)
+        self.assertIn("s10435", reply)
+        self.assertIn("27512", reply)
+
+    def test_no_records_shows_placeholder(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        query_bot.DB_PATH = _make_db_for_changeover_tests([])
+        reply = query_bot.workhours_reply("s10435", now)
+        self.assertIn("今日目前沒有修機/改機紀錄", reply)
 
 
 if __name__ == "__main__":
