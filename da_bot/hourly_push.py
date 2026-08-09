@@ -47,7 +47,28 @@ _ENTITY_GROUP_PREFIXES = {
 def _group_for_machine(machine_id):
     p3 = (machine_id or "").upper()[:3]
     return _ENTITY_GROUP_PREFIXES.get(p3)
-    return _ENTITY_GROUP_PREFIXES.get(p3)
+
+
+# 早班/夜班交接時間(2026/08/09使用者確認：夜班19:30~07:30、早班07:30~19:30)。
+# 「今日改機統計」的「今日」要跟班別對齊，不能用日曆日(午夜00:00分界)——
+# 一個「班別日」是從當天07:30(早班開始)算到隔天07:30(夜班結束)，涵蓋一個
+# 早班+接續的夜班。凌晨00:00~07:30這段時間其實還算「昨晚的班別日」，還沒
+# 進入今天的班別日。
+SHIFT_CHANGE_TIME = "07:30"
+
+
+def _shift_day_bounds(now):
+    """
+    回傳now所屬「班別日」的(shift_date, next_date)兩個日期字串(YYYY-MM-DD)。
+    now還沒到當天07:30時，算前一天的班別日；07:30(含)之後才算當天的班別日。
+    """
+    shift_start_today = now.replace(hour=7, minute=30, second=0, microsecond=0)
+    if now < shift_start_today:
+        shift_date = now.date() - datetime.timedelta(days=1)
+    else:
+        shift_date = now.date()
+    next_date = shift_date + datetime.timedelta(days=1)
+    return shift_date.isoformat(), next_date.isoformat()
 
 
 # 「今日改機」認定為真正改機的job_code只有CED/CEE/CD三類(2026/08/09使用者
@@ -66,7 +87,7 @@ def _epoxy_jcode_category(job_code):
     return None
 
 
-def get_epoxy_done_by_jcode():
+def get_epoxy_done_by_jcode(now: datetime.datetime = None):
     """
     EPOXY(ESEC+DB)今日已完成的改機次數，依「實際job_code」逐一列出台數
     (2026/08/09使用者要求要看到CED/CEDO/CD這些實際代碼各自的台數，方便
@@ -77,18 +98,24 @@ def get_epoxy_done_by_jcode():
     導致改機統計數字暴增到不合理(EPOXY改機274/315這種)。這裡只算job_code
     對得到CED/CEE/CD前綴(真正改機類別)的紀錄，對不到的一律不算改機
     (2026/08/09使用者確認)，所以回傳結果加總起來會等於get_setup_group_stats()
-    裡EPOXY(ESEC+DB)的done數字。用SELECT DISTINCT防重複——同一筆真實紀錄
-    理論上不該重複，這裡用DISTINCT保險。回傳{實際job_code: n}，沒有資料的
-    代碼不會出現在結果裡。
+    裡EPOXY(ESEC+DB)的done數字。「今日」跟班別對齊(見_shift_day_bounds())，
+    不是日曆日。用SELECT DISTINCT防重複——同一筆真實紀錄理論上不該重複，
+    這裡用DISTINCT保險。回傳{實際job_code: n}，沒有資料的代碼不會出現在
+    結果裡。
     """
-    today = datetime.date.today().isoformat()
+    if now is None:
+        now = datetime.datetime.now()
+    shift_date, next_date = _shift_day_bounds(now)
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         SELECT DISTINCT machine_id, bgn_date, bgn_time, job_code
         FROM ee_maintenance_record
-        WHERE e_tag = 'S' AND end_date = ?
-    """, (today,))
+        WHERE e_tag = 'S' AND (
+            (end_date = ? AND end_time >= ?)
+            OR (end_date = ? AND end_time < ?)
+        )
+    """, (shift_date, SHIFT_CHANGE_TIME, next_date, SHIFT_CHANGE_TIME))
     rows = cur.fetchall()
     conn.close()
 
@@ -182,24 +209,30 @@ def get_pm_monitor_group_stats():
     return _pm_group_stats_from_rows(get_pm_monitor_records())
 
 
-def get_setup_group_stats():
+def get_setup_group_stats(now: datetime.datetime = None):
     """
     今日改機統計，依機型群組(ESEC/DB/LOC/FC)分組。"改機"(今日已完成)算自
     ee_maintenance_record，只算job_code屬於CED/CEE/CD三類真正改機的紀錄
     (跟get_epoxy_done_by_jcode()同一套篩選標準，理由見該函式docstring—
     e_tag='S'裡混了很多生產中的小動作，不能整批當改機算)；"改機中"/"待改"
     改成算自PM Monitor的即時快照(SETUP/WAIT-SETUP狀態)，比EE Maintenance的
-    wait_date/bgn_date推算法準確，是當下真正的狀態，不是歷史推論的。
+    wait_date/bgn_date推算法準確，是當下真正的狀態，不是歷史推論的。「今日」
+    跟班別對齊(見_shift_day_bounds())，不是日曆日。
     回傳{group: {"done": int, "in_progress": int, "waiting": int}}。
     """
-    today = datetime.date.today().isoformat()
+    if now is None:
+        now = datetime.datetime.now()
+    shift_date, next_date = _shift_day_bounds(now)
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         SELECT DISTINCT machine_id, bgn_date, bgn_time, job_code
         FROM ee_maintenance_record
-        WHERE e_tag = 'S' AND end_date = ?
-    """, (today,))
+        WHERE e_tag = 'S' AND (
+            (end_date = ? AND end_time >= ?)
+            OR (end_date = ? AND end_time < ?)
+        )
+    """, (shift_date, SHIFT_CHANGE_TIME, next_date, SHIFT_CHANGE_TIME))
     done_rows = cur.fetchall()
     conn.close()
 
@@ -342,13 +375,13 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
     # 改機中/待改的台數；EPOXY另外逐一列出實際job_code(CED/CEDO/CD...)各自的
     # 台數細項，數字由多到少排序，加總起來要等於EPOXY的改機總數(2026/08/09
     # 使用者要求，方便肉眼核對)。
-    setup_stats = get_setup_group_stats()
+    setup_stats = get_setup_group_stats(now)
     esec, db, loc, fc = setup_stats["ESEC"], setup_stats["DB"], setup_stats["LOC"], setup_stats["FC"]
     epoxy = {k: esec[k] + db[k] for k in ("done", "in_progress", "waiting")}
     parts.append("")
     parts.append("🔧 今日改機統計")
     parts.append(_setup_stats_line("EPOXY", epoxy))
-    epoxy_jcode = get_epoxy_done_by_jcode()
+    epoxy_jcode = get_epoxy_done_by_jcode(now)
     jcode_parts = [
         f"{code}{n}台" for code, n in sorted(epoxy_jcode.items(), key=lambda kv: (-kv[1], kv[0]))
         if n

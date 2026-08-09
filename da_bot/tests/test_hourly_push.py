@@ -11,6 +11,11 @@ import unittest
 
 import hourly_push
 
+# 固定的測試時間點(下午2點，確定已經過了07:30早班交接時間)，讓「今日改機
+# 統計」這類跟班別對齊的測試不受實際執行時間影響，結果穩定、不會因為剛好
+# 在半夜00:00~07:30之間跑測試就失敗
+_TEST_NOW = datetime.datetime(2026, 8, 9, 14, 0)
+
 _UTIL_TABLE_SQL = """
     CREATE TABLE utilization_record (
         MODEL TEXT, ENTITY TEXT, fetched_at TEXT,
@@ -179,6 +184,34 @@ class TestGroupForMachine(unittest.TestCase):
         self.assertIsNone(hourly_push._group_for_machine(None))
 
 
+class TestShiftDayBounds(unittest.TestCase):
+    """「今日改機統計」的「今日」要跟班別對齊(夜班19:30~07:30/早班07:30~19:30，
+    2026/08/09使用者確認)，不是日曆日(午夜00:00分界)。"""
+
+    def test_after_shift_change_returns_same_calendar_day(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)  # 下午2點，早班中
+        shift_date, next_date = hourly_push._shift_day_bounds(now)
+        self.assertEqual(shift_date, "2026-08-09")
+        self.assertEqual(next_date, "2026-08-10")
+
+    def test_exactly_at_shift_change_counts_as_new_day(self):
+        now = datetime.datetime(2026, 8, 9, 7, 30)  # 剛好07:30，早班開始
+        shift_date, next_date = hourly_push._shift_day_bounds(now)
+        self.assertEqual(shift_date, "2026-08-09")
+
+    def test_before_shift_change_still_counts_as_previous_day(self):
+        # 凌晨03:00還在昨晚的夜班裡，還沒進入今天的班別日
+        now = datetime.datetime(2026, 8, 9, 3, 0)
+        shift_date, next_date = hourly_push._shift_day_bounds(now)
+        self.assertEqual(shift_date, "2026-08-08")
+        self.assertEqual(next_date, "2026-08-09")
+
+    def test_one_minute_before_shift_change(self):
+        now = datetime.datetime(2026, 8, 9, 7, 29)
+        shift_date, _ = hourly_push._shift_day_bounds(now)
+        self.assertEqual(shift_date, "2026-08-08")
+
+
 class TestGetEpoxyDoneByJcode(unittest.TestCase):
     """EPOXY(ESEC+DB)今日已完成的改機次數，依「實際job_code」逐一列出台數。"""
 
@@ -191,16 +224,16 @@ class TestGetEpoxyDoneByJcode(unittest.TestCase):
     def test_groups_by_actual_jcode_not_broad_category(self):
         # 2026/08/09使用者要求要看到CED/CEDO/CD這些「實際代碼」各自的台數，
         # 不要收斂成CED機台/CEE機台/CD機台三個大類，把CEDO藏在CED機台裡看不到
-        today = datetime.date.today().isoformat()
+        today = _TEST_NOW.date().isoformat()
         hourly_push.DB_PATH = _make_db_with_records([
-            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "CED"},    # ESEC
-            {"machine_id": "BA401", "e_tag": "S", "end_date": today, "job_code": "CEDO"},   # ESEC
-            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "job_code": "CEDO"},   # DB
-            {"machine_id": "BAA02", "e_tag": "S", "end_date": today, "job_code": "CD"},     # DB
-            {"machine_id": "BA801", "e_tag": "S", "end_date": today, "job_code": "CED"},    # LOC, 不算EPOXY
-            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "INK"},    # ESEC，但INK不是真正改機，不算
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "10:00", "job_code": "CED"},    # ESEC
+            {"machine_id": "BA401", "e_tag": "S", "end_date": today, "end_time": "10:00", "job_code": "CEDO"},   # ESEC
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "10:00", "job_code": "CEDO"},   # DB
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": today, "end_time": "10:00", "job_code": "CD"},     # DB
+            {"machine_id": "BA801", "e_tag": "S", "end_date": today, "end_time": "10:00", "job_code": "CED"},    # LOC, 不算EPOXY
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "10:00", "job_code": "INK"},    # ESEC，但INK不是真正改機，不算
         ])
-        result = hourly_push.get_epoxy_done_by_jcode()
+        result = hourly_push.get_epoxy_done_by_jcode(_TEST_NOW)
         self.assertEqual(result, {"CED": 1, "CEDO": 2, "CD": 1})
         self.assertEqual(sum(result.values()), 4)
 
@@ -208,34 +241,52 @@ class TestGetEpoxyDoneByJcode(unittest.TestCase):
         # CPIS的e_tag='S'不是每一筆都是機型改機，補墨水(INK)/AI視覺校正(AING)/
         # 換料(CWT)/操作員備註(OC)這類生產中的小動作也會被標成'S'，
         # 2026/08/09使用者確認這些不算改機，一律不計入(也不放進"其他"桶)
-        today = datetime.date.today().isoformat()
+        today = _TEST_NOW.date().isoformat()
         hourly_push.DB_PATH = _make_db_with_records([
-            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "INK"},
-            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "AING"},
-            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "job_code": "CWT"},
-            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "job_code": "OC"},
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "10:00", "job_code": "INK"},
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "10:00", "job_code": "AING"},
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "10:00", "job_code": "CWT"},
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "10:00", "job_code": "OC"},
         ])
-        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(), {})
+        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(_TEST_NOW), {})
 
     def test_non_epoxy_group_excluded(self):
-        today = datetime.date.today().isoformat()
+        today = _TEST_NOW.date().isoformat()
         hourly_push.DB_PATH = _make_db_with_records([
-            {"machine_id": "BA801", "e_tag": "S", "end_date": today, "job_code": "CED"},  # LOC
+            {"machine_id": "BA801", "e_tag": "S", "end_date": today, "end_time": "10:00", "job_code": "CED"},  # LOC
         ])
-        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(), {})
+        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(_TEST_NOW), {})
 
     def test_e_tag_r_excluded(self):
-        today = datetime.date.today().isoformat()
+        today = _TEST_NOW.date().isoformat()
         hourly_push.DB_PATH = _make_db_with_records([
-            {"machine_id": "BA205", "e_tag": "R", "end_date": today, "job_code": "CED"},
+            {"machine_id": "BA205", "e_tag": "R", "end_date": today, "end_time": "10:00", "job_code": "CED"},
         ])
-        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(), {})
+        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(_TEST_NOW), {})
 
     def test_not_completed_today_excluded(self):
         hourly_push.DB_PATH = _make_db_with_records([
-            {"machine_id": "BA205", "e_tag": "S", "end_date": "2026-08-01", "job_code": "CED"},
+            {"machine_id": "BA205", "e_tag": "S", "end_date": "2026-08-01", "end_time": "10:00", "job_code": "CED"},
         ])
-        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(), {})
+        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(_TEST_NOW), {})
+
+    def test_completed_just_after_midnight_still_belongs_to_previous_shift_day(self):
+        # 08/09凌晨02:00完成的改機，還算在08/08的班別日裡(夜班橫跨午夜)。
+        # 如果現在是08/09下午(已經進入08/09的班別日)，這筆08/08班別日的紀錄
+        # 已經「過去了」，不該再被算進「今日」改機統計
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": "2026-08-09", "end_time": "02:00", "job_code": "CED"},
+        ])
+        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(_TEST_NOW), {})
+
+    def test_completed_just_after_midnight_counted_while_still_in_that_shift_day(self):
+        # 同一筆08/09凌晨02:00完成的紀錄，如果現在還是08/09凌晨03:00(還在
+        # 08/08那個班別日裡，還沒到07:30交班)，就應該要算進「今日」
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": "2026-08-09", "end_time": "02:00", "job_code": "CED"},
+        ])
+        now = datetime.datetime(2026, 8, 9, 3, 0)
+        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(now), {"CED": 1})
 
 
 class TestGetSetupGroupStats(unittest.TestCase):
@@ -249,7 +300,7 @@ class TestGetSetupGroupStats(unittest.TestCase):
         hourly_push.DB_PATH = self._orig_db_path
 
     def test_done_from_ee_maintenance_in_progress_and_waiting_from_pm_monitor(self):
-        today = datetime.date.today().isoformat()
+        today = _TEST_NOW.date().isoformat()
         hourly_push.DB_PATH = _make_db_with_records([
             {"machine_id": "BA205", "e_tag": "S", "bgn_date": "2026-08-08", "bgn_time": "10:00",
              "end_date": today, "end_time": "12:00", "job_code": "CED"},   # ESEC, 今日完成
@@ -261,7 +312,7 @@ class TestGetSetupGroupStats(unittest.TestCase):
             ("BAA01", "SETUP"),       # DB, 改機中
             ("BA801", "WAIT-SETUP"),  # LOC, 待改
         ])
-        stats = hourly_push.get_setup_group_stats()
+        stats = hourly_push.get_setup_group_stats(_TEST_NOW)
         self.assertEqual(stats["ESEC"], {"done": 1, "in_progress": 0, "waiting": 0})
         self.assertEqual(stats["DB"], {"done": 0, "in_progress": 1, "waiting": 0})
         self.assertEqual(stats["LOC"], {"done": 0, "in_progress": 0, "waiting": 1})
@@ -272,23 +323,23 @@ class TestGetSetupGroupStats(unittest.TestCase):
             {"machine_id": "BA205", "e_tag": "S", "bgn_date": "2026-08-01", "bgn_time": "10:00",
              "end_date": "2026-08-01", "end_time": "12:00", "job_code": "CED"},
         ])
-        stats = hourly_push.get_setup_group_stats()
+        stats = hourly_push.get_setup_group_stats(_TEST_NOW)
         self.assertEqual(stats["ESEC"]["done"], 0)
 
     def test_non_changeover_jcode_not_counted_as_done(self):
         # e_tag='S'裡INK(補墨水)/AING(AI視覺校正)這類生產中的小動作不算改機，
         # 2026/08/09使用者確認只算CED/CEE/CD三類，其餘一律不計入done
-        today = datetime.date.today().isoformat()
+        today = _TEST_NOW.date().isoformat()
         hourly_push.DB_PATH = _make_db_with_records([
-            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "INK"},
-            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "AING"},
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "10:00", "job_code": "INK"},
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "10:00", "job_code": "AING"},
         ])
-        stats = hourly_push.get_setup_group_stats()
+        stats = hourly_push.get_setup_group_stats(_TEST_NOW)
         self.assertEqual(stats["ESEC"]["done"], 0)
 
     def test_no_pm_monitor_table_leaves_in_progress_and_waiting_zero(self):
         hourly_push.DB_PATH = _make_db_with_records([])
-        stats = hourly_push.get_setup_group_stats()
+        stats = hourly_push.get_setup_group_stats(_TEST_NOW)
         for g in ("ESEC", "DB", "LOC", "FC"):
             self.assertEqual(stats[g], {"done": 0, "in_progress": 0, "waiting": 0})
 
@@ -301,14 +352,14 @@ class TestBuildHourlyPushMessageNewSections(unittest.TestCase):
         hourly_push.DB_PATH = self._orig_db_path
 
     def test_includes_setup_stats_and_epoxy_jcode_breakdown(self):
-        today = datetime.date.today().isoformat()
+        today = _TEST_NOW.date().isoformat()
         hourly_push.DB_PATH = _make_db_with_records([
             {"machine_id": "BA205", "e_tag": "S", "bgn_date": "2026-08-08", "bgn_time": "10:00",
              "end_date": today, "end_time": "12:00", "job_code": "CED"},
             {"machine_id": "BAA01", "e_tag": "S", "bgn_date": "2026-08-08", "bgn_time": "10:00",
              "end_date": today, "end_time": "12:00", "job_code": "CEDO"},
         ])
-        msg = hourly_push.build_hourly_push_message()
+        msg = hourly_push.build_hourly_push_message(now=_TEST_NOW)
         self.assertIn("🔧 今日改機統計", msg)
         self.assertIn("EPOXY   改機2 | 改機中0 | 待改0", msg)
         # 逐一列出實際job_code(不再收斂成CED機台這種大類)，加總要等於改機總數
@@ -317,7 +368,7 @@ class TestBuildHourlyPushMessageNewSections(unittest.TestCase):
 
     def test_overtime_section_shows_placeholder_when_no_pm_monitor_data(self):
         hourly_push.DB_PATH = _make_db_with_records([])
-        msg = hourly_push.build_hourly_push_message()
+        msg = hourly_push.build_hourly_push_message(now=_TEST_NOW)
         self.assertIn("⏰ 超時機台", msg)
         self.assertIn("目前無超過標準工時的機台，或PM Monitor資料尚未抓取", msg)
 
