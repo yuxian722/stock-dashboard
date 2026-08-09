@@ -1,3 +1,4 @@
 pywin32
 beautifulsoup4
 xlrd
+selenium
