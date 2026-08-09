@@ -20,6 +20,14 @@ PM_MONITOR_URL = (
     "?isCopy=True&FuncId=57&ServerName=CPIS&UserName=EQS01"
 )
 
+# 在瀏覽器F12主控台對mainFrame打location.href找到的實際網址(真正顯示機況
+# 表格的那個frame)，沒有帶任何querystring參數，猜測是靠session/cookie記住
+# Oper Kind選項(D/A)，不是靠網址參數決定
+MAIN_FRAME_URL = (
+    "http://tncpisapg.tn.chipmos.com.tw/APG/APGPROD/EQUIPMENT/"
+    "wFrmPMRepairSetupMonitor/ent_st11.aspx"
+)
+
 
 def _print_tables(html, label):
     try:
@@ -81,6 +89,25 @@ def main():
     all_htmls = cpis_api._collect_html_recursive(opener, html, final_url, cpis_api.MAX_FRAME_DEPTH)
     for i, frame_html in enumerate(all_htmls[1:], start=1):  # [0]就是主頁面，已經印過了
         _print_tables(frame_html, f"iframe第{i}層")
+
+    # 額外測試：在瀏覽器F12主控台對mainFrame打location.href找到的實際網址，
+    # 沿用同一個opener(帶著剛才GET Default.aspx拿到的cookie)、以Default.aspx
+    # 當Referer，直接GET看看能不能拿到跟畫面上一樣的機況表格
+    print("\n" + "#" * 60)
+    print("額外測試：直接GET mainFrame的實際網址(帶著同一組cookie)")
+    print("GET:", MAIN_FRAME_URL)
+    print("#" * 60)
+
+    import urllib.request
+    req = urllib.request.Request(MAIN_FRAME_URL)
+    req.add_header("Referer", final_url)
+    main_html, main_final_url = cpis_api._read(opener, req, timeout=30)
+    print(f"[最終網址] {main_final_url}")
+
+    if cpis_api.is_auth_fail(main_html, main_final_url):
+        print("[結果] 被導向登入/逾時頁，這條路線需要更完整的session/cookie才能用")
+    else:
+        _print_tables(main_html, "mainFrame直接GET")
 
 
 if __name__ == "__main__":
