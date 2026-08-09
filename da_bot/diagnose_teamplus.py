@@ -6,65 +6,70 @@ team+ 讀訊息API 診斷工具(一次性使用，不影響正式的da_bot_servi
 
 用法: python diagnose_teamplus.py
 （跟teamplus_cookie.txt放在同一個da_bot資料夾下執行）
+目前已知：NewestBatchID傳空字串會被team+的API直接拒絕(參數錯誤)，這支
+腳本會多測一種寫法：NewestBatchID帶一個隨機產生的UUID(格式模仿send訊息
+時自己產生的batchID)，看這樣能不能正常要到「目前最新」的訊息清單/cursor。
 """
 import json
+import uuid
 
 import teamplus_api
-
-print("=" * 60)
-print("ChatID:", teamplus_api.CHAT_ID)
-print("=" * 60)
-
-cookie = teamplus_api.load_cookie()
-print(f"[cookie] 讀到{len(cookie)}個字元\n")
-
 import urllib.request
 import urllib.parse
 
-body = urllib.parse.urlencode({
-    "action": "getNewestMessageList",
-    "ChannelType": teamplus_api.CHANNEL_TYPE,
-    "Mobile": teamplus_api.MOBILE,
-    "ChatID": teamplus_api.CHAT_ID,
-    "NewestBatchID": "",
-    "FromNearline": "false",
-    "LoadCount": "25",
-}).encode("utf-8")
-req = urllib.request.Request(teamplus_api.READ_URL, data=body, method="POST")
-req.add_header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-req.add_header("Accept", "application/json, text/javascript, */*; q=0.01")
-req.add_header("X-Requested-With", "XMLHttpRequest")
-req.add_header("Referer", teamplus_api.PAGE_URL)
-req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-req.add_header("Cookie", cookie)
 
-try:
+def call_read(newest_batch_id):
+    cookie = teamplus_api.load_cookie()
+    body = urllib.parse.urlencode({
+        "action": "getNewestMessageList",
+        "ChannelType": teamplus_api.CHANNEL_TYPE,
+        "Mobile": teamplus_api.MOBILE,
+        "ChatID": teamplus_api.CHAT_ID,
+        "NewestBatchID": newest_batch_id,
+        "FromNearline": "false",
+        "LoadCount": "25",
+    }).encode("utf-8")
+    req = urllib.request.Request(teamplus_api.READ_URL, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+    req.add_header("Accept", "application/json, text/javascript, */*; q=0.01")
+    req.add_header("X-Requested-With", "XMLHttpRequest")
+    req.add_header("Referer", teamplus_api.PAGE_URL)
+    req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+    req.add_header("Cookie", cookie)
     with urllib.request.urlopen(req, context=teamplus_api._SSL_CTX, timeout=15) as resp:
         raw = resp.read().decode("utf-8")
-except Exception as e:
-    print(f"[錯誤] 連線失敗: {type(e).__name__}: {e}")
-    raise SystemExit(1)
+    return json.loads(raw)
 
-print("[原始JSON長度]", len(raw), "字元\n")
 
+def show(label, data):
+    print("=" * 60)
+    print(label)
+    print("=" * 60)
+    print("[最上層的所有欄位名稱]", list(data.keys()))
+    for key in ("ChatMessageList", "MessageList"):
+        val = data.get(key)
+        print(f"[{key}] {'不存在' if val is None else f'{len(val)} 筆'}")
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+    print()
+
+
+print("ChatID:", teamplus_api.CHAT_ID)
+print()
+
+print("--- 測試1: NewestBatchID = 空字串(目前程式原本的寫法) ---")
 try:
-    data = json.loads(raw)
+    data1 = call_read("")
+    show("測試1結果", data1)
 except Exception as e:
-    print(f"[錯誤] 不是合法JSON: {e}")
-    print("[原始內容前2000字]")
-    print(raw[:2000])
-    raise SystemExit(1)
+    print(f"[錯誤] {type(e).__name__}: {e}\n")
 
-print("[最上層的所有欄位名稱]")
-print(list(data.keys()))
-print()
+print("--- 測試2: NewestBatchID = 隨機UUID(模仿送訊息時的batchID格式) ---")
+try:
+    fake_bid = str(uuid.uuid4())
+    print("用的UUID:", fake_bid)
+    data2 = call_read(fake_bid)
+    show("測試2結果", data2)
+except Exception as e:
+    print(f"[錯誤] {type(e).__name__}: {e}\n")
 
-for key in ("ChatMessageList", "MessageList"):
-    val = data.get(key)
-    print(f"[{key}] {'不存在' if val is None else f'{len(val)} 筆'}")
-
-print()
-print("=" * 60)
-print("完整JSON內容(把這整段貼給Claude看)：")
-print("=" * 60)
-print(json.dumps(data, ensure_ascii=False, indent=2))
+print("把上面測試1、測試2的完整結果都貼給Claude看")
