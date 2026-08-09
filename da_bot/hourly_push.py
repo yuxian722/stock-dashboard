@@ -102,15 +102,22 @@ def _get_done_setup_records(now):
 
 
 # 「今日改機」認定為真正改機的job_code只有CED/CEE/CD三類(2026/08/09使用者
-# 提供+確認)，也用來當「這筆e_tag='S'紀錄算不算改機」的篩選標準——CPIS的
-# e_tag='S'不是每一筆都是機型改機，INK(補墨水)/AING(AI視覺校正)/CWT(換料)/
-# OC(操作員備註)這類生產中的小動作也會被標成'S'，對不到這三類前綴的就不算
-# 改機(不管是哪個機型群組)
+# 提供+確認)，也用來當「這筆紀錄算不算改機」的統一篩選標準——不管是EE
+# Maintenance的e_tag='S'紀錄(判斷「改機完成」)，還是PM Monitor的SETUP/
+# WAIT-SETUP快照(判斷「改機中」/「待改」)，都要用同一套標準，CPIS的
+# STATUS='SETUP'/e_tag='S'不是每一筆都是機型改機——INK(補墨水)/AING(AI視覺
+# 校正)/CWT(換料)/OC(操作員備註)/CWTM/EI這類生產中的小動作也會被標成同樣
+# 的狀態，對不到這幾類的就不算改機(2026/08/09使用者確認PM Monitor這邊也要
+# 統一套用)。"CE"是獨立代碼，比"CED"/"CEE"還短，不是誰的前綴，要另外精確
+# 比對(2026/08/09使用者補充)。
 _EPOXY_JCODE_CATEGORIES = [("CED", "CED機台"), ("CEE", "CEE機台"), ("CD", "CD機台")]
+_EPOXY_JCODE_EXACT = {"CE": "CEE機台"}
 
 
 def _epoxy_jcode_category(job_code):
     jc = (job_code or "").upper()
+    if jc in _EPOXY_JCODE_EXACT:
+        return _EPOXY_JCODE_EXACT[jc]
     for prefix, label in _EPOXY_JCODE_CATEGORIES:
         if jc.startswith(prefix):
             return label
@@ -236,14 +243,28 @@ def get_pm_monitor_records():
     return rows
 
 
+_PM_CHANGEOVER_STATUSES = ("SETUP", "WAIT-SETUP")
+
+
 def _pm_group_stats_from_rows(rows):
-    """依機型群組(ESEC/DB/LOC/FC)統計PM Monitor各STATUS台數，回傳{group: {status_code: 台數}}。"""
+    """
+    依機型群組(ESEC/DB/LOC/FC)統計PM Monitor各STATUS台數，回傳
+    {group: {status_code: 台數}}。SETUP/WAIT-SETUP(改機中/待改)這兩種
+    狀態額外用_epoxy_jcode_category()篩過，只算jcode對得到CED/CEE/CD/CE
+    真正改機類別的紀錄——PM Monitor同一個STATUS='SETUP'底下混了CWTM/EI/
+    INK這類生產中小動作，不是每一筆都是真正改機(2026/08/09使用者確認，
+    要跟改機完成的判斷標準統一)。其餘狀態(IN-REPAIR/WAIT-REPAIR/PM/ENG)
+    不受影響，照原樣全部計入。
+    """
     stats = {g: {} for g in ("ESEC", "DB", "LOC", "FC")}
     for r in rows:
         g = _group_for_machine(r["entity"])
         if g is None:
             continue
-        stats[g][r["status"]] = stats[g].get(r["status"], 0) + 1
+        status = r["status"]
+        if status in _PM_CHANGEOVER_STATUSES and _epoxy_jcode_category(r["jcode"]) is None:
+            continue
+        stats[g][status] = stats[g].get(status, 0) + 1
     return stats
 
 

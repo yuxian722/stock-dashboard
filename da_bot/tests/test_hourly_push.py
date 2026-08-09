@@ -212,6 +212,31 @@ class TestShiftDayBounds(unittest.TestCase):
         self.assertEqual(shift_date, "2026-08-08")
 
 
+class TestEpoxyJcodeCategory(unittest.TestCase):
+    """真正改機job_code的判斷標準：CED/CEE/CD前綴比對，加上"CE"獨立精確比對
+    (2026/08/09使用者確認，"CE"比"CED"/"CEE"短，不是誰的前綴)。"""
+
+    def test_ced_prefix_family(self):
+        for jc in ("CED", "CEDO", "CED-1", "CED-M2"):
+            self.assertEqual(hourly_push._epoxy_jcode_category(jc), "CED機台", msg=jc)
+
+    def test_cee_prefix_family(self):
+        for jc in ("CEE", "CEEO", "CEE123"):
+            self.assertEqual(hourly_push._epoxy_jcode_category(jc), "CEE機台", msg=jc)
+
+    def test_cd_prefix_family(self):
+        for jc in ("CD", "CD-2"):
+            self.assertEqual(hourly_push._epoxy_jcode_category(jc), "CD機台", msg=jc)
+
+    def test_ce_exact_match_maps_to_cee(self):
+        self.assertEqual(hourly_push._epoxy_jcode_category("CE"), "CEE機台")
+        self.assertEqual(hourly_push._epoxy_jcode_category("ce"), "CEE機台")
+
+    def test_non_changeover_codes_return_none(self):
+        for jc in ("INK", "AING", "CWT", "OC", "CWTM", "EI", "XI", None, ""):
+            self.assertIsNone(hourly_push._epoxy_jcode_category(jc), msg=jc)
+
+
 class TestGetEpoxyDoneByJcode(unittest.TestCase):
     """EPOXY(ESEC+DB)今日已完成的改機次數，依「實際job_code」逐一列出台數。"""
 
@@ -358,8 +383,8 @@ class TestGetSetupGroupStats(unittest.TestCase):
              "job_code": "CE"},
         ])
         _add_pm_monitor_rows(hourly_push.DB_PATH, [
-            ("BAA01", "SETUP"),       # DB, 改機中
-            ("BA801", "WAIT-SETUP"),  # LOC, 待改
+            {"entity": "BAA01", "status": "SETUP", "jcode": "CED"},       # DB, 改機中
+            {"entity": "BA801", "status": "WAIT-SETUP", "jcode": "CEE"},  # LOC, 待改
         ])
         stats = hourly_push.get_setup_group_stats(_TEST_NOW)
         self.assertEqual(stats["ESEC"], {"done": 1, "in_progress": 0, "waiting": 0})
@@ -446,16 +471,46 @@ class TestGetPmMonitorGroupStats(unittest.TestCase):
     def test_groups_by_machine_prefix_and_counts_status(self):
         hourly_push.DB_PATH = _make_db_with_records([])
         _add_pm_monitor_rows(hourly_push.DB_PATH, [
-            ("BA205", "IN-REPAIR"),  # ESEC
-            ("BAA01", "SETUP"),      # DB
-            ("BAA02", "SETUP"),      # DB
-            ("BA801", "WAIT-SETUP"),  # LOC
+            {"entity": "BA205", "status": "IN-REPAIR"},                # ESEC
+            {"entity": "BAA01", "status": "SETUP", "jcode": "CED"},     # DB
+            {"entity": "BAA02", "status": "SETUP", "jcode": "CEDO"},    # DB
+            {"entity": "BA801", "status": "WAIT-SETUP", "jcode": "CD"},  # LOC
         ])
         stats = hourly_push.get_pm_monitor_group_stats()
         self.assertEqual(stats["ESEC"], {"IN-REPAIR": 1})
         self.assertEqual(stats["DB"], {"SETUP": 2})
         self.assertEqual(stats["LOC"], {"WAIT-SETUP": 1})
         self.assertEqual(stats["FC"], {})
+
+    def test_setup_status_excludes_non_changeover_jcode(self):
+        # PM Monitor的STATUS='SETUP'底下混了CWTM/EI/INK這類生產中小動作，
+        # 不是每一筆都是真正改機，2026/08/09使用者確認要跟改機完成的判斷
+        # 標準統一，只算CED/CEE/CD/CE類的jcode
+        hourly_push.DB_PATH = _make_db_with_records([])
+        _add_pm_monitor_rows(hourly_push.DB_PATH, [
+            {"entity": "BAA01", "status": "SETUP", "jcode": "CED"},   # 真正改機，算
+            {"entity": "BAA02", "status": "SETUP", "jcode": "CWTM"},  # 生產中小動作，不算
+            {"entity": "BAA03", "status": "SETUP", "jcode": "EI"},    # 生產中小動作，不算
+            {"entity": "BAB01", "status": "WAIT-SETUP", "jcode": "INK"},  # 生產中小動作，不算
+            {"entity": "BAB02", "status": "WAIT-SETUP", "jcode": "CE"},   # "CE"是獨立的真正改機代碼，算
+        ])
+        stats = hourly_push.get_pm_monitor_group_stats()
+        self.assertEqual(stats["DB"], {"SETUP": 1, "WAIT-SETUP": 1})
+
+    def test_non_changeover_statuses_not_filtered_by_jcode(self):
+        # IN-REPAIR/WAIT-REPAIR/PM/ENG這些狀態不受jcode篩選影響，全部照算
+        hourly_push.DB_PATH = _make_db_with_records([])
+        _add_pm_monitor_rows(hourly_push.DB_PATH, [
+            {"entity": "BAA01", "status": "IN-REPAIR", "jcode": "E"},
+            {"entity": "BAA02", "status": "WAIT-REPAIR", "jcode": None},
+            {"entity": "BAA03", "status": "PM", "jcode": "PE"},
+            {"entity": "BAA04", "status": "ENG", "jcode": "PE"},
+        ])
+        stats = hourly_push.get_pm_monitor_group_stats()
+        self.assertEqual(
+            stats["DB"],
+            {"IN-REPAIR": 1, "WAIT-REPAIR": 1, "PM": 1, "ENG": 1},
+        )
 
     def test_missing_table_returns_empty_group_dict(self):
         hourly_push.DB_PATH = _make_db_with_records([])
