@@ -202,6 +202,20 @@ def fetch_pm_monitor_html(wait_seconds=WAIT_SECONDS, oper_kind="D/A"):
         driver.quit()
 
 
+def _dedupe_doubled(s):
+    """
+    實測發現STATUS這類欄位的儲存格內容會整段重複兩次、中間沒有分隔符號
+    (例如"IN-REPAIRIN-REPAIR"、"SETUPSETUP")，研判是圖示+文字各自帶了
+    一份同樣的內容，get_text()把兩份文字接在一起了。這裡把「整段文字剛好
+    重複兩次」的情況收斂成一次；正常不會重複的值(機台代號、時間等)不受
+    影響，不會誤觸發。
+    """
+    n = len(s)
+    if n > 0 and n % 2 == 0 and s[: n // 2] == s[n // 2 :]:
+        return s[: n // 2]
+    return s
+
+
 def _cell_text(cell):
     """
     儲存格文字。這頁的表頭不是純文字，是ASP.NET GridView做成可排序按鈕：
@@ -211,12 +225,11 @@ def _cell_text(cell):
     按鈕式表頭)改讀裡面<input>的value屬性。
     """
     text = cell.get_text(strip=True)
-    if text:
-        return text
-    inp = cell.find("input")
-    if inp is not None:
-        return (inp.get("value") or "").strip()
-    return ""
+    if not text:
+        inp = cell.find("input")
+        if inp is not None:
+            text = (inp.get("value") or "").strip()
+    return _dedupe_doubled(text)
 
 
 def parse_pm_monitor_html(html):

@@ -10,6 +10,26 @@ import unittest
 import cpis_pm_monitor_scraper as pm
 
 
+class TestDedupeDoubled(unittest.TestCase):
+    """實測STATUS這類欄位的儲存格內容會整段重複兩次、中間沒分隔符號
+    (例如"IN-REPAIRIN-REPAIR")，鎖定收斂邏輯只對「剛好重複兩次」的字串
+    生效，不會誤動到正常不重複的值。"""
+
+    def test_collapses_exact_doubled_string(self):
+        self.assertEqual(pm._dedupe_doubled("IN-REPAIRIN-REPAIR"), "IN-REPAIR")
+        self.assertEqual(pm._dedupe_doubled("SETUPSETUP"), "SETUP")
+        self.assertEqual(pm._dedupe_doubled("PMPM"), "PM")
+
+    def test_leaves_normal_values_unchanged(self):
+        self.assertEqual(pm._dedupe_doubled("BA248"), "BA248")
+        self.assertEqual(pm._dedupe_doubled(""), "")
+        self.assertEqual(pm._dedupe_doubled("2026-08-09"), "2026-08-09")
+
+    def test_even_length_but_not_actually_doubled_unchanged(self):
+        # "ENTITY"是偶數長度(6)，但前半"ENT"跟後半"ITY"不一樣，不該被誤收斂
+        self.assertEqual(pm._dedupe_doubled("ENTITY"), "ENTITY")
+
+
 class TestParsePmMonitorHtml(unittest.TestCase):
     def test_parses_rows_matching_header(self):
         html = """
