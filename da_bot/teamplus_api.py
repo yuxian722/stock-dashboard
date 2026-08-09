@@ -14,7 +14,7 @@ team+這部分的穩定性應該會好非常多。
 
 用法：
     import teamplus_api
-    texts, new_cursor = teamplus_api.read_new_messages(cursor)
+    messages, new_cursor = teamplus_api.read_new_messages(cursor)  # messages: [{"text","batch_id"}, ...]
     ok, desc = teamplus_api.send_message("要送出的文字")          # 只送到機器人推播室
     results = teamplus_api.broadcast_message("要送出的文字")      # 送到機器人推播室+額外聊天室
 
@@ -82,7 +82,12 @@ def read_new_messages(cursor=None):
     隨機UUID當NewestBatchID(格式模仿同事teamplus_bot.py送訊息時自己產生的
     batchID)，實測這樣team+會正常回應IsSuccess=true、視為目前沒有更新的訊息。
 
-    回傳 (texts, new_cursor)，texts是純文字內容清單(按時間順序)；
+    回傳 (messages, new_cursor)，messages是[{"text":內容, "batch_id":該則訊息的
+    BatchID}, ...]清單(按時間順序，不是單純文字清單)——呼叫端要靠batch_id
+    判斷「這則是不是機器人自己剛送出的」，不能只比對文字內容(機器人自己的
+    回覆內容有機會剛好含有查詢關鍵字，例如"downrate"，這種情況只比文字
+    會導致機器人把自己的回覆誤判成新指令、觸發下一輪回覆，兩種回覆格式
+    來回觸發、自問自答，直到洗版保護的次數上限)。
     如果cookie過期或請求失敗，回傳 ([], cursor)(cursor不變)，並印出錯誤訊息。
     """
     cookie = load_cookie()
@@ -125,14 +130,17 @@ def read_new_messages(cursor=None):
         # 每次都用不一樣的"起點"去問，行為會變得不可預期。
         return [], effective_cursor
 
-    texts = [m.get("MsgContent", "") for m in msg_list if m.get("MsgContent")]
+    messages = [
+        {"text": m.get("MsgContent", ""), "batch_id": m.get("BatchID")}
+        for m in msg_list if m.get("MsgContent")
+    ]
     # 用這批訊息裡最大的BatchID當作下次的cursor，避免重複讀到同一批
     new_cursor = effective_cursor
     for m in msg_list:
         bid = m.get("BatchID")
         if bid:
             new_cursor = bid
-    return texts, new_cursor
+    return messages, new_cursor
 
 
 def _load_extra_chat_ids():

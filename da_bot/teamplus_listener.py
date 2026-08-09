@@ -18,8 +18,9 @@ team+「機器人推播」室 - 即時問答監聽腳本 (08/06改版：HTTP API
 
 範例: BA220 / BA220今天 / 查BA220上週 / BAA02稼動
 
-機器人會記住自己剛送出的回覆內容，讀到跟自己剛講過一樣的話會自動跳過，
-不會自問自答、無限循環。
+機器人會記住自己送出的每則訊息的BatchID，讀到自己剛送出的訊息會自動跳過，
+不會自問自答、無限循環(用BatchID而不是比對文字內容，因為回覆內容本身有機會
+剛好含有查詢關鍵字，只比文字會誤判成新指令、觸發下一輪回覆)。
 
 ════════════════════════════════════════
 08/06重大改版：改用team+ HTTP API(teamplus_api.py)，不再用Selenium操控Edge
@@ -41,14 +42,6 @@ import query_bot
 import teamplus_api
 
 POLL_INTERVAL_SECONDS = 10
-
-
-def normalize_for_dedup(s):
-    """
-    把換行、空白全部拿掉，做為判斷『這則是不是我剛講過的話』的依據，
-    避免把自己剛送出的回覆內容當成新指令，自問自答。
-    """
-    return re.sub(r"\s+", "", s)
 
 
 # ---------- 指令解析 ----------
@@ -283,18 +276,18 @@ def init_listener_state():
     讓服務還能啟動、之後靠[警告]訊息提示需要重新抓cookie。
     """
     ok, desc, bid = teamplus_api.send_message_get_batch_id(BOOT_MESSAGE)
-    bot_sent_norms = []
+    sent_batch_ids = []
     if ok:
         cursor = bid
-        bot_sent_norms.append(normalize_for_dedup(BOOT_MESSAGE))
+        sent_batch_ids.append(bid)
         print("[啟動] 已送出上線通知，之後只會回應這則之後才出現的新訊息")
     else:
         print(f"[警告] 上線通知送出失敗({desc})，改用備援方式啟動")
-        texts, cursor = teamplus_api.read_new_messages(None)
-        print(f"[啟動] 已同步至最新訊息(略過{len(texts)}則既有訊息)，之後只會回應新出現的訊息")
+        messages, cursor = teamplus_api.read_new_messages(None)
+        print(f"[啟動] 已同步至最新訊息(略過{len(messages)}則既有訊息)，之後只會回應新出現的訊息")
     return {
         "cursor": cursor,
-        "bot_sent_norms": bot_sent_norms,  # 記住機器人自己最近送出的回覆內容(正規化後)，避免自問自答
+        "sent_batch_ids": sent_batch_ids,  # 記住機器人自己送出的訊息的BatchID，避免自問自答
         "recent_reply_times": [],          # 防暴衝保護用的時間戳記錄
     }
 
@@ -306,19 +299,26 @@ def poll_once(state):
     合併服務也能在自己的迴圈裡呼叫這個函式，共用同一套邏輯。
     state是init_listener_state()回傳的dict，會被就地更新。
     """
-    new_texts, new_cursor = teamplus_api.read_new_messages(state["cursor"])
-    if not new_texts:
+    new_messages, new_cursor = teamplus_api.read_new_messages(state["cursor"])
+    if not new_messages:
         return
     state["cursor"] = new_cursor
 
-    bot_sent_norms = state["bot_sent_norms"]
+    sent_batch_ids = state["sent_batch_ids"]
     recent_reply_times = state["recent_reply_times"]
 
-    for text in new_texts:
-        norm = normalize_for_dedup(text)
-        if norm in bot_sent_norms:
-            # 這是機器人自己剛送出的回覆，讀回來了而已，不是新指令，消耗一次記錄後跳過
-            bot_sent_norms.remove(norm)
+    for msg in new_messages:
+        text = msg["text"]
+        bid = msg["batch_id"]
+
+        # 用BatchID(送訊息當下自己產生、team+確實記錄下來的識別碼)判斷「這是不是
+        # 自己剛送出的訊息」，不能只比對文字內容——機器人的回覆內容本身有機會
+        # 剛好含有查詢關鍵字(例如"downrate"、"EPOXY(DB)")，只比文字的話，
+        # 機器人會把自己的回覆誤判成新指令、再回一次，兩種回覆格式來回觸發、
+        # 自問自答，直到洗版保護的次數上限才停下來(同事的teamplus_bot.py
+        # 就是靠BatchID識別、不是比對文字，這裡照做)。
+        if bid and bid in sent_batch_ids:
+            sent_batch_ids.remove(bid)
             continue
 
         cmd = parse_query(text)
@@ -339,12 +339,12 @@ def poll_once(state):
         print(f"[收到指令] {text!r} -> {cmd}")
         reply = build_reply(cmd)
         print(f"[回覆] {reply}")
-        ok, desc = teamplus_api.send_message(reply)
+        ok, desc, reply_bid = teamplus_api.send_message_get_batch_id(reply)
         if ok:
             recent_reply_times.append(now)
-            bot_sent_norms.append(normalize_for_dedup(reply))
-            if len(bot_sent_norms) > 30:
-                bot_sent_norms.pop(0)
+            sent_batch_ids.append(reply_bid)
+            if len(sent_batch_ids) > 30:
+                sent_batch_ids.pop(0)
         else:
             print(f"[警告] 送出訊息失敗: {desc}")
 

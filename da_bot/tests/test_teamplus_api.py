@@ -51,16 +51,16 @@ class TestReadNewMessagesFieldNameFallback(unittest.TestCase):
         self._fake_urlopen_returning({
             "ChatMessageList": [{"MsgContent": "BAA08", "BatchID": "b1"}]
         })
-        texts, cursor = teamplus_api.read_new_messages(None)
-        self.assertEqual(texts, ["BAA08"])
+        messages, cursor = teamplus_api.read_new_messages(None)
+        self.assertEqual(messages, [{"text": "BAA08", "batch_id": "b1"}])
         self.assertEqual(cursor, "b1")
 
     def test_message_list_key_fallback(self):
         self._fake_urlopen_returning({
             "MessageList": [{"MsgContent": "BAA08", "BatchID": "b1"}]
         })
-        texts, cursor = teamplus_api.read_new_messages(None)
-        self.assertEqual(texts, ["BAA08"])
+        messages, cursor = teamplus_api.read_new_messages(None)
+        self.assertEqual(messages, [{"text": "BAA08", "batch_id": "b1"}])
         self.assertEqual(cursor, "b1")
 
     def test_chat_message_list_takes_priority_when_both_present(self):
@@ -68,13 +68,13 @@ class TestReadNewMessagesFieldNameFallback(unittest.TestCase):
             "ChatMessageList": [{"MsgContent": "來自ChatMessageList", "BatchID": "b1"}],
             "MessageList": [{"MsgContent": "來自MessageList", "BatchID": "b2"}],
         })
-        texts, _ = teamplus_api.read_new_messages(None)
-        self.assertEqual(texts, ["來自ChatMessageList"])
+        messages, _ = teamplus_api.read_new_messages(None)
+        self.assertEqual([m["text"] for m in messages], ["來自ChatMessageList"])
 
     def test_neither_key_present_returns_empty_without_error(self):
         self._fake_urlopen_returning({"SomethingElse": []})
-        texts, cursor = teamplus_api.read_new_messages("old-cursor")
-        self.assertEqual(texts, [])
+        messages, cursor = teamplus_api.read_new_messages("old-cursor")
+        self.assertEqual(messages, [])
         self.assertEqual(cursor, "old-cursor")
 
 
@@ -114,8 +114,8 @@ class TestReadNewMessagesCursorBootstrap(unittest.TestCase):
             return _FakeResponse({"IsSuccess": True, "MessageList": [], "Description": "查無資料"})
 
         teamplus_api.urllib.request.urlopen = fake_urlopen
-        texts, cursor = teamplus_api.read_new_messages(None)
-        self.assertEqual(texts, [])
+        messages, cursor = teamplus_api.read_new_messages(None)
+        self.assertEqual(messages, [])
         self.assertTrue(cursor)  # 不能是None、也不能是空字串
 
     def test_bootstrap_cursor_reused_on_next_call_with_no_new_messages(self):
