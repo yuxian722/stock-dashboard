@@ -191,13 +191,26 @@ class TestGetEpoxyDoneByJcode(unittest.TestCase):
             {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "job_code": "CEE123"},  # DB
             {"machine_id": "BA401", "e_tag": "S", "end_date": today, "job_code": "CD-2"},    # ESEC
             {"machine_id": "BA801", "e_tag": "S", "end_date": today, "job_code": "CED"},     # LOC, 不算EPOXY
-            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "XYZ"},     # ESEC, 其他
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "INK"},     # ESEC，但INK不是真正改機，不算
         ])
         result = hourly_push.get_epoxy_done_by_jcode()
         self.assertEqual(result.get("CED機台"), 1)
         self.assertEqual(result.get("CEE機台"), 1)
         self.assertEqual(result.get("CD機台"), 1)
-        self.assertEqual(result.get("其他"), 1)
+        self.assertNotIn("其他", result)
+
+    def test_non_changeover_jcode_not_counted(self):
+        # CPIS的e_tag='S'不是每一筆都是機型改機，補墨水(INK)/AI視覺校正(AING)/
+        # 換料(CWT)/操作員備註(OC)這類生產中的小動作也會被標成'S'，
+        # 2026/08/09使用者確認這些不算改機，一律不計入(也不放進"其他"桶)
+        today = datetime.date.today().isoformat()
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "INK"},
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "AING"},
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "job_code": "CWT"},
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "job_code": "OC"},
+        ])
+        self.assertEqual(hourly_push.get_epoxy_done_by_jcode(), {})
 
     def test_non_epoxy_group_excluded(self):
         today = datetime.date.today().isoformat()
@@ -253,6 +266,17 @@ class TestGetSetupGroupStats(unittest.TestCase):
         hourly_push.DB_PATH = _make_db_with_records([
             {"machine_id": "BA205", "e_tag": "S", "bgn_date": "2026-08-01", "bgn_time": "10:00",
              "end_date": "2026-08-01", "end_time": "12:00", "job_code": "CED"},
+        ])
+        stats = hourly_push.get_setup_group_stats()
+        self.assertEqual(stats["ESEC"]["done"], 0)
+
+    def test_non_changeover_jcode_not_counted_as_done(self):
+        # e_tag='S'裡INK(補墨水)/AING(AI視覺校正)這類生產中的小動作不算改機，
+        # 2026/08/09使用者確認只算CED/CEE/CD三類，其餘一律不計入done
+        today = datetime.date.today().isoformat()
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "INK"},
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "job_code": "AING"},
         ])
         stats = hourly_push.get_setup_group_stats()
         self.assertEqual(stats["ESEC"]["done"], 0)

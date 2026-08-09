@@ -44,8 +44,11 @@ def _group_for_machine(machine_id):
     return _ENTITY_GROUP_PREFIXES.get(p3)
 
 
-# EPOXY(=ESEC+DB)的「今日改機」要依job_code分CED/CEE/CD三類顯示，
-# 2026/08/09使用者提供
+# 「今日改機」認定為真正改機的job_code只有CED/CEE/CD三類(2026/08/09使用者
+# 提供+確認)，也用來當「這筆e_tag='S'紀錄算不算改機」的篩選標準——CPIS的
+# e_tag='S'不是每一筆都是機型改機，INK(補墨水)/AING(AI視覺校正)/CWT(換料)/
+# OC(操作員備註)這類生產中的小動作也會被標成'S'，對不到這三類前綴的就不算
+# 改機(不管是哪個機型群組)
 _EPOXY_JCODE_CATEGORIES = [("CED", "CED機台"), ("CEE", "CEE機台"), ("CD", "CD機台")]
 
 
@@ -60,11 +63,14 @@ def _epoxy_jcode_category(job_code):
 def get_epoxy_done_by_jcode():
     """
     EPOXY(ESEC+DB)今日已完成的改機次數，依job_code分CED機台/CEE機台/CD機台
-    三類(對不到這三類的算"其他")。用SELECT DISTINCT防重複——run_pipeline.py
-    每小時重抓「昨天~今天」這個有重疊的區間，cpis_scraper.py以前存檔時沒有
-    去重，同一筆真實紀錄可能被重複INSERT很多次(已經修好，但既有資料庫裡
-    可能還殘留舊的重複列，這裡用DISTINCT保險)。回傳{"CED機台":n, ...}，
-    沒有資料的類別不會出現在結果裡。
+    三類。CPIS的e_tag='S'不是每一筆都是真正的機型改機——生產過程中很多
+    小動作(補墨水INK、AI視覺校正AING、換料CWT、操作員備註OC...)也會被
+    標成'S'，2026/08/09實測診斷發現這類小動作占了e_tag='S'紀錄的大多數，
+    導致改機統計數字暴增到不合理(EPOXY改機274/315這種)。這裡只算job_code
+    對得到CED/CEE/CD這三類的紀錄，對不到的一律不算改機(不再放進"其他"
+    桶，2026/08/09使用者確認)。用SELECT DISTINCT防重複——同一筆真實紀錄
+    理論上不該重複，這裡用DISTINCT保險。回傳{"CED機台":n, ...}，沒有資料
+    的類別不會出現在結果裡。
     """
     today = datetime.date.today().isoformat()
     conn = get_conn()
@@ -82,7 +88,9 @@ def get_epoxy_done_by_jcode():
         g = _group_for_machine(r["machine_id"])
         if g not in ("ESEC", "DB"):
             continue
-        label = _epoxy_jcode_category(r["job_code"]) or "其他"
+        label = _epoxy_jcode_category(r["job_code"])
+        if label is None:
+            continue
         result[label] = result.get(label, 0) + 1
     return result
 
@@ -168,8 +176,10 @@ def get_pm_monitor_group_stats():
 def get_setup_group_stats():
     """
     今日改機統計，依機型群組(ESEC/DB/LOC/FC)分組。"改機"(今日已完成)算自
-    ee_maintenance_record(用SELECT DISTINCT防重複)；"改機中"/"待改"改成
-    算自PM Monitor的即時快照(SETUP/WAIT-SETUP狀態)，比EE Maintenance的
+    ee_maintenance_record，只算job_code屬於CED/CEE/CD三類真正改機的紀錄
+    (跟get_epoxy_done_by_jcode()同一套篩選標準，理由見該函式docstring—
+    e_tag='S'裡混了很多生產中的小動作，不能整批當改機算)；"改機中"/"待改"
+    改成算自PM Monitor的即時快照(SETUP/WAIT-SETUP狀態)，比EE Maintenance的
     wait_date/bgn_date推算法準確，是當下真正的狀態，不是歷史推論的。
     回傳{group: {"done": int, "in_progress": int, "waiting": int}}。
     """
@@ -187,7 +197,7 @@ def get_setup_group_stats():
     stats = {g: {"done": 0, "in_progress": 0, "waiting": 0} for g in ("ESEC", "DB", "LOC", "FC")}
     for r in done_rows:
         g = _group_for_machine(r["machine_id"])
-        if g:
+        if g and _epoxy_jcode_category(r["job_code"]) is not None:
             stats[g]["done"] += 1
 
     pm_stats = get_pm_monitor_group_stats()
