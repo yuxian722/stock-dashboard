@@ -823,7 +823,7 @@ def _changeover_rows_for_group(cur, group_name, now):
     """
     shift_date, next_date = hourly_push._shift_day_bounds(now)
     cur.execute("""
-        SELECT DISTINCT machine_id, bgn_date, bgn_time, job_code, engineer_id, dur
+        SELECT DISTINCT machine_id, bgn_date, bgn_time, end_time, job_code, engineer_id, dur
         FROM ee_maintenance_record
         WHERE e_tag = 'S' AND (
             (end_date = ? AND end_time >= ?)
@@ -849,6 +849,7 @@ def _changeover_rows_for_group(cur, group_name, now):
         rows.append({
             "machine_id": r["machine_id"], "job_code": r["job_code"],
             "engineer_id": r["engineer_id"], "dur": r["dur"], "category": category,
+            "end_time": r["end_time"],
         })
     return rows
 
@@ -895,6 +896,15 @@ def group_changeover_detail_reply(group_name: str, now: datetime.datetime = None
         return f"{display_name}改機 今日目前沒有完成的改機紀錄"
 
     lines = [f"【{display_name}改機】今日共{len(rows)}台"]
+
+    # 早班(07:30~19:30)/夜班(19:30~次日07:30)改機台數(2026/08/10使用者要求)，
+    # 跟hourly_push.get_epoxy_done_by_shift()同一套依end_time判斷班別的邏輯。
+    night_count = sum(1 for r in rows if hourly_push._is_night_shift(r["end_time"]))
+    day_count = len(rows) - night_count
+    shift_parts = [f"{label}{n}台" for label, n in (("早班", day_count), ("夜班", night_count)) if n]
+    if shift_parts:
+        lines.append(" ".join(shift_parts))
+
     cat_parts = _category_avg_parts(rows)
     if cat_parts:
         lines.append(" ".join(cat_parts))

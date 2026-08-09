@@ -482,6 +482,34 @@ class TestGroupChangeoverDetailReply(unittest.TestCase):
         self.assertIn("CN機台2台平均1.5hr", reply)
         self.assertIn("CD機台1台平均0.5hr", reply)
 
+    def test_shows_day_and_night_shift_breakdown(self):
+        # 早班07:30~19:30／夜班19:30~次日07:30，依end_time判斷
+        # (2026/08/10使用者要求，跟hourly_push推播的早班/夜班統計一致)
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "s10435", "dur": 1.0},   # 早班
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": today, "end_time": "18:00",
+             "job_code": "CED", "engineer_id": "s10435", "dur": 1.4},   # 早班
+            {"machine_id": "BAA03", "e_tag": "S", "end_date": today, "end_time": "22:00",
+             "job_code": "CEE", "engineer_id": "s10435", "dur": 1.0},   # 夜班
+        ])
+        reply = query_bot.group_changeover_detail_reply("DB", now)
+        self.assertIn("【DB改機】今日共3台", reply)
+        self.assertIn("早班2台 夜班1台", reply)
+
+    def test_shift_breakdown_omits_zero_shift(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "s10435", "dur": 1.0},
+        ])
+        reply = query_bot.group_changeover_detail_reply("DB", now)
+        self.assertIn("早班1台", reply)
+        self.assertNotIn("夜班", reply)
+
 
 class TestWorkhoursReply(unittest.TestCase):
     """「工時」查詢：今日各工號人員修機+改機總工時(2026/08/09使用者要求)。"""
