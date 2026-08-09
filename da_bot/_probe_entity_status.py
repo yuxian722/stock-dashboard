@@ -25,13 +25,12 @@ def _print_records(records, limit=5):
 
 
 def probe_ee(date_start, date_end, entity_pattern):
-    print("=== 登入APG(EE Maintenance)===")
-    opener = cpis_api.login()
-    print("登入成功")
-
     print(f"=== 查詢EE Maintenance Record {date_start} ~ {date_end}, Entity={entity_pattern} ===")
-    html = cpis_api.fetch_ee_maintenance_html(date_start, date_end, entity_pattern, opener=opener)
-    records = cpis_scraper.parse_result_table(html)
+    xls_chunks = cpis_api.fetch_ee_maintenance_xls(date_start, date_end, entity_pattern)
+    print(f"共下載 {len(xls_chunks)} 份報表")
+    records = []
+    for raw in xls_chunks:
+        records.extend(cpis_scraper.parse_ee_maintenance_xls(raw))
     _print_records(records)
 
 

@@ -5,11 +5,13 @@ Selenium 附身模式)
 
 原本這兩支腳本靠附身模式Edge(--remote-debugging-port=9222)操作已登入的分頁，
 長期卡在「除錯模式Edge開不起來」的環境問題(單一實例限制、殘留行程沒清乾淨等)。
-同事的 APG_Dashboard 專案已證實 CPIS 可以純用 urllib.request 直接發HTTP請求
-登入+查詢，完全不需要開瀏覽器，這裡把這套方法整合成模組，比照 teamplus_api.py
-的封裝方式：只負責「登入 + 把查詢結果原始HTML抓回來」，實際的表格解析/欄位對應/
-資料清洗邏輯仍留在 cpis_scraper.py / cpis_utilization_scraper.py 裡(用
-BeautifulSoup，跟原本一致，只是資料來源從 driver.page_source 換成這裡回傳的HTML)。
+這裡把純urllib.request直接發HTTP請求登入+查詢的方法整合成模組，比照
+teamplus_api.py的封裝方式：只負責「登入 + 把查詢結果抓回來」，實際的資料解析/
+欄位對應/清洗邏輯留在 cpis_scraper.py / cpis_utilization_scraper.py 裡。
+
+EE Maintenance走的是report產生端點(maintenance_record_r.aspx)，回傳EJP_*.xls
+報表檔案(舊版Excel/BIFF格式)，由cpis_scraper.py用xlrd解析；Utilization走的是
+資料頁直接GET，回傳HTML，由cpis_utilization_scraper.py用BeautifulSoup解析。
 
 原理：CPIS是傳統ASP.NET WebForms系統，登入與查詢都要帶上隱藏欄位
 __VIEWSTATE / __VIEWSTATEGENERATOR / __EVENTVALIDATION(先GET頁面把值抓出來，
@@ -18,13 +20,14 @@ __VIEWSTATE / __VIEWSTATEGENERATOR / __EVENTVALIDATION(先GET頁面把值抓出�
 
 用法：
     import cpis_api
-    html = cpis_api.fetch_ee_maintenance_html("20260716", "20260717", "B*")
+    xls_chunks = cpis_api.fetch_ee_maintenance_xls("20260716", "20260717", "BA*")
     html_list = cpis_api.fetch_utilization_html("20260809", "20260809")
 
 前置：
     da_bot資料夾下要有 config.txt(複製 config.txt.example 改名，填入
     apg_user/apg_password/util_user/util_password)。
 """
+import datetime
 import http.cookiejar
 import re
 import urllib.error
@@ -33,33 +36,10 @@ import urllib.request
 
 import config
 
-DOMAINS = {
-    "tncpisapg.tn.chipmos.com.tw": {
-        "login": "http://tncpisapg.tn.chipmos.com.tw/CPISWeb/Logon.aspx?ReturnUrl=%2fCPISWeb%2fDefault.aspx",
-        "default": "http://tncpisapg.tn.chipmos.com.tw/CPISWeb/Default.aspx",
-    },
-    "tncpis.tn.chipmos.com.tw": {  # Utilization 用，走 APG 子系統獨立登入
-        "login": (
-            "http://tncpis.tn.chipmos.com.tw/APG/Logon.aspx?ReturnUrl="
-            "%2fAPG%2fAPGPROD%2fEQUIPMENT%2fwFrmUtilizationAnalysis%2futil_overa2.aspx"
-        ),
-        "default": (
-            "http://tncpis.tn.chipmos.com.tw/APG/APGPROD/EQUIPMENT/"
-            "wFrmUtilizationAnalysis/Default.aspx?isCopy=True&FuncId=58"
-        ),
-    },
-}
-
 AUTH_FAIL = ("Logon.aspx", "TimeOut.aspx", "系統停滯過久", "請重新登入")
 
-EE_FRAME_URL = (
-    "http://tncpisapg.tn.chipmos.com.tw/APG/APGREPORT/EE/"
-    "wFrmEEMaintenanceRecord/maintenance_record_h.aspx"
-)
-EE_REFERER_URL = (
-    "http://tncpisapg.tn.chipmos.com.tw/APG/APGREPORT/EE/"
-    "wFrmEEMaintenanceRecord/Default.aspx"
-)
+EE_R_BASE = "http://tncpisapg.tn.chipmos.com.tw"
+EE_R_PATH = "/APG/APGREPORT/EE/wFrmEEMaintenanceRecord/maintenance_record_r.aspx"
 
 UTIL_BASE = "http://tncpis.tn.chipmos.com.tw"
 UTIL_DATA_PATH = "/APG/APGPROD/EQUIPMENT/wFrmUtilizationAnalysis/util_overa2.aspx"
@@ -144,141 +124,128 @@ def _post_form(opener, url, fields, referer=None, timeout=30):
 
 
 # ---------------------------------------------------------------------------
-# 登入
+# EE Maintenance Record
+#
+# 這裡改用「report產生端點」maintenance_record_r.aspx：查詢條件直接是query
+# string，登入時把ReturnUrl指到這個帶好條件的網址，登入成功會直接被redirect到
+# 這裡，伺服器端算好報表後回傳一頁「Report Generate Successful」+ EJP_*.xls
+# 報表連結，下載該檔案(舊版Excel/BIFF格式，用xlrd解析)就是完整資料。
+# 不需要像maintenance_record_h.aspx那個查詢表單一樣填Operation複選框，
+# 也不會被表單前端驗證(entity/JobCode長度規則)卡住——這個端點的query string
+# 沒有那些檢查。
+# (此流程比照使用者自己另一個已實測驗證過的dashboard(server.py)的作法照搬)
 # ---------------------------------------------------------------------------
 
-def do_login(opener, host, user, pwd):
-    info = DOMAINS[host]
-    html, _ = _read(opener, info["login"])
-    payload = {
-        "__VIEWSTATE": extract_input(html, "__VIEWSTATE"),
-        "__VIEWSTATEGENERATOR": extract_input(html, "__VIEWSTATEGENERATOR"),
-        "__EVENTVALIDATION": extract_input(html, "__EVENTVALIDATION"),
-        "UserName": user,
-        "Password": pwd,
-        "Login.x": "61",
-        "Login.y": "5",
-    }
-    _, final_url = _post_form(opener, info["login"], payload, referer=info["login"])
-    return "Logon.aspx" not in final_url
-
-
-def login():
-    """建立opener並登入APG主站(EE Maintenance用)，回傳已登入的opener。"""
-    cfg = config.load()
-    config.require(cfg, "apg_user", "apg_password")
-    opener = build_opener()
-    if not do_login(opener, "tncpisapg.tn.chipmos.com.tw", cfg["apg_user"], cfg["apg_password"]):
-        raise CpisAuthError("APG登入失敗，請確認config.txt的apg_user/apg_password")
-    return opener
-
-
-# ---------------------------------------------------------------------------
-# EE Maintenance Record：查詢表單頁 -> POST查詢條件 -> 回傳結果HTML
-# ---------------------------------------------------------------------------
-
-# Operation是多選勾選框：每個勾選各送一欄 DropDownCheckBoxes1$<index> = 站別代碼
-# (不是"on"！送出去的value就是站別代碼本身，這點跟一般checkbox不一樣)。
-# 這份內建對照是保險，每次會先試著從表單HTML動態解析(_ee_oper_index_from_form)，
-# 解析不到才用這份，避免站別代碼改版後對照失準。
-_EE_OPER_INDEX = {
-    "DA": 7, "DA10": 8, "DA3": 9, "DA4": 10, "DA5": 11, "DA6": 12,
-    "DA7": 13, "DA8": 14, "DA9": 15, "PRT": 48, "SA": 51, "SLM": 56,
-}
-
-
-def _ee_oper_index_from_form(html):
-    """從EE表單HTML解析Operation各項：站別代碼 -> 欄位index。解析不到回{}。"""
-    m = {}
-    html = html or ""
-    for mo in re.finditer(r'name="DropDownCheckBoxes1\$(\d+)"[^>]*?value="([^"]+)"', html):
-        m[mo.group(2).strip()] = int(mo.group(1))
-    for mo in re.finditer(r'value="([^"]+)"[^>]*?name="DropDownCheckBoxes1\$(\d+)"', html):
-        m.setdefault(mo.group(1).strip(), int(mo.group(2)))
-    return m
-
-
-def _ee_oper_fields(html_form, ee_entity):
-    """
-    依ee_entity(逗號分隔多站，或"ALL"/"*"代表全選)組出要送的DropDownCheckBoxes欄位dict。
-    「全選」才不會讓查詢條件互相打架變成No Data；如果只想篩特定站別，把ee_entity
-    改成該站代碼(例如"DA")即可。
-    """
-    idx_map = dict(_EE_OPER_INDEX)
-    idx_map.update(_ee_oper_index_from_form(html_form))  # 表單解析優先(較新、能涵蓋新站)
-    want = [o.strip() for o in (ee_entity or "").split(",") if o.strip()]
-    if len(want) == 1 and want[0].upper() in ("ALL", "*"):
-        want = list(idx_map.keys())
-    fields = {}
-    for code in want:
-        idx = idx_map.get(code)
-        if idx is not None:
-            fields[f"DropDownCheckBoxes1${idx}"] = code
-    return fields
+_EJP_URL_RE = re.compile(r'https?://\S+/APG/assyfab/cpis/report/EJP_\d+\.xls')
+_EJP_ID_RE = re.compile(r'EJP_(\d+)\.xls')
 
 
 def _check_entity_pattern(entity_pattern):
     """
-    CPIS的txtentity欄位有前端驗證：不可為空，且扣掉萬用字元(*/?)後至少要有2個
-    字元，否則會直接跳出alert擋掉整次查詢(伺服器只回一小段<script>alert(...)</script>，
-    不是正常結果頁，我們自己送出前先擋掉比較清楚，不要等CPIS回傳警告才發現)。
+    entity欄位建議：不可為空，且扣掉萬用字元(*/?)後至少要有2個字元(例如"BA*"
+    而不是"B*")，這是原本maintenance_record_h.aspx表單驗證觀察到的規則，這裡
+    先擋一手避免明顯會查不到東西的輸入。
     """
     literal_len = len((entity_pattern or "").replace("*", "").replace("?", ""))
     if literal_len < 2:
         raise ValueError(
-            f"entity_pattern={entity_pattern!r} 不符合CPIS規則：不可為空，"
-            "且扣掉萬用字元(*/?)後至少要有2個字元(例如用'BA*'而不是'B*')"
+            f"entity_pattern={entity_pattern!r} 不建議使用：扣掉萬用字元(*/?)後"
+            "至少要有2個字元(例如用'BA*'而不是'B*')"
         )
 
 
-def fetch_ee_maintenance_html(date_start, date_end, entity_pattern="BA*", ee_entity="ALL", opener=None):
-    """
-    登入APG站並查詢EE Maintenance Record，回傳查詢結果頁的原始HTML(字串)，
-    交給cpis_scraper.py用BeautifulSoup解析(跟原本Selenium版的parse_result_table
-    邏輯完全一致，只是HTML的來源從driver.page_source換成這裡回傳的字串)。
+def _ee_query_string(date_start, date_end, entity, jobcode=""):
+    return (
+        "HIDCOUNT=1&pkg_type=T"
+        f"&start_date={date_start}&end_date={date_end}"
+        f"&entity={entity}&shift=None&floor=A2&operation=None"
+        f"&etag=None&jobcode={jobcode}&enginerr=&value=WD&oper_type=0"
+        "&dept=None&description=&bd_id=None&assylot=&product="
+    )
 
-    date_start/date_end格式跟原本Selenium版一致，YYYYMMDD。
-    entity_pattern是機台代號萬用字元查詢(例如"BA*")，對應表單裡的txtentity欄位；
-    CPIS規定不可為空，且扣掉萬用字元後至少要有2個字元(實測"B*"會被擋，"BA*"可以)。
-    ee_entity是Operation多選要勾哪些站別，預設"ALL"(全選，等同原本Selenium版點
-    「Select all」的效果)，機台範圍改用entity_pattern篩選。
-    """
-    _check_entity_pattern(entity_pattern)
-    opener = opener or login()
 
-    req = urllib.request.Request(EE_FRAME_URL)
-    req.add_header("Referer", EE_REFERER_URL)
-    html_form, form_url = _read(opener, req)
-    if is_auth_fail(html_form, form_url):
-        raise CpisAuthError("EE驗證失敗(取表單)")
+def _find_ejp_url(html):
+    """從HTML找EJP_*.xls報表的完整下載URL，抓不到回傳None。"""
+    m = _EJP_URL_RE.search(html)
+    if m:
+        return m.group(0)
+    m = _EJP_ID_RE.search(html)
+    if m:
+        return f"{EE_R_BASE}/APG/assyfab/cpis/report/EJP_{m.group(1)}.xls"
+    return None
 
-    fields = {
-        "__VIEWSTATE": extract_input(html_form, "__VIEWSTATE"),
-        "__VIEWSTATEGENERATOR": extract_input(html_form, "__VIEWSTATEGENERATOR"),
-        "__EVENTVALIDATION": extract_input(html_form, "__EVENTVALIDATION"),
-        "txtStart_date": date_start,
-        "txtEnd_date": date_end,
-        "ddl_shift": "None",
-        "ddl_floor": "A2",
-        "ddl_etag": "None(P,R,S,QC)",
-        "dllDept": "None",
-        "ddl_bd_id": "None",
-        "oper_type": "WD",
-        "txt_oper_type": "0",
-        "txtentity": entity_pattern,
-        "txtJobCode": "",
-        "txtEngineer": "",
-        "txtAssyLot": "",
-        "txtProduct": "",
-        "btnFetch": "Fetch",
+
+def _fetch_ee_maintenance_chunk(date_start, date_end, entity, jobcode=""):
+    """單一區間(<=30天)查詢，回傳EJP報表(.xls)的原始bytes。"""
+    cfg = config.load()
+    config.require(cfg, "apg_user", "apg_password")
+
+    qs = _ee_query_string(date_start, date_end, entity, jobcode)
+    ee_path_qs = f"{EE_R_PATH}?{qs}"
+    login_url = f"{EE_R_BASE}/APG/Logon.aspx?ReturnUrl=" + urllib.parse.quote(ee_path_qs, safe="")
+
+    opener = build_opener()
+    login_html, _ = _read(opener, login_url, timeout=20)
+    payload = {
+        "__VIEWSTATE": extract_input(login_html, "__VIEWSTATE"),
+        "__VIEWSTATEGENERATOR": extract_input(login_html, "__VIEWSTATEGENERATOR"),
+        "__EVENTVALIDATION": extract_input(login_html, "__EVENTVALIDATION"),
+        "UserName": cfg["apg_user"],
+        "Password": cfg["apg_password"],
+        "Login.x": "50",
+        "Login.y": "15",
     }
-    fields.update(_ee_oper_fields(html_form, ee_entity))
+    html, final_url = _post_form(opener, login_url, payload, referer=login_url, timeout=120)
+    if "logon" in final_url.lower():
+        raise CpisAuthError(f"EE Maintenance登入失敗，仍停留在登入頁：{final_url}")
 
-    html_result, final_url = _post_form(opener, EE_FRAME_URL, fields, referer=EE_FRAME_URL, timeout=60)
-    if is_auth_fail(html_result, final_url):
-        raise CpisAuthError("EE POST驗證失敗")
+    xls_url = _find_ejp_url(html)
+    if not xls_url:
+        preview = re.sub(r"\s+", " ", html)[:200]
+        raise CpisAuthError(f"EE Maintenance查無EJP報表連結(可能這段區間沒有資料)：{preview!r}")
 
-    return html_result
+    with opener.open(xls_url, timeout=90) as r:
+        raw = r.read()
+    if len(raw) < 1000:
+        raise CpisAuthError(f"EE Maintenance報表下載失敗或內容過短({len(raw)} bytes)")
+    return raw
+
+
+def fetch_ee_maintenance_xls(date_start, date_end, entity="BA*", jobcode=""):
+    """
+    查詢EE Maintenance Record，回傳EJP報表(.xls, 舊版BIFF格式)原始bytes的清單
+    (區間>30天時會自動拆成多段查詢，所以是清單而非單一結果)。
+
+    date_start/date_end格式YYYYMMDD。依CPIS查詢頁規則(來自實測驗證過的既有
+    dashboard)：
+      - 區間<=7天：entity可用萬用字元，jobcode可留空
+      - 區間8天~1個月：entity與jobcode皆為必填(可用萬用字元，預設用*涵蓋所有JobCode)
+      - 區間>1個月：自動切成多段(每段<=30天)分別查詢
+    """
+    _check_entity_pattern(entity)
+
+    d1 = datetime.datetime.strptime(date_start, "%Y%m%d")
+    d2 = datetime.datetime.strptime(date_end, "%Y%m%d")
+    total_days = (d2 - d1).days + 1
+
+    if total_days > 30:
+        chunks = []
+        cur = d1
+        while cur <= d2:
+            chunk_end = min(cur + datetime.timedelta(days=29), d2)
+            chunks.extend(
+                fetch_ee_maintenance_xls(
+                    cur.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d"), entity, jobcode
+                )
+            )
+            cur = chunk_end + datetime.timedelta(days=1)
+        return chunks
+
+    jc = jobcode
+    if total_days > 7 and not jc:
+        jc = "*"
+
+    return [_fetch_ee_maintenance_chunk(date_start, date_end, entity, jc)]
 
 
 # ---------------------------------------------------------------------------

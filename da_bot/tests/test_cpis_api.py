@@ -89,45 +89,38 @@ class TestIframeSrcs(unittest.TestCase):
         self.assertEqual(cpis_api._iframe_srcs("<div>no frames</div>"), [])
 
 
-class TestEeOperIndexFromForm(unittest.TestCase):
-    def test_name_then_value_order(self):
-        html = '<input type="checkbox" name="DropDownCheckBoxes1$7" value="DA" />'
-        self.assertEqual(cpis_api._ee_oper_index_from_form(html), {"DA": 7})
+class TestEeQueryString(unittest.TestCase):
+    def test_contains_dates_and_entity(self):
+        qs = cpis_api._ee_query_string("20260801", "20260809", "BA*", "*")
+        self.assertIn("start_date=20260801", qs)
+        self.assertIn("end_date=20260809", qs)
+        self.assertIn("entity=BA*", qs)
+        self.assertIn("jobcode=*", qs)
 
-    def test_value_then_name_order(self):
-        html = '<input type="checkbox" value="DA" name="DropDownCheckBoxes1$7" />'
-        self.assertEqual(cpis_api._ee_oper_index_from_form(html), {"DA": 7})
-
-    def test_no_matches_returns_empty(self):
-        self.assertEqual(cpis_api._ee_oper_index_from_form("<div>nothing here</div>"), {})
+    def test_jobcode_defaults_to_empty(self):
+        qs = cpis_api._ee_query_string("20260801", "20260809", "BA*")
+        self.assertIn("jobcode=&", qs)
 
 
-class TestEeOperFields(unittest.TestCase):
-    def test_single_code_uses_index(self):
-        fields = cpis_api._ee_oper_fields("", "DA")
-        self.assertEqual(fields, {"DropDownCheckBoxes1$7": "DA"})
+class TestFindEjpUrl(unittest.TestCase):
+    def test_finds_full_url(self):
+        html = '<a href="http://tncpisapg.tn.chipmos.com.tw/APG/assyfab/cpis/report/EJP_20260803192310.xls">Here</a>'
+        self.assertEqual(
+            cpis_api._find_ejp_url(html),
+            "http://tncpisapg.tn.chipmos.com.tw/APG/assyfab/cpis/report/EJP_20260803192310.xls",
+        )
 
-    def test_multiple_comma_separated_codes(self):
-        fields = cpis_api._ee_oper_fields("", "DA,PRT")
-        self.assertEqual(fields, {"DropDownCheckBoxes1$7": "DA", "DropDownCheckBoxes1$48": "PRT"})
+    def test_finds_backslash_relative_href_via_id_fallback(self):
+        # CPIS實際回傳的是Windows風格反斜線相對路徑，不是正規URL，
+        # 前兩個regex比對不到，要靠只抓EJP編號的第三層備援重組出正確網址
+        html = r'<a href="\APG\assyfab\cpis\report\EJP_20260803192310.xls">Here</a>'
+        self.assertEqual(
+            cpis_api._find_ejp_url(html),
+            "http://tncpisapg.tn.chipmos.com.tw/APG/assyfab/cpis/report/EJP_20260803192310.xls",
+        )
 
-    def test_all_selects_every_known_code(self):
-        fields = cpis_api._ee_oper_fields("", "ALL")
-        self.assertEqual(len(fields), len(cpis_api._EE_OPER_INDEX))
-        self.assertEqual(fields["DropDownCheckBoxes1$7"], "DA")
-
-    def test_wildcard_star_also_selects_all(self):
-        fields = cpis_api._ee_oper_fields("", "*")
-        self.assertEqual(len(fields), len(cpis_api._EE_OPER_INDEX))
-
-    def test_unknown_code_skipped_silently(self):
-        fields = cpis_api._ee_oper_fields("", "NOT_A_REAL_CODE")
-        self.assertEqual(fields, {})
-
-    def test_form_html_overrides_fallback_index(self):
-        html = '<input type="checkbox" name="DropDownCheckBoxes1$99" value="DA" />'
-        fields = cpis_api._ee_oper_fields(html, "DA")
-        self.assertEqual(fields, {"DropDownCheckBoxes1$99": "DA"})
+    def test_no_match_returns_none(self):
+        self.assertIsNone(cpis_api._find_ejp_url("<div>no report link here</div>"))
 
 
 if __name__ == "__main__":
