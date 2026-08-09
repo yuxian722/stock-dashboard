@@ -47,7 +47,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DRIVER_PATH = os.path.join(SCRIPT_DIR, "msedgedriver.exe")
 
 # JS把Syncfusion Grid畫出來要等多久，太短可能表格還沒渲染完、抓到空表格
-WAIT_SECONDS = 8
+WAIT_SECONDS = 15
+
+SCREENSHOT_PATH = os.path.join(SCRIPT_DIR, "pm_monitor_debug.png")
 
 
 class PmMonitorError(RuntimeError):
@@ -69,12 +71,15 @@ def _make_driver():
     return webdriver.Edge(service=Service(executable_path=DRIVER_PATH), options=opts)
 
 
-def _find_grid_html(driver, max_depth=5):
+def _find_grid_html(driver, max_depth=5, log=None):
     """
     遞迴切換進每一層frame，找到含ENTITY+STATUS表頭的那一層，回傳其HTML；
     找不到就回傳None(呼叫端自己決定要不要退回用最外層的page_source)。
+    log給的話會記錄每一層抓到的HTML長度，抓不到表格時方便印出來對照。
     """
     html = driver.page_source
+    if log is not None:
+        log.append(len(html))
     if "ENTITY" in html.upper() and "STATUS" in html.upper():
         return html
     if max_depth <= 0:
@@ -87,7 +92,7 @@ def _find_grid_html(driver, max_depth=5):
             driver.switch_to.frame(frames[i])
         except Exception:
             continue
-        result = _find_grid_html(driver, max_depth - 1)
+        result = _find_grid_html(driver, max_depth - 1, log)
         driver.switch_to.parent_frame()
         if result:
             return result
@@ -95,16 +100,29 @@ def _find_grid_html(driver, max_depth=5):
 
 
 def fetch_pm_monitor_html(wait_seconds=WAIT_SECONDS):
-    """開無頭瀏覽器，等JS畫出機況表格，回傳渲染後含目標表格的那一層HTML。"""
+    """開無頭瀏覽器，等JS畫出機況表格，回傳渲染後含目標表格的那一層HTML。
+
+    找不到表格時，會先存一張目前畫面的截圖(SCREENSHOT_PATH)再丟例外——
+    比起純文字的錯誤訊息，截圖能直接看出JS到底畫出了什麼(卡在載入中、
+    畫面是空的、還是根本跳到別的頁面)，不用再靠猜的。
+    """
     driver = _make_driver()
     try:
         driver.get(PM_MONITOR_URL)
         time.sleep(wait_seconds)
-        html = _find_grid_html(driver)
+        log = []
+        html = _find_grid_html(driver, log=log)
         if html is None:
+            driver.switch_to.default_content()
+            try:
+                driver.save_screenshot(SCREENSHOT_PATH)
+                shot_note = f"已存截圖到 {SCREENSHOT_PATH}，把這張圖傳給Claude看"
+            except Exception as e:
+                shot_note = f"存截圖也失敗了: {type(e).__name__}: {e}"
             raise PmMonitorError(
                 "找不到含ENTITY+STATUS表頭的表格，可能JS還沒渲染完"
-                f"(可以拉長wait_seconds，目前是{wait_seconds}秒)，或頁面結構變了"
+                f"(可以拉長wait_seconds，目前是{wait_seconds}秒)，或頁面結構變了。\n"
+                f"掃過的每一層HTML長度: {log}\n{shot_note}"
             )
         return html
     finally:
