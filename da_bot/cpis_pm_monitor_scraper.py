@@ -202,6 +202,23 @@ def fetch_pm_monitor_html(wait_seconds=WAIT_SECONDS, oper_kind="D/A"):
         driver.quit()
 
 
+def _cell_text(cell):
+    """
+    儲存格文字。這頁的表頭不是純文字，是ASP.NET GridView做成可排序按鈕：
+    <th><input type="submit" value="ENTITY" ...></th>——"ENTITY"這幾個字
+    放在<input>的value屬性裡，<input>本身沒有文字節點，get_text()永遠
+    抓到空字串。這裡改成：先試get_text()，抓不到內容的話(常見於這種
+    按鈕式表頭)改讀裡面<input>的value屬性。
+    """
+    text = cell.get_text(strip=True)
+    if text:
+        return text
+    inp = cell.find("input")
+    if inp is not None:
+        return (inp.get("value") or "").strip()
+    return ""
+
+
 def parse_pm_monitor_html(html):
     """
     解析渲染後的HTML，抓OPER/ENTITY/MODEL/STATUS/LOT NO/Bond ID/WIP/
@@ -209,18 +226,14 @@ def parse_pm_monitor_html(html):
 
     Syncfusion Grid這類元件很常見的做法是把「表頭」跟「資料內容」拆成兩個
     不同的<table>(方便凍結表頭、內容區單獨捲動)，不是同一個<table>裡表頭
-    加資料列這種單純結構。原本邏輯要求表頭跟資料列在同一個<table>裡，
-    抓到表頭表格(通常沒有資料列，或資料列數=0)就直接回傳，導致實際上真的
-    有資料的表格根本沒被掃到，永遠回傳空清單。
-
-    改成：先找出表頭在哪一列(欄位名稱清單)，再不限定同一個<table>，直接
-    在整份HTML裡找「欄位數跟表頭一樣」的所有<tr>當資料列，跳過表頭本身
-    (表頭列可能因為凍結表頭機制重複出現)。
+    加資料列這種單純結構。這裡不限定同一個<table>，直接在整份HTML裡找
+    「欄位數跟表頭一樣」的所有<tr>當資料列，跳過表頭本身(表頭列可能因為
+    凍結表頭機制重複出現)。
     """
     soup = BeautifulSoup(html, "html.parser")
     header = None
     for tr in soup.find_all("tr"):
-        candidate = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+        candidate = [_cell_text(c) for c in tr.find_all(["td", "th"])]
         candidate_upper = [h.upper() for h in candidate]
         if "ENTITY" in candidate_upper and "STATUS" in candidate_upper:
             header = candidate
@@ -231,7 +244,7 @@ def parse_pm_monitor_html(html):
 
     records = []
     for tr in soup.find_all("tr"):
-        cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+        cells = [_cell_text(c) for c in tr.find_all(["td", "th"])]
         if len(cells) != len(header) or cells == header or not any(cells):
             continue
         records.append(dict(zip(header, cells)))

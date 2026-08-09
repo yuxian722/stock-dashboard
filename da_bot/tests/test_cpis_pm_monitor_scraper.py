@@ -69,6 +69,27 @@ class TestParsePmMonitorHtml(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["ENTITY"], "BA721")
 
+    def test_header_rendered_as_sortable_submit_buttons(self):
+        # 實機抓到的真實結構：這頁的表頭欄位是ASP.NET GridView做成的可排序
+        # 按鈕，欄位名稱放在<input type="submit" value="ENTITY">的value屬性
+        # 裡，不是<th>的文字內容——get_text()對<input>永遠抓到空字串，
+        # 這是造成"共擷取到0筆"的真正原因(表頭列的candidate全是空字串，
+        # 永遠比對不到ENTITY/STATUS，header判斷成None)。
+        html = """
+        <table>
+          <tr>
+            <th><input type="submit" value="ENTITY" name="ctl00$gvData$btnEntity"></th>
+            <th><input type="submit" value="STATUS" name="ctl00$gvData$btnStatus"></th>
+          </tr>
+          <tr><td>BA721</td><td>IN-REPAIR</td></tr>
+          <tr><td>BA231</td><td>SETUP</td></tr>
+        </table>
+        """
+        records = pm.parse_pm_monitor_html(html)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0], {"ENTITY": "BA721", "STATUS": "IN-REPAIR"})
+        self.assertEqual(records[1], {"ENTITY": "BA231", "STATUS": "SETUP"})
+
     def test_finds_data_rows_in_a_separate_table_from_the_header(self):
         # 實測抓到的真實情況：Syncfusion Grid把表頭跟資料內容拆成兩個不同的
         # <table>(方便凍結表頭)，表頭那個<table>裡完全沒有資料列。
