@@ -15,6 +15,7 @@ da_bot/*.db-shm
 # 執行期產生的狀態/紀錄檔
 da_bot/listener_state.txt
 da_bot/push_log.txt
+da_bot/last_pipeline_hour.txt
 
 # Selenium附身模式殘留物（CPIS/health_dashboard已不需要，其餘手動除錯工具本機自備即可）
 da_bot/msedgedriver.exe

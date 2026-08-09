@@ -32,13 +32,40 @@ DA 監控機器人 - 合併常駐服務 (CPIS改版：整點任務也不再需�
 使用者在team+打的任何訊息都要等整點任務跑完才會被讀到、回覆(甚至看起來像
 機器人完全沒反應)。改成把run_pipeline.run_once()丟到背景執行緒(thread)跑，
 主迴圈永遠每10秒檢查一次team+訊息，不會被整點任務卡住。
+
+原本「這個小時推播過了沒」只記在記憶體變數(last_pipeline_hour)裡，
+每次重新啟動服務都會歸零成None，導致同一小時內只要重開程式，就會立刻
+重新觸發一次整點任務(重抓CPIS資料+重推播一次)，跟有沒有真的到整點無關。
+偵錯期間反覆重開測試的話，team+群組裡就會看到一堆時間相近、數字微調的
+重複推播訊息(看起來像陷入迴圈，其實是「重啟次數=重複推播次數」)。
+改成把「這個小時推播過了沒」存到硬碟上的小檔案(LAST_PIPELINE_HOUR_PATH)，
+重啟服務時先讀這個檔案，如果這小時已經推播過了就不會再立刻重推，
+會乖乖等到下一個真正的整點。
 """
+import os
 import threading
 import time
 import datetime
 
 import teamplus_listener as listener
 import run_pipeline
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LAST_PIPELINE_HOUR_PATH = os.path.join(SCRIPT_DIR, "last_pipeline_hour.txt")
+
+
+def _load_last_pipeline_hour():
+    """讀取上次(不管服務有沒有重開過)已經觸發過整點任務的小時(YYYYMMDDHH)，沒有紀錄回傳None。"""
+    try:
+        with open(LAST_PIPELINE_HOUR_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def _save_last_pipeline_hour(hour_key):
+    with open(LAST_PIPELINE_HOUR_PATH, "w", encoding="utf-8") as f:
+        f.write(hour_key)
 
 
 def _run_pipeline_in_background(hour_key):
@@ -54,7 +81,8 @@ def main():
     state = listener.init_listener_state()
 
     # 記錄上次「觸發」整點任務是哪個小時(格式YYYYMMDDHH)，避免同一小時內重複觸發
-    last_pipeline_hour = None
+    # (改讀硬碟上的紀錄檔，而不是每次重開都歸零成None，避免重開服務=重推播)
+    last_pipeline_hour = _load_last_pipeline_hour()
     pipeline_thread = None
 
     print(f"[服務啟動] 每 {listener.POLL_INTERVAL_SECONDS} 秒檢查即時訊息、每整點自動更新+推播(背景執行緒)，Ctrl+C 結束")
@@ -68,6 +96,7 @@ def main():
         # ---------- 整點任務(丟到背景執行緒，不擋住下面的即時問答) ----------
         if last_pipeline_hour != current_hour_key and (pipeline_thread is None or not pipeline_thread.is_alive()):
             last_pipeline_hour = current_hour_key
+            _save_last_pipeline_hour(current_hour_key)
             pipeline_thread = threading.Thread(
                 target=_run_pipeline_in_background, args=(current_hour_key,), daemon=True
             )
