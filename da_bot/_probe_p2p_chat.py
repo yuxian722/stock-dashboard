@@ -14,13 +14,22 @@ v2改用完全比照teamplus_listener.py實際運作方式的真實cursor(送一
 這代表問題不是cursor bootstrap方式，而是更底層的東西。
 
 v2的read_new_messages()只印出「解析後」的結果(messages/new_cursor)，
-沒印出team+實際回傳的原始JSON——這一版(v3)補上這塊：直接發送跟
+沒印出team+實際回傳的原始JSON——v3補上這塊：直接發送跟
 read_new_messages()完全一樣的原始HTTP請求，把team+真正回傳的內容整個
-印出來。懷疑的方向：getOneOnOneChatInfo的回應整個包在一層"Data"欄位
-底下(不是像群組聊天室的getNewestMessageList那樣訊息清單直接在最外層)，
-如果P2P的getNewestMessageList也是這樣包法，我們現有的解析邏輯(只看
-最外層的"MessageList"/"ChatMessageList")就會一直找不到、永遠當成
-「沒有新訊息」，即使team+其實真的有把訊息送回來。
+印出來。結果：回應格式是單純的平面結構(LastServerDate/MessageList/
+IsSuccess/Description，沒有像getOneOnOneChatInfo那樣包一層"Data")，
+排除了巢狀結構的懷疑；但用真實cursor、使用者也確實打了字，
+MessageList還是空的、Description是"查無資料"。
+
+這一版(v4)換個懷疑方向：ChannelType=0這個參數。這是_channel_info_for_chat()
+依ChatID格式("{自己Mobile}_{對方Mobile}")自動判斷出來的，這個判斷邏輯
+是從sendChatMessage(送訊息)那邊逆推、驗證過的——但getNewestMessageList
+(讀訊息)是完全不同的一支API，不能假設兩者對ChannelType的定義/要求一樣。
+很有可能讀訊息這支API根本不區分P2P/群組，一律都要傳ChannelType=1
+(把ChatID本身當作已經足夠識別是哪個對話)，我們卻依樣畫葫蘆傳了
+ChannelType=0，導致team+內部把這次查詢解讀成別的意思、找不到對應的
+訊息紀錄。這一版額外用同一個cursor、但把ChannelType強制改成"1"
+再讀一次，兩相對照即可驗證。
 
 用法：
     python _probe_p2p_chat.py 903_1631
@@ -33,9 +42,12 @@ import urllib.parse
 import teamplus_api
 
 
-def _raw_get_newest_message_list(chat_id, cursor):
+def _raw_get_newest_message_list(chat_id, cursor, channel_type_override=None):
     cookie = teamplus_api.load_cookie()
-    channel_type, _ = teamplus_api._channel_info_for_chat(chat_id)
+    if channel_type_override is not None:
+        channel_type = channel_type_override
+    else:
+        channel_type, _ = teamplus_api._channel_info_for_chat(chat_id)
     body = urllib.parse.urlencode({
         "action": "getNewestMessageList",
         "ChannelType": channel_type,
@@ -94,7 +106,28 @@ def main():
     print(f"messages = {json.dumps(messages, ensure_ascii=False, indent=2)}")
     print(f"new_cursor = {new_cursor!r}")
 
-    print("\n=== 診斷完成，請把上面全部輸出內容(尤其是步驟2的原始JSON)截圖/複製傳回 ===")
+    print("\n===== 步驟4: 同一個cursor，但把ChannelType強制改成\"1\"(群組聊天室用的值)再讀一次 =====")
+    print("(懷疑getNewestMessageList這支API讀訊息時其實不分P2P/群組，一律該用ChannelType=1)")
+    try:
+        raw2 = _raw_get_newest_message_list(chat_id, bid, channel_type_override="1")
+    except Exception as e:
+        print(f"[錯誤] 請求失敗: {type(e).__name__}: {e}")
+        sys.exit(1)
+    print("原始回應內容:")
+    print(raw2)
+    try:
+        parsed2 = json.loads(raw2)
+        print("解析後(縮排格式):")
+        print(json.dumps(parsed2, ensure_ascii=False, indent=2))
+        if parsed2.get("MessageList") or parsed2.get("ChatMessageList"):
+            print("\n[結果] ChannelType改成1之後讀到訊息了！代表getNewestMessageList讀P2P對話"
+                  "也要用ChannelType=1，不能沿用sendChatMessage那邊P2P=0的規則。")
+        else:
+            print("\n[結果] ChannelType改成1還是讀不到，這個懷疑方向也被排除了。")
+    except json.JSONDecodeError:
+        print("[警告] 回應不是合法JSON")
+
+    print("\n=== 診斷完成，請把上面全部輸出內容(尤其是步驟2、步驟4的原始JSON)截圖/複製傳回 ===")
 
 
 if __name__ == "__main__":
