@@ -176,15 +176,16 @@ def _make_db_for_group_tests(util_rows=None, pm_rows=None, ee_rows=None, no_pm_t
         CREATE TABLE ee_maintenance_record (
             machine_id TEXT, bgn_date TEXT, bgn_time TEXT, end_date TEXT, end_time TEXT,
             job_code TEXT, e_tag TEXT, engineer_id TEXT, cause TEXT, description TEXT,
-            dur REAL, wait_dur REAL
+            dur REAL, wait_dur REAL, bd_id TEXT, product TEXT
         )
     """)
     for row in (ee_rows or []):
         conn.execute(
-            "INSERT INTO ee_maintenance_record VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO ee_maintenance_record VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (row.get("machine_id"), row.get("bgn_date"), row.get("bgn_time"), row.get("end_date"),
              row.get("end_time"), row.get("job_code"), row.get("e_tag"), row.get("engineer_id"),
-             row.get("cause"), row.get("description"), row.get("dur"), row.get("wait_dur")),
+             row.get("cause"), row.get("description"), row.get("dur"), row.get("wait_dur"),
+             row.get("bd_id"), row.get("product")),
         )
     conn.execute('CREATE TABLE utilization_record (MODEL TEXT, ENTITY TEXT, UTIL TEXT, fetched_at TEXT)')
     util_fetched_at = "2026-08-09T12:00:00"
@@ -1048,6 +1049,60 @@ class TestGroupRepairDetailReply(unittest.TestCase):
         self.assertIn("E  修總次數1", reply)
 
 
+class TestGroupRepairCodeDetailReply(unittest.TestCase):
+    """「<群組> <修機代碼>」查詢(2026/08/10使用者要求，例："2100 BWD")：
+    只看單一修機代碼的統計——共修幾次/wait repair總時數/in repair總時數/
+    有修過的機台號碼。"""
+
+    def setUp(self):
+        self._orig_db_path = query_bot.DB_PATH
+        self._orig_master_path = engineer_master.PATH
+        self._orig_master_cache = engineer_master._cache
+        engineer_master.PATH = "/tmp/does_not_exist_engineer_master_test.json"
+        engineer_master._cache = None
+
+    def tearDown(self):
+        query_bot.DB_PATH = self._orig_db_path
+        engineer_master.PATH = self._orig_master_path
+        engineer_master._cache = self._orig_master_cache
+
+    def test_totals_and_machine_list_for_single_code(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_group_tests(ee_rows=[
+            {"machine_id": "BA210", "e_tag": "R", "end_date": today, "end_time": "09:00",
+             "job_code": "BWD", "dur": 1.0, "wait_dur": 0.5},
+            {"machine_id": "BA210", "e_tag": "R", "end_date": today, "end_time": "10:00",
+             "job_code": "BWD", "dur": 2.0, "wait_dur": 1.5},
+            {"machine_id": "BA228", "e_tag": "R", "end_date": today, "end_time": "11:00",
+             "job_code": "BWD", "dur": 1.5, "wait_dur": 0.5},
+            {"machine_id": "BA205", "e_tag": "R", "end_date": today, "end_time": "12:00",
+             "job_code": "E", "dur": 9.0, "wait_dur": 9.0},  # 不同代碼，不能算進來
+        ])
+        reply = query_bot.group_repair_code_detail_reply("ESEC", "BWD", now)
+        self.assertIn("【ESEC BWD修機】今日", reply)
+        self.assertIn("BWD  共修3次  wait repair共2.50hr  in repair共4.50hr", reply)
+        self.assertIn("BA210  修2次", reply)
+        self.assertIn("BA228  修1次", reply)
+        self.assertNotIn("BA205", reply)
+
+    def test_code_matching_is_case_insensitive(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_group_tests(ee_rows=[
+            {"machine_id": "BA210", "e_tag": "R", "end_date": today, "end_time": "09:00",
+             "job_code": "bwd", "dur": 1.0, "wait_dur": 0.5},
+        ])
+        reply = query_bot.group_repair_code_detail_reply("ESEC", "BWD", now)
+        self.assertIn("共修1次", reply)
+
+    def test_no_records_for_code_returns_message(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        query_bot.DB_PATH = _make_db_for_group_tests()
+        reply = query_bot.group_repair_code_detail_reply("ESEC", "BWD", now)
+        self.assertIn("查無「BWD」這個修機代碼今日的紀錄", reply)
+
+
 class TestGroupProductTypeReply(unittest.TestCase):
     """「<群組>產品」查詢(2026/08/10使用者要求)：依每台機台最後一次完成
     改機的job_code，判斷目前是「加熱」還是「畫膠」產品。"""
@@ -1102,8 +1157,31 @@ class TestGroupProductTypeReply(unittest.TestCase):
         ])
         reply = query_bot.group_product_type_reply("LOC")
         self.assertIn("加熱: 共2台", reply)
-        self.assertIn("BA802、BA803", reply)
+        lines = reply.split("\n")
+        heat_idx = lines.index("加熱: 共2台")
+        self.assertEqual(lines[heat_idx + 1: heat_idx + 3], ["BA802", "BA803"])
         self.assertNotIn("畫膠:", reply)
+
+    def test_includes_product_id_and_bd_id_when_available(self):
+        # 2026/08/10使用者要求：產品查詢要多補充Product ID跟B/D，這兩個
+        # 都是查最後一筆改機紀錄一起取得(CPIS EE Maintenance Record報表
+        # 本來就有抓、存在ee_maintenance_record.product/bd_id欄位)
+        query_bot.DB_PATH = _make_db_for_group_tests(ee_rows=[
+            {"machine_id": "BA205", "e_tag": "S", "end_date": "2026-08-01", "end_time": "10:00",
+             "job_code": "CED", "product": "P12345", "bd_id": "BD001"},
+        ])
+        reply = query_bot.group_product_type_reply("ESEC")
+        lines = reply.split("\n")
+        self.assertEqual(lines[lines.index("加熱: 共1台") + 1], "BA205  Product:P12345  B/D:BD001")
+
+    def test_no_product_or_bd_id_falls_back_to_bare_machine_id(self):
+        query_bot.DB_PATH = _make_db_for_group_tests(ee_rows=[
+            {"machine_id": "BA205", "e_tag": "S", "end_date": "2026-08-01", "end_time": "10:00",
+             "job_code": "CED"},
+        ])
+        reply = query_bot.group_product_type_reply("ESEC")
+        lines = reply.split("\n")
+        self.assertEqual(lines[lines.index("加熱: 共1台") + 1], "BA205")
 
     def test_uses_most_recent_changeover_not_earliest(self):
         query_bot.DB_PATH = _make_db_for_group_tests(ee_rows=[

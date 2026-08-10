@@ -265,6 +265,41 @@ class TestParseQueryDatedChangeoverAndWorkhours(unittest.TestCase):
         finally:
             query_bot.DB_PATH = orig_db_path
 
+    def test_group_repair_code_query(self):
+        # "2100 BWD"(2026/08/10使用者要求)：群組後面直接接大寫代碼，
+        # 不用"修機"這種動作字樣
+        cmd = listener.parse_query("2100 BWD")
+        self.assertEqual(cmd, {"mode": "group_repair_code_detail", "group_name": "ESEC", "code": "BWD"})
+
+    def test_group_repair_code_query_lowercase_code_not_matched(self):
+        # 代碼要求全大寫，降低誤判成隨口打的英文單字的機率
+        cmd = listener.parse_query("2100 bwd")
+        self.assertNotEqual(cmd.get("mode") if cmd else None, "group_repair_code_detail")
+
+    def test_group_repair_code_query_with_date(self):
+        cmd = listener.parse_query("8/9 DB BWD")
+        self.assertEqual(cmd["mode"], "group_repair_code_detail")
+        self.assertEqual(cmd["group_name"], "DB")
+        self.assertEqual(cmd["code"], "BWD")
+        self.assertEqual(cmd["date_label"], "08/09")
+
+    def test_group_repair_code_does_not_shadow_official_group_downrate(self):
+        # "DB downrate"不該被誤判成group_repair_code_detail("downrate"是
+        # 小寫，不符合代碼要求全大寫的規則)
+        cmd = listener.parse_query("DB downrate")
+        self.assertNotEqual(cmd.get("mode") if cmd else None, "group_repair_code_detail")
+
+    def test_build_reply_group_repair_code_detail_dispatches(self):
+        orig_db_path = query_bot.DB_PATH
+        query_bot.DB_PATH = tempfile.mktemp(suffix=".db")
+        try:
+            reply = listener.build_reply(
+                {"mode": "group_repair_code_detail", "group_name": "DB", "code": "BWD"}
+            )
+            self.assertIsInstance(reply, str)
+        finally:
+            query_bot.DB_PATH = orig_db_path
+
     def test_build_reply_machine_changeover_detail_dispatches(self):
         orig_db_path = query_bot.DB_PATH
         query_bot.DB_PATH = tempfile.mktemp(suffix=".db")

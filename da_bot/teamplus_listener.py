@@ -140,6 +140,22 @@ _PRODUCT_GROUP_PATTERNS = [
     (internal, _build_group_suffix_pattern(label, "產品")) for label, internal in _CHANGEOVER_GROUP_KEYWORDS
 ]
 
+
+def _build_group_code_pattern(label):
+    """「<群組> <修機代碼>」查詢(例如"2100 BWD")：群組名稱後面直接接一個
+    全大寫的代碼，不用"修機"這種動作字樣(2026/08/10使用者要求)。群組名稱
+    比對不分大小寫(?i:...)，但代碼部分要求全大寫[A-Z]——不能整個pattern
+    都用re.IGNORECASE，不然任何隨口打的英文單字(例如"DB downrate"的
+    "downrate"，雖然它本身已經被更前面的downrate判斷式攔截，這裡是額外
+    保險)都會被誤判成代碼查詢，全大寫的要求大幅降低誤判機率。"""
+    escaped = re.escape(label).replace(r"\ ", r"\s*")
+    return re.compile(r"(?<![A-Za-z0-9])(?i:" + escaped + r")\s+([A-Z]{1,8})(?![A-Za-z0-9])")
+
+
+_GROUP_REPAIR_CODE_PATTERNS = [
+    (internal, _build_group_code_pattern(label)) for label, internal in _CHANGEOVER_GROUP_KEYWORDS
+]
+
 # 「工時」查詢(例如"s10435工時"、"27512總工時")：今日該工號人員的修機+改機
 # 總工時(2026/08/09使用者要求)。工號格式不固定(純數字或字母開頭+數字)，
 # 用寬鬆一點的樣式抓緊貼在"工時"前面的那一段
@@ -205,8 +221,10 @@ HELP_TEXT = (
     "• 工時（不加工號） → 列出今日所有有紀錄工號的總工時\n"
     "• <群組>修機 → 今日該群組依修機代碼(code)分類的次數統計，每個代碼底下再列出\n"
     "  各機台各自修了幾次，例：2100修機／2100 修機\n"
-    "• <群組>產品 → 該群組每台機台目前是「加熱」還是「畫膠」產品(依最後一次真正\n"
-    "  改機判斷，不是當天限定)，例：DB產品／2100產品／LOC產品(LOC全部都是加熱)\n"
+    "• <群組> <修機代碼>(代碼要大寫) → 只看單一代碼：共修幾次＋wait repair總時數＋\n"
+    "  in repair總時數＋有修過的機台號碼，例：2100 BWD／DB BWD\n"
+    "• <群組>產品 → 該群組每台機台目前是「加熱」還是「畫膠」產品＋Product ID＋B/D\n"
+    "  (依最後一次真正改機判斷，不是當天限定)，例：DB產品／2100產品／LOC產品(LOC全部都是加熱)\n"
     "• 以上（機台改機歷史、群組產品除外）前面/後面可以加「8/9」這種日期(跟英文字母中間留個空格)，\n"
     "  改查指定那一天，例：8/9 DB改機／8/9工時／8/9 DB／8/9 BAA02改機\n"
     "\n"
@@ -273,6 +291,19 @@ def parse_query(text):
     for internal, pattern in _PRODUCT_GROUP_PATTERNS:
         if pattern.search(text):
             return {"mode": "group_product_type", "group_name": internal}
+
+    # 「<機型群組> <修機代碼>」查詢(例如"2100 BWD")：只看單一修機代碼的
+    # 統計，不用"修機"這種動作字樣(2026/08/10使用者要求)。程式碼部分要求
+    # 全大寫[A-Z]，跟中文動作字樣(修機/改機/產品)天生不會衝突，也不會誤觸
+    # 到"DB downrate"這種既有查詢(downrate是小寫，_GROUP_REPAIR_CODE_
+    # PATTERNS比對不到)。可以搭配"8/9"這種日期。
+    for internal, pattern in _GROUP_REPAIR_CODE_PATTERNS:
+        m_code = pattern.search(text)
+        if m_code:
+            cmd = {"mode": "group_repair_code_detail", "group_name": internal, "code": m_code.group(1)}
+            if query_now is not None:
+                cmd["now"], cmd["date_label"] = query_now, date_label
+            return cmd
 
     # 只打日期+群組關鍵字、沒加「改機」兩個字(例如"8/9 DB")：等同查那天
     # 的<群組>改機彙總(2026/08/10使用者要求)。一定要先抓到日期才觸發，不然
@@ -490,6 +521,14 @@ def build_reply(cmd):
             )
         except Exception as e:
             return f"{cmd['group_name']}修機查詢時發生錯誤: {type(e).__name__}: {e}"
+
+    if mode == "group_repair_code_detail":
+        try:
+            return query_bot.group_repair_code_detail_reply(
+                cmd["group_name"], cmd["code"], now=cmd.get("now"), date_label=cmd.get("date_label")
+            )
+        except Exception as e:
+            return f"{cmd['group_name']} {cmd['code']}修機查詢時發生錯誤: {type(e).__name__}: {e}"
 
     if mode == "group_product_type":
         try:

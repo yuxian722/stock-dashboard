@@ -1322,6 +1322,51 @@ def group_repair_detail_reply(group_name: str, now: datetime.datetime = None,
     return "\n".join(lines)
 
 
+def group_repair_code_detail_reply(group_name: str, code: str, now: datetime.datetime = None,
+                                    date_label: str = None) -> str:
+    """
+    「<群組> <修機代碼>」查詢(2026/08/10使用者要求，例："2100 BWD")：只看
+    單一修機代碼的統計——共修幾次、wait repair(等待修機)總時數、in repair
+    (實際修機)總時數，以及有修過這個代碼的機台號碼清單。跟group_repair_
+    detail_reply()共用同一份_repair_rows_for_group()資料，只是這裡篩到
+    單一code、用「共」(加總)而不是「平均」呈現時數(使用者這次的措辭跟
+    group_repair_detail_reply()要平均不一樣，兩種呈現方式都留著，各自
+    對應不同的使用情境)。
+
+    code比對不分大小寫；這個代碼在該群組今日(或指定日期)完全沒有紀錄時，
+    回傳提示訊息而不是空清單。
+    """
+    if now is None:
+        now = datetime.datetime.now()
+    day_word = date_label or "今日"
+    display_name = _CHANGEOVER_GROUP_DISPLAY.get(group_name, group_name)
+    conn = get_conn()
+    cur = conn.cursor()
+    all_rows = _repair_rows_for_group(cur, group_name, now)
+    conn.close()
+
+    rows = [r for r in all_rows if r["job_code"].upper() == code.upper()]
+    if not rows:
+        return f"{display_name} 查無「{code}」這個修機代碼{day_word}的紀錄"
+
+    total_dur = sum(r["dur"] or 0.0 for r in rows)
+    total_wait = sum(r["wait_dur"] or 0.0 for r in rows)
+
+    lines = [
+        f"【{display_name} {code}修機】{day_word}",
+        f"{code}  共修{len(rows)}次  wait repair共{total_wait:.2f}hr  in repair共{total_dur:.2f}hr",
+        "",
+        "機台號碼:",
+    ]
+    by_machine = {}
+    for r in rows:
+        by_machine.setdefault(r["machine_id"], []).append(r)
+    for mid, m_rows in sorted(by_machine.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        lines.append(f"  {mid}  修{len(m_rows)}次")
+
+    return "\n".join(lines)
+
+
 # 「<群組>產品」查詢要用真實機台清單，但改機內部代號(ESEC/DB/LOC/EPOXY)
 # 跟MODEL_GROUPS的key是兩套不同命名(見_group_machine_ids()註解)，這裡對照
 # 過去，才能拿到_group_machine_ids()能認得的名稱。FC(FlipChip)目前沒有
@@ -1331,19 +1376,21 @@ _CHANGEOVER_TO_MODEL_GROUP = {
 }
 
 
-def _latest_changeover_jcode(cur, machine_id):
-    """查該機台最新一筆已完成改機(e_tag='S')的job_code，不限日期——要找的
-    是「機台目前的產品設定」，是機台歷史上最後一次真正改機決定的，不是
-    當天限定(2026/08/10使用者要求「<群組>產品」查詢用)。查無紀錄回傳None。
+def _latest_changeover_row(cur, machine_id):
+    """查該機台最新一筆已完成改機(e_tag='S')的完整列(job_code/bd_id/product)，
+    不限日期——要找的是「機台目前的產品設定」，是機台歷史上最後一次真正
+    改機決定的，不是當天限定(2026/08/10使用者要求「<群組>產品」查詢用；
+    bd_id/product是CPIS EE Maintenance Record報表本來就有抓、存在
+    ee_maintenance_record裡的原始欄位，同一筆紀錄一起查出來，不用另外
+    再查一次)。查無紀錄回傳None。
     """
     cur.execute("""
-        SELECT job_code FROM ee_maintenance_record
+        SELECT job_code, bd_id, product FROM ee_maintenance_record
         WHERE machine_id = ? AND e_tag = 'S'
         ORDER BY end_date DESC, end_time DESC
         LIMIT 1
     """, (machine_id,))
-    row = cur.fetchone()
-    return row["job_code"] if row else None
+    return cur.fetchone()
 
 
 def _product_type_for_jcode(group_name, job_code):
@@ -1370,9 +1417,11 @@ def _product_type_for_jcode(group_name, job_code):
 def group_product_type_reply(group_name: str) -> str:
     """
     「<群組>產品」查詢(2026/08/10使用者要求，例："DB產品"/"2100產品"/
-    "LOC產品")：列出該機型群組每台機台目前是「加熱」還是「畫膠」產品——
-    依每台機台「最新一筆已完成改機」的job_code判斷(_latest_changeover_
-    jcode())，不是當天限定，找的是機台目前真正的產品設定。
+    "LOC產品")：列出該機型群組每台機台目前是「加熱」還是「畫膠」產品，
+    並附上Product ID/B-D(2026/08/10使用者再要求補充)——三者都是依每台
+    機台「最新一筆已完成改機」那一筆紀錄判斷/取得(_latest_changeover_
+    row())，不是當天限定，找的是機台目前真正的產品設定。查無改機紀錄
+    的機台歸在「未知」，不會有Product/B-D資訊可以附。
 
     group_name要用改機內部代號(ESEC/DB/LOC/EPOXY)；FC(FlipChip)目前沒有
     對應的真實機台清單來源，會回傳提示訊息而不是查詢結果。
@@ -1388,9 +1437,20 @@ def group_product_type_reply(group_name: str) -> str:
 
     by_type = {"加熱": [], "畫膠": [], "未知": []}
     for mid in sorted(machine_ids):
-        jcode = _latest_changeover_jcode(cur, mid)
-        product = _product_type_for_jcode(group_name, jcode)
-        by_type[product or "未知"].append(mid)
+        row = _latest_changeover_row(cur, mid)
+        jcode = row["job_code"] if row else None
+        product_type = _product_type_for_jcode(group_name, jcode)
+
+        line = mid
+        if row is not None:
+            extras = []
+            if row["product"]:
+                extras.append(f"Product:{row['product']}")
+            if row["bd_id"]:
+                extras.append(f"B/D:{row['bd_id']}")
+            if extras:
+                line = f"{mid}  " + "  ".join(extras)
+        by_type[product_type or "未知"].append(line)
 
     conn.close()
 
@@ -1401,7 +1461,7 @@ def group_product_type_reply(group_name: str) -> str:
             continue
         lines.append("")
         lines.append(f"{label}: 共{len(machines)}台")
-        lines.append("、".join(machines))
+        lines.extend(machines)  # 一機一行(補了Product/B-D欄位後不適合用「、」串成一行)
 
     return "\n".join(lines)
 
