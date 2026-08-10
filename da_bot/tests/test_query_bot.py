@@ -11,6 +11,7 @@ import tempfile
 import unittest
 
 import query_bot
+import hourly_push
 import engineer_master
 
 
@@ -388,6 +389,61 @@ class TestDbGroupReplyOvertimeRepairList(unittest.TestCase):
         engineer_master._cache = None
         reply = query_bot.db_group_reply(["DB830"])
         self.assertIn("/s10435(王小明)", reply)
+
+
+class TestAllLiveStatusReply(unittest.TestCase):
+    """all_live_status_reply()：不指定機台代號的「即時機況查詢」(2026/08/10
+    使用者要求)，全公司PM Monitor異常機況總覽——分組台數、機台明細、超時
+    機台，直接複用hourly_push整點推播「⚡即時機況」段落同一套邏輯。"""
+
+    def setUp(self):
+        self._orig_db_path = query_bot.DB_PATH
+        self._orig_hp_db_path = hourly_push.DB_PATH
+
+    def tearDown(self):
+        query_bot.DB_PATH = self._orig_db_path
+        hourly_push.DB_PATH = self._orig_hp_db_path
+
+    def _use_db(self, **kwargs):
+        path = _make_db_for_group_tests(**kwargs)
+        query_bot.DB_PATH = path
+        hourly_push.DB_PATH = path
+
+    def test_no_data_message_when_pm_monitor_table_missing(self):
+        self._use_db(no_pm_table=True)
+        reply = query_bot.all_live_status_reply()
+        self.assertIn("目前無PM Monitor即時機況資料", reply)
+
+    def test_lists_group_stats_machine_detail_and_overtime(self):
+        self._use_db(pm_rows=[
+            {"entity": "BAA01", "status": "IN-REPAIR",
+             "in_time": "2026/08/09 10:00", "operator": "s10435"},
+            {"entity": "BA801", "status": "SETUP",
+             "in_time": "2026/08/09 10:00", "jcode": "CN"},
+        ])
+        now = datetime.datetime(2026, 8, 9, 16, 0)
+        reply = query_bot.all_live_status_reply(now=now)
+
+        self.assertIn("【即時機況】", reply)
+        # BAA01(DB)修機中、BA801(LOC)改機中，各組分組台數都要出現
+        self.assertIn("修機中1", reply)
+        self.assertIn("改機中1", reply)
+        # 機台明細列出機台號碼+狀態+已耗時(6小時)，BA801還要附JCODE
+        self.assertIn("機台明細:", reply)
+        self.assertIn("BAA01  修機中  6.00hr", reply)
+        self.assertIn("BA801  改機中  6.00hr  CN", reply)
+        # BA801(CN標準工時3.38hr)已超時，BAA01沒有jcode所以無法判斷標準工時、不列入超時
+        self.assertIn("超時機台:", reply)
+        self.assertIn("BA801", reply.split("超時機台:")[1])
+        self.assertNotIn("BAA01", reply.split("超時機台:")[1])
+
+    def test_no_overtime_placeholder_when_nothing_over_standard(self):
+        self._use_db(pm_rows=[
+            {"entity": "BAA01", "status": "IN-REPAIR", "in_time": "2026/08/09 15:30"},
+        ])
+        now = datetime.datetime(2026, 8, 9, 16, 0)
+        reply = query_bot.all_live_status_reply(now=now)
+        self.assertIn("(目前無超過標準工時的機台)", reply)
 
 
 def _make_db_for_official_downrate_tests(rows):

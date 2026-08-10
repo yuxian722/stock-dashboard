@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 import query_bot
+import hourly_push
 import teamplus_listener as listener
 
 
@@ -229,6 +230,46 @@ class TestParseQueryDatedChangeoverAndWorkhours(unittest.TestCase):
             self.assertIn("【DB改機】08/09共1台", reply)
         finally:
             query_bot.DB_PATH = orig_db_path
+
+
+class TestParseQueryLiveStatus(unittest.TestCase):
+    """「機況」/「即時機況」查詢(2026/08/10使用者要求新增「即時機況查詢」)：
+    加機台代號查單一機台即時狀態、不加機台代號查全公司PM Monitor機況總覽。"""
+
+    def test_machine_with_keyword_routes_to_live(self):
+        cmd = listener.parse_query("BA220機況")
+        self.assertEqual(cmd, {"machine": "BA220", "mode": "live"})
+
+    def test_machine_with_immediate_keyword_variant(self):
+        # "即時機況"裡本身就包含"機況"這個子字串，同一份判斷式就能涵蓋
+        cmd = listener.parse_query("BA220即時機況")
+        self.assertEqual(cmd, {"machine": "BA220", "mode": "live"})
+
+    def test_bare_keyword_routes_to_all_live_status(self):
+        self.assertEqual(listener.parse_query("機況"), {"mode": "all_live_status"})
+        self.assertEqual(listener.parse_query("即時機況"), {"mode": "all_live_status"})
+
+    def test_build_reply_live_dispatches_to_query_bot(self):
+        orig_db_path = query_bot.DB_PATH
+        query_bot.DB_PATH = tempfile.mktemp(suffix=".db")
+        try:
+            reply = listener.build_reply({"machine": "BA220", "mode": "live"})
+            self.assertIsInstance(reply, str)
+        finally:
+            query_bot.DB_PATH = orig_db_path
+
+    def test_build_reply_all_live_status_dispatches_to_query_bot(self):
+        orig_db_path = query_bot.DB_PATH
+        orig_hp_db_path = hourly_push.DB_PATH
+        path = tempfile.mktemp(suffix=".db")
+        query_bot.DB_PATH = path
+        hourly_push.DB_PATH = path
+        try:
+            reply = listener.build_reply({"mode": "all_live_status"})
+            self.assertIsInstance(reply, str)
+        finally:
+            query_bot.DB_PATH = orig_db_path
+            hourly_push.DB_PATH = orig_hp_db_path
 
 
 class TestParseQueryDatedDownrate(unittest.TestCase):

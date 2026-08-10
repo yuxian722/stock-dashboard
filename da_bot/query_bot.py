@@ -684,6 +684,53 @@ def db_group_reply(group_names=None) -> str:
     return "\n".join(lines)
 
 
+def all_live_status_reply(now: datetime.datetime = None) -> str:
+    """
+    回傳全公司目前PM/REPAIR/SETUP Monitor異常機況總覽(2026/08/10使用者要求
+    「即時機況查詢」新增一個不用指定機台代號的版本)：依機型群組(ESEC/DB/
+    LOC/FlipChip)列出各狀態台數，再列出每台機台號碼+狀態+已耗時+JCODE，
+    最後列出超過標準工時的機台。資料來源、排版都直接複用整點推播「⚡即時
+    機況」段落用的hourly_push輔助函式，是PM Monitor的真實快照，不是像
+    db_group_reply()那樣只列單一機型群組、也不是EE Maintenance歷史紀錄
+    推算的近似值。沒抓過/抓不到PM Monitor資料時回傳提示文字，不會噴例外。
+    """
+    if now is None:
+        now = datetime.datetime.now()
+    pm_rows = hourly_push.get_pm_monitor_records()
+    if not pm_rows:
+        return "目前無PM Monitor即時機況資料(尚未抓取或抓取失敗)"
+
+    now_str = now.strftime("%m/%d %H:%M")
+    lines = [f"【即時機況】{now_str}"]
+
+    pm_stats = hourly_push._pm_group_stats_from_rows(pm_rows)
+    epoxy_pm = {}
+    for g in ("ESEC", "DB"):
+        for code, cnt in pm_stats.get(g, {}).items():
+            epoxy_pm[code] = epoxy_pm.get(code, 0) + cnt
+    stat_lines = [
+        hourly_push._pm_stats_line("EPOXY", epoxy_pm),
+        hourly_push._pm_stats_line("├ESEC", pm_stats.get("ESEC", {}), " "),
+        hourly_push._pm_stats_line("└DB", pm_stats.get("DB", {}), " "),
+        hourly_push._pm_stats_line("LOC", pm_stats.get("LOC", {})),
+        hourly_push._pm_stats_line("FlipChip", pm_stats.get("FC", {})),
+    ]
+    lines.extend(ln for ln in stat_lines if ln is not None)
+
+    lines.append("機台明細:")
+    lines.extend(hourly_push._pm_detail_lines(pm_rows, now))
+
+    lines.append("")
+    lines.append("超時機台:")
+    overtime_lines = hourly_push._pm_overtime_lines(pm_rows, now)
+    if overtime_lines:
+        lines.extend(overtime_lines)
+    else:
+        lines.append("(目前無超過標準工時的機台)")
+
+    return "\n".join(lines)
+
+
 # CPIS Utilization Analysis 頁面最下方「GROUP」彙總表裡，官方本身就有的群組名稱清單
 # (這些是cpis_utilization_scraper.py抓取時，連同機台明細一起原封不動存進DB的整列彙總數字，
 # 跟db_group_reply()裡自己逐台平均算出來的數字是兩回事，可能因為官方是用產量加權平均
