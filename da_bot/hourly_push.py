@@ -20,6 +20,8 @@ for _s in (sys.stdout, sys.stderr):
 import sqlite3
 import datetime
 
+import engineer_master
+
 DB_PATH = "da_maintenance.db"
 
 
@@ -81,15 +83,16 @@ def _is_night_shift(end_time):
 def _get_done_setup_records(now):
     """
     共用查詢：今日(跟班別對齊，見_shift_day_bounds())已完成的e_tag='S'紀錄
-    原始列(machine_id/bgn_date/bgn_time/job_code/end_time)，用SELECT DISTINCT
-    防重複。get_epoxy_done_by_jcode()/get_setup_group_stats()/
-    get_epoxy_done_by_shift()都共用這份查詢，避免同一段SQL重複維護好幾份。
+    原始列(machine_id/bgn_date/bgn_time/job_code/end_time/engineer_id)，用
+    SELECT DISTINCT防重複。get_epoxy_done_by_jcode()/get_setup_group_stats()/
+    get_epoxy_done_by_shift()/get_epoxy_done_by_dept()都共用這份查詢，避免
+    同一段SQL重複維護好幾份。
     """
     shift_date, next_date = _shift_day_bounds(now)
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT DISTINCT machine_id, bgn_date, bgn_time, job_code, end_time
+        SELECT DISTINCT machine_id, bgn_date, bgn_time, job_code, end_time, engineer_id
         FROM ee_maintenance_record
         WHERE e_tag = 'S' AND (
             (end_date = ? AND end_time >= ?)
@@ -195,6 +198,30 @@ def get_epoxy_done_by_shift(now: datetime.datetime = None):
         else:
             day_count += 1
     return {"早班": day_count, "夜班": night_count}
+
+
+def get_epoxy_done_by_dept(now: datetime.datetime = None):
+    """
+    EPOXY(ESEC+DB)今日已完成的改機次數，依人員所屬部門分類成MFG(產線技術員)/
+    EE(設備工程師)(2026/08/10使用者要求，資料來源是使用者提供的DA EE
+    Maintenance Record人員名冊，見engineer_master.py)。跟get_epoxy_done_by_jcode()/
+    get_epoxy_done_by_shift()同一套真正改機篩選標準。查無工號資料、或部門
+    不是OP/EE(例如PE)的紀錄歸類到"未知"，讓三者加總起來等於EPOXY改機總數，
+    方便肉眼核對。回傳{"MFG": int, "EE": int, "未知": int}。
+    """
+    if now is None:
+        now = datetime.datetime.now()
+    rows = _get_done_setup_records(now)
+
+    engineer_ids = []
+    for r in rows:
+        g = _group_for_machine(r["machine_id"])
+        if g not in ("ESEC", "DB"):
+            continue
+        if _changeover_jcode_category(g, r["job_code"]) is None:
+            continue
+        engineer_ids.append(r["engineer_id"])
+    return engineer_master.dept_breakdown(engineer_ids)
 
 
 # PM/REPAIR/SETUP Monitor頁面的STATUS代碼(cpis_pm_monitor_scraper.py抓的
@@ -360,7 +387,7 @@ def _pm_overtime_lines(rows, now):
         std = get_pm_jcode_std_hours(r["jcode"])
         if std is None or elapsed <= std:
             continue
-        operator = r["operator"] or "未指定"
+        operator = engineer_master.format_engineer(r["operator"]) if r["operator"] else "未指定"
         lines.append(
             f"{r['entity']}  {elapsed:.2f}hr(超時{elapsed - std:.2f}hr)  {r['jcode']}  人員{operator}"
         )
@@ -442,7 +469,8 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
     # 🔧 今日改機統計：依機型群組(EPOXY=ESEC+DB、LOC、FlipChip)列出今日已完成/
     # 改機中/待改的台數；EPOXY另外逐一列出實際job_code(CED/CEDO/CD...)各自的
     # 台數細項，數字由多到少排序，加總起來要等於EPOXY的改機總數(2026/08/09
-    # 使用者要求，方便肉眼核對)；還有早班/夜班改機台數(2026/08/09使用者要求)。
+    # 使用者要求，方便肉眼核對)；還有早班/夜班改機台數(2026/08/09使用者要求)、
+    # MFG(產線)/EE(設備)改機台數(2026/08/10使用者要求)。
     setup_stats = get_setup_group_stats(now)
     esec, db, loc, fc = setup_stats["ESEC"], setup_stats["DB"], setup_stats["LOC"], setup_stats["FC"]
     epoxy = {k: esec[k] + db[k] for k in ("done", "in_progress", "waiting")}
@@ -453,6 +481,10 @@ def build_hourly_push_message(now: datetime.datetime = None) -> str:
     shift_parts = [f"{label}{n}台" for label, n in epoxy_shift.items() if n]
     if shift_parts:
         parts.append("  " + " ".join(shift_parts))
+    epoxy_dept = get_epoxy_done_by_dept(now)
+    dept_parts = [f"{label}{n}台" for label, n in epoxy_dept.items() if n]
+    if dept_parts:
+        parts.append("  " + " ".join(dept_parts))
     epoxy_jcode = get_epoxy_done_by_jcode(now)
     jcode_parts = [
         f"{code}{n}台" for code, n in sorted(epoxy_jcode.items(), key=lambda kv: (-kv[1], kv[0]))

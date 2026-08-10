@@ -27,6 +27,7 @@ for _s in (sys.stdout, sys.stderr):
 # 搞錯的覆轍。這幾個都是
 # 不碰資料庫的純函式，直接import沿用沒有交互汙染DB_PATH的疑慮。
 import hourly_push
+import engineer_master
 
 DB_PATH = "da_maintenance.db"
 
@@ -674,7 +675,7 @@ def db_group_reply(group_names=None) -> str:
                 elapsed = hourly_push._pm_elapsed_hours(row["in_time"], now)
                 if elapsed is None or elapsed <= 1.0:
                     continue
-                operator = row["operator"] or "?"
+                operator = engineer_master.format_engineer(row["operator"]) if row["operator"] else "?"
                 overtime_repairs.append(f"{mid} 修機超時{elapsed:.2f}hr/{operator}")
         if overtime_repairs:
             lines.append(f"  異常機台(修機超時1hr以上): " + "、".join(overtime_repairs))
@@ -905,6 +906,16 @@ def group_changeover_detail_reply(group_name: str, now: datetime.datetime = None
     if shift_parts:
         lines.append(" ".join(shift_parts))
 
+    # MFG(產線技術員)/EE(設備工程師)改機台數(2026/08/10使用者要求)，資料來源
+    # 是engineer_master.py的工號→部門對照(使用者提供的DA EE Maintenance
+    # Record人員名冊)。
+    dept_counts = engineer_master.dept_breakdown([r["engineer_id"] for r in rows])
+    dept_parts = [
+        f"{label}{dept_counts[label]}台" for label in ("MFG", "EE", "未知") if dept_counts[label]
+    ]
+    if dept_parts:
+        lines.append(" ".join(dept_parts))
+
     cat_parts = _category_avg_parts(rows)
     if cat_parts:
         lines.append(" ".join(cat_parts))
@@ -918,7 +929,7 @@ def group_changeover_detail_reply(group_name: str, now: datetime.datetime = None
     lines.append("人員明細:")
     for eng, eng_rows in sorted(by_engineer.items(), key=lambda kv: -len(kv[1])):
         eng_cat_parts = _category_avg_parts(eng_rows)
-        lines.append(f"{eng}  改機{len(eng_rows)}台  " + " ".join(eng_cat_parts))
+        lines.append(f"{engineer_master.format_engineer(eng)}  改機{len(eng_rows)}台  " + " ".join(eng_cat_parts))
 
     return "\n".join(lines)
 
@@ -983,7 +994,9 @@ def workhours_reply(engineer_id: str = None, now: datetime.datetime = None) -> s
     lines = ["【工時】今日修機+改機總工時"]
     for eng, hrs in sorted(by_engineer.items(), key=lambda kv: -(kv[1]["R"] + kv[1]["S"])):
         total = hrs["R"] + hrs["S"]
-        lines.append(f"{eng}  修機{hrs['R']:.1f}hr + 改機{hrs['S']:.1f}hr = 總{total:.1f}hr")
+        lines.append(
+            f"{engineer_master.format_engineer(eng)}  修機{hrs['R']:.1f}hr + 改機{hrs['S']:.1f}hr = 總{total:.1f}hr"
+        )
     return "\n".join(lines)
 
 

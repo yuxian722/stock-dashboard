@@ -5,11 +5,23 @@
 import conftest  # noqa: F401  (設定 sys.path)
 
 import datetime
+import json
 import sqlite3
 import tempfile
 import unittest
 
 import query_bot
+import engineer_master
+
+
+def _make_engineer_master(entries):
+    """entries是list of (工號, 姓名, 部門原始值OP/EE/PE)，寫成engineer_master.json
+    格式的暫存檔，供工號+姓名、MFG/EE分類相關測試使用。"""
+    path = tempfile.mktemp(suffix=".json")
+    data = {key: {"name": name, "dept": dept} for key, name, dept in entries}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    return path
 
 
 def _make_db(include_health_table=False):
@@ -311,9 +323,15 @@ class TestDbGroupReplyOvertimeRepairList(unittest.TestCase):
 
     def setUp(self):
         self._orig_db_path = query_bot.DB_PATH
+        self._orig_master_path = engineer_master.PATH
+        self._orig_master_cache = engineer_master._cache
+        engineer_master.PATH = "/tmp/does_not_exist_engineer_master_test.json"
+        engineer_master._cache = None
 
     def tearDown(self):
         query_bot.DB_PATH = self._orig_db_path
+        engineer_master.PATH = self._orig_master_path
+        engineer_master._cache = self._orig_master_cache
 
     @staticmethod
     def _in_time_hours_ago(hours):
@@ -358,6 +376,18 @@ class TestDbGroupReplyOvertimeRepairList(unittest.TestCase):
         )
         reply = query_bot.db_group_reply(["DB830"])
         self.assertNotIn("異常機台", reply)
+
+    def test_operator_name_appended_when_found(self):
+        # 2026/08/10使用者要求：工號後面要補上姓名
+        query_bot.DB_PATH = _make_db_for_group_tests(
+            util_rows=[("DB830", "BAB01")],
+            pm_rows=[{"entity": "BAB01", "status": "IN-REPAIR",
+                      "in_time": self._in_time_hours_ago(2), "operator": "s10435"}],
+        )
+        engineer_master.PATH = _make_engineer_master([("10435", "王小明", "EE")])
+        engineer_master._cache = None
+        reply = query_bot.db_group_reply(["DB830"])
+        self.assertIn("/s10435(王小明)", reply)
 
 
 class TestGetStdHours(unittest.TestCase):
@@ -404,9 +434,18 @@ class TestGroupChangeoverDetailReply(unittest.TestCase):
 
     def setUp(self):
         self._orig_db_path = query_bot.DB_PATH
+        # 隔離掉真正隨repo一起發布的engineer_master.json，避免這裡的假工號
+        # 剛好在真實名冊裡對到人名，讓測試斷言變得不穩定(工號後面+姓名的
+        # 行為另外有TestGroupChangeoverDetailReplyEngineerName驗證)
+        self._orig_master_path = engineer_master.PATH
+        self._orig_master_cache = engineer_master._cache
+        engineer_master.PATH = "/tmp/does_not_exist_engineer_master_test.json"
+        engineer_master._cache = None
 
     def tearDown(self):
         query_bot.DB_PATH = self._orig_db_path
+        engineer_master.PATH = self._orig_master_path
+        engineer_master._cache = self._orig_master_cache
 
     def test_shows_total_count_category_avg_and_per_engineer_breakdown(self):
         now = datetime.datetime(2026, 8, 9, 14, 0)
@@ -510,15 +549,55 @@ class TestGroupChangeoverDetailReply(unittest.TestCase):
         self.assertIn("早班1台", reply)
         self.assertNotIn("夜班", reply)
 
+    def test_engineer_name_appended_in_engineer_breakdown(self):
+        # 2026/08/10使用者要求：工號後面要補上姓名
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "s10435", "dur": 1.0},
+        ])
+        engineer_master.PATH = _make_engineer_master([("10435", "王小明", "EE")])
+        engineer_master._cache = None
+        reply = query_bot.group_changeover_detail_reply("DB", now)
+        self.assertIn("s10435(王小明)  改機1台", reply)
+
+    def test_mfg_ee_breakdown(self):
+        # 2026/08/10使用者要求：改機統計分成MFG(產線)/EE(設備)
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "10001", "dur": 1.0},   # OP=MFG
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": today, "end_time": "11:00",
+             "job_code": "CED", "engineer_id": "20002", "dur": 1.0},   # EE
+            {"machine_id": "BAA03", "e_tag": "S", "end_date": today, "end_time": "12:00",
+             "job_code": "CED", "engineer_id": "99999", "dur": 1.0},   # 查無資料
+        ])
+        engineer_master.PATH = _make_engineer_master([
+            ("10001", "王小明", "OP"), ("20002", "李大華", "EE"),
+        ])
+        engineer_master._cache = None
+        reply = query_bot.group_changeover_detail_reply("DB", now)
+        self.assertIn("MFG1台 EE1台 未知1台", reply)
+
 
 class TestWorkhoursReply(unittest.TestCase):
     """「工時」查詢：今日各工號人員修機+改機總工時(2026/08/09使用者要求)。"""
 
     def setUp(self):
         self._orig_db_path = query_bot.DB_PATH
+        # 隔離掉真正隨repo一起發布的engineer_master.json，避免這裡的假工號
+        # 剛好在真實名冊裡對到人名，讓測試斷言變得不穩定
+        self._orig_master_path = engineer_master.PATH
+        self._orig_master_cache = engineer_master._cache
+        engineer_master.PATH = "/tmp/does_not_exist_engineer_master_test.json"
+        engineer_master._cache = None
 
     def tearDown(self):
         query_bot.DB_PATH = self._orig_db_path
+        engineer_master.PATH = self._orig_master_path
+        engineer_master._cache = self._orig_master_cache
 
     def test_sums_repair_and_changeover_hours_for_one_engineer(self):
         now = datetime.datetime(2026, 8, 9, 14, 0)
@@ -563,6 +642,19 @@ class TestWorkhoursReply(unittest.TestCase):
         query_bot.DB_PATH = _make_db_for_changeover_tests([])
         reply = query_bot.workhours_reply("s10435", now)
         self.assertIn("今日目前沒有修機/改機紀錄", reply)
+
+    def test_engineer_name_appended(self):
+        # 2026/08/10使用者要求：工號後面要補上姓名
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BA205", "e_tag": "R", "end_date": today, "end_time": "10:00",
+             "engineer_id": "s10435", "dur": 2.0},
+        ])
+        engineer_master.PATH = _make_engineer_master([("10435", "王小明", "EE")])
+        engineer_master._cache = None
+        reply = query_bot.workhours_reply(None, now)
+        self.assertIn("s10435(王小明)  修機2.0hr", reply)
 
 
 if __name__ == "__main__":

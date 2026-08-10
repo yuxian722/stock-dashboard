@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 import hourly_push
+import engineer_master
 
 # 固定的測試時間點(下午2點，確定已經過了07:30早班交接時間)，讓「今日改機
 # 統計」這類跟班別對齊的測試不受實際執行時間影響，結果穩定、不會因為剛好
@@ -75,6 +76,18 @@ def _add_pm_monitor_rows(db_path, rows, fetched_at="2026-08-09T17:00:00"):
         )
     conn.commit()
     conn.close()
+
+
+def _make_engineer_master(entries):
+    """entries是list of (工號, 姓名, 部門原始值OP/EE/PE)，寫成engineer_master.json
+    格式的暫存檔，供get_epoxy_done_by_dept()/_pm_overtime_lines()的MFG/EE/
+    工號+姓名測試使用。"""
+    import json
+    path = tempfile.mktemp(suffix=".json")
+    data = {key: {"name": name, "dept": dept} for key, name, dept in entries}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    return path
 
 
 def _make_db_with_group_rates(rows):
@@ -392,6 +405,53 @@ class TestGetEpoxyDoneByShift(unittest.TestCase):
         self.assertEqual(sum(by_jcode.values()), sum(by_shift.values()))
 
 
+class TestGetEpoxyDoneByDept(unittest.TestCase):
+    """EPOXY(ESEC+DB)今日已完成改機依人員部門分類成MFG(產線)/EE(設備)
+    (2026/08/10使用者要求)，資料來源是engineer_master.py的工號→部門對照，
+    跟get_epoxy_done_by_jcode()同一套CED/CEE/CD篩選標準。"""
+
+    def setUp(self):
+        self._orig_db_path = hourly_push.DB_PATH
+        self._orig_master_path = engineer_master.PATH
+        self._orig_master_cache = engineer_master._cache
+
+    def tearDown(self):
+        hourly_push.DB_PATH = self._orig_db_path
+        engineer_master.PATH = self._orig_master_path
+        engineer_master._cache = self._orig_master_cache
+
+    def test_splits_by_mfg_and_ee(self):
+        today = _TEST_NOW.date().isoformat()
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "08:00",
+             "job_code": "CED", "engineer_id": "10001"},   # OP=MFG
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "20:00",
+             "job_code": "CEDO", "engineer_id": "20002"},  # EE
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": today, "end_time": "21:00",
+             "job_code": "CD", "engineer_id": "99999"},    # 查無資料
+        ])
+        engineer_master.PATH = _make_engineer_master([
+            ("10001", "王小明", "OP"), ("20002", "李大華", "EE"),
+        ])
+        engineer_master._cache = None
+        result = hourly_push.get_epoxy_done_by_dept(_TEST_NOW)
+        self.assertEqual(result, {"MFG": 1, "EE": 1, "未知": 1})
+
+    def test_total_matches_get_epoxy_done_by_jcode_total(self):
+        today = _TEST_NOW.date().isoformat()
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "08:00",
+             "job_code": "CED", "engineer_id": "10001"},
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "20:00",
+             "job_code": "CEDO", "engineer_id": "20002"},
+        ])
+        engineer_master.PATH = _make_engineer_master([("10001", "王小明", "OP")])
+        engineer_master._cache = None
+        by_jcode = hourly_push.get_epoxy_done_by_jcode(_TEST_NOW)
+        by_dept = hourly_push.get_epoxy_done_by_dept(_TEST_NOW)
+        self.assertEqual(sum(by_jcode.values()), sum(by_dept.values()))
+
+
 class TestGetSetupGroupStats(unittest.TestCase):
     """今日改機統計：done(今日完成)算自ee_maintenance_record；in_progress(改機中)/
     waiting(待改)改成算自pm_monitor_record的即時快照(SETUP/WAIT-SETUP)。"""
@@ -450,9 +510,13 @@ class TestGetSetupGroupStats(unittest.TestCase):
 class TestBuildHourlyPushMessageNewSections(unittest.TestCase):
     def setUp(self):
         self._orig_db_path = hourly_push.DB_PATH
+        self._orig_master_path = engineer_master.PATH
+        self._orig_master_cache = engineer_master._cache
 
     def tearDown(self):
         hourly_push.DB_PATH = self._orig_db_path
+        engineer_master.PATH = self._orig_master_path
+        engineer_master._cache = self._orig_master_cache
 
     def test_includes_setup_stats_and_epoxy_jcode_breakdown(self):
         today = _TEST_NOW.date().isoformat()
@@ -478,6 +542,22 @@ class TestBuildHourlyPushMessageNewSections(unittest.TestCase):
         ])
         msg = hourly_push.build_hourly_push_message(now=_TEST_NOW)
         self.assertIn("早班1台 夜班1台", msg)
+
+    def test_includes_mfg_ee_dept_breakdown(self):
+        # 2026/08/10使用者要求要在推播裡補上MFG(產線)/EE(設備)改機台數
+        today = _TEST_NOW.date().isoformat()
+        hourly_push.DB_PATH = _make_db_with_records([
+            {"machine_id": "BA205", "e_tag": "S", "end_date": today, "end_time": "08:00",
+             "job_code": "CED", "engineer_id": "10001"},
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "20:00",
+             "job_code": "CEDO", "engineer_id": "20002"},
+        ])
+        engineer_master.PATH = _make_engineer_master([
+            ("10001", "王小明", "OP"), ("20002", "李大華", "EE"),
+        ])
+        engineer_master._cache = None
+        msg = hourly_push.build_hourly_push_message(now=_TEST_NOW)
+        self.assertIn("MFG1台 EE1台", msg)
 
     def test_overtime_section_shows_placeholder_when_no_pm_monitor_data(self):
         hourly_push.DB_PATH = _make_db_with_records([])
@@ -651,6 +731,24 @@ class TestPmDetailLines(unittest.TestCase):
 
 
 class TestPmOvertimeLines(unittest.TestCase):
+    def setUp(self):
+        self._orig_master_path = engineer_master.PATH
+        self._orig_master_cache = engineer_master._cache
+
+    def tearDown(self):
+        engineer_master.PATH = self._orig_master_path
+        engineer_master._cache = self._orig_master_cache
+
+    def test_operator_id_gets_name_appended_when_found(self):
+        # 2026/08/10使用者要求：工號後面要補上姓名
+        engineer_master.PATH = _make_engineer_master([("12345", "王小明", "EE")])
+        engineer_master._cache = None
+        now = datetime.datetime(2026, 8, 9, 17, 30)
+        rows = [{"entity": "BA205", "status": "SETUP", "in_time": "2026/08/09 12:30",
+                  "jcode": "CEE", "operator": "s12345"}]
+        lines = hourly_push._pm_overtime_lines(rows, now)
+        self.assertIn("人員s12345(王小明)", lines[0])
+
     def test_machine_over_standard_hours_included_with_operator(self):
         now = datetime.datetime(2026, 8, 9, 17, 30)
         # CEE標準4.17hr，經過5hr超時
