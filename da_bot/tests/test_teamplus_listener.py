@@ -110,6 +110,115 @@ class TestParseQueryWorkhours(unittest.TestCase):
             query_bot.DB_PATH = orig_db_path
 
 
+class TestParseQueryDatedChangeoverAndWorkhours(unittest.TestCase):
+    """「8/9」這種指定日期可以加在「<群組>改機」「改機」「工時」查詢前後，
+    改查那一天而不是預設今日(2026/08/10使用者要求)。"""
+
+    def test_date_with_explicit_group_changeover(self):
+        # 日期(數字)跟群組代號(英文字母)中間要留分隔(空格或中文字)，不然
+        # 兩者黏在一起會讓群組關鍵字的邊界判斷失敗(跟"DB800"不能誤判成裸
+        # "DB"是同一套邊界規則)，這裡用空格分隔是自然的打法
+        cmd = listener.parse_query("8/9 DB改機")
+        self.assertEqual(cmd["mode"], "group_changeover_detail")
+        self.assertEqual(cmd["group_name"], "DB")
+        self.assertEqual(cmd["date_label"], "08/09")
+        self.assertEqual((cmd["now"].month, cmd["now"].day), (8, 9))
+
+    def test_date_after_group_changeover(self):
+        cmd = listener.parse_query("DB改機 8/9")
+        self.assertEqual(cmd["mode"], "group_changeover_detail")
+        self.assertEqual(cmd["group_name"], "DB")
+        self.assertEqual(cmd["date_label"], "08/09")
+
+    def test_date_with_bare_group_no_changeover_word_routes_to_changeover_detail(self):
+        # "8/9 DB"沒有「改機」兩個字，但有日期，等同查那天DB改機彙總
+        # (跟不帶日期的裸"DB"要維持查即時彙總的行為不同)
+        cmd = listener.parse_query("8/9 DB")
+        self.assertEqual(cmd["mode"], "group_changeover_detail")
+        self.assertEqual(cmd["group_name"], "DB")
+        self.assertEqual(cmd["date_label"], "08/09")
+        self.assertEqual((cmd["now"].month, cmd["now"].day), (8, 9))
+        self.assertEqual(set(cmd.keys()), {"mode", "group_name", "now", "date_label"})
+
+    def test_bare_db_without_date_still_uses_live_db_group(self):
+        # 沒有日期時，裸的"DB"要維持原本查即時彙總(db_group)的行為，不能被
+        # 新增的日期規則搶走
+        cmd = listener.parse_query("DB")
+        self.assertEqual(cmd, {"mode": "db_group"})
+
+    def test_date_with_no_group_routes_to_all_changeover(self):
+        cmd = listener.parse_query("8/9改機")
+        self.assertEqual(cmd["mode"], "all_changeover")
+        self.assertEqual(cmd["date_label"], "08/09")
+        self.assertEqual((cmd["now"].month, cmd["now"].day), (8, 9))
+
+    def test_bare_changeover_without_date_routes_to_all_changeover(self):
+        cmd = listener.parse_query("改機")
+        self.assertEqual(cmd, {"mode": "all_changeover"})
+
+    def test_date_with_workhours(self):
+        cmd = listener.parse_query("8/9 工時")
+        self.assertEqual(cmd["mode"], "workhours")
+        self.assertIsNone(cmd["engineer_id"])
+        self.assertEqual(cmd["date_label"], "08/09")
+        self.assertEqual((cmd["now"].month, cmd["now"].day), (8, 9))
+
+    def test_date_with_engineer_and_workhours(self):
+        cmd = listener.parse_query("8/9 s10435工時")
+        self.assertEqual(cmd["mode"], "workhours")
+        self.assertEqual(cmd["engineer_id"], "s10435")
+        self.assertEqual(cmd["date_label"], "08/09")
+
+    def test_workhours_without_date_has_no_now_key(self):
+        cmd = listener.parse_query("s10435工時")
+        self.assertNotIn("now", cmd)
+        self.assertNotIn("date_label", cmd)
+
+    def test_machine_range_query_unaffected_by_new_single_date_pattern(self):
+        # "8/9~8/10"是既有的機台區間查詢語法，不能被新的單一日期規則誤判
+        cmd = listener.parse_query("BA220 8/9~8/10")
+        self.assertEqual(cmd["mode"], "range")
+        self.assertEqual(cmd["machine"], "BA220")
+
+    def test_build_reply_all_changeover_dispatches_to_query_bot(self):
+        orig_db_path = query_bot.DB_PATH
+        query_bot.DB_PATH = tempfile.mktemp(suffix=".db")
+        try:
+            reply = listener.build_reply({"mode": "all_changeover"})
+            self.assertIsInstance(reply, str)
+        finally:
+            query_bot.DB_PATH = orig_db_path
+
+    def test_build_reply_passes_dated_now_and_label_through(self):
+        import datetime as dt
+        import sqlite3
+
+        orig_db_path = query_bot.DB_PATH
+        path = tempfile.mktemp(suffix=".db")
+        conn = sqlite3.connect(path)
+        conn.execute("""
+            CREATE TABLE ee_maintenance_record (
+                machine_id TEXT, bgn_date TEXT, bgn_time TEXT, end_date TEXT, end_time TEXT,
+                job_code TEXT, e_tag TEXT, engineer_id TEXT, dur REAL
+            )
+        """)
+        conn.execute(
+            "INSERT INTO ee_maintenance_record "
+            "(machine_id, end_date, end_time, job_code, e_tag, engineer_id, dur) "
+            "VALUES ('BAA01', '2026-08-09', '10:00', 'CED', 'S', 's10435', 1.0)"
+        )
+        conn.commit()
+        conn.close()
+        query_bot.DB_PATH = path
+        try:
+            cmd = {"mode": "group_changeover_detail", "group_name": "DB",
+                   "now": dt.datetime(2026, 8, 9, 12, 0), "date_label": "08/09"}
+            reply = listener.build_reply(cmd)
+            self.assertIn("【DB改機】08/09共1台", reply)
+        finally:
+            query_bot.DB_PATH = orig_db_path
+
+
 class TestHelpTrigger(unittest.TestCase):
     def test_chinese_trigger(self):
         self.assertEqual(listener.parse_query("查詢"), {"mode": "help"})

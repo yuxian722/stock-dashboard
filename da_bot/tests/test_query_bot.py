@@ -581,6 +581,64 @@ class TestGroupChangeoverDetailReply(unittest.TestCase):
         reply = query_bot.group_changeover_detail_reply("DB", now)
         self.assertIn("MFG1台 EE1台 未知1台", reply)
 
+    def test_date_label_replaces_today_wording(self):
+        # 2026/08/10使用者要求：指定日期查詢(例如"8/9DB改機")要顯示那個
+        # 日期而不是"今日"
+        now = datetime.datetime(2026, 8, 9, 12, 0)
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": "2026-08-09", "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "s10435", "dur": 1.0},
+        ])
+        reply = query_bot.group_changeover_detail_reply("DB", now, date_label="08/09")
+        self.assertIn("【DB改機】08/09共1台", reply)
+        self.assertNotIn("今日", reply)
+
+    def test_date_label_on_empty_result(self):
+        now = datetime.datetime(2026, 8, 9, 12, 0)
+        query_bot.DB_PATH = _make_db_for_changeover_tests([])
+        reply = query_bot.group_changeover_detail_reply("DB", now, date_label="08/09")
+        self.assertIn("08/09目前沒有完成的改機紀錄", reply)
+
+
+class TestAllChangeoverReply(unittest.TestCase):
+    """「改機」查詢(不指定群組時)：列出EPOXY/LOC/FlipChip全部群組指定日期
+    (預設今日)的改機彙總(2026/08/10使用者要求)。"""
+
+    def setUp(self):
+        self._orig_db_path = query_bot.DB_PATH
+        self._orig_master_path = engineer_master.PATH
+        self._orig_master_cache = engineer_master._cache
+        engineer_master.PATH = "/tmp/does_not_exist_engineer_master_test.json"
+        engineer_master._cache = None
+
+    def tearDown(self):
+        query_bot.DB_PATH = self._orig_db_path
+        engineer_master.PATH = self._orig_master_path
+        engineer_master._cache = self._orig_master_cache
+
+    def test_lists_all_groups(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "e1", "dur": 1.0},   # DB(EPOXY)
+            {"machine_id": "BA801", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CN", "engineer_id": "e2", "dur": 1.0},    # LOC
+            {"machine_id": "BA512", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "e3", "dur": 1.0},   # FlipChip
+        ])
+        reply = query_bot.all_changeover_reply(now)
+        self.assertIn("【EPOXY改機】今日共1台", reply)
+        self.assertIn("【LOC改機】今日共1台", reply)
+        self.assertIn("【FlipChip改機】今日共1台", reply)
+
+    def test_date_label_applies_to_all_sections(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        query_bot.DB_PATH = _make_db_for_changeover_tests([])
+        reply = query_bot.all_changeover_reply(now, date_label="08/09")
+        self.assertNotIn("今日", reply)
+        self.assertEqual(reply.count("08/09目前沒有完成的改機紀錄"), 3)
+
 
 class TestWorkhoursReply(unittest.TestCase):
     """「工時」查詢：今日各工號人員修機+改機總工時(2026/08/09使用者要求)。"""
@@ -655,6 +713,25 @@ class TestWorkhoursReply(unittest.TestCase):
         engineer_master._cache = None
         reply = query_bot.workhours_reply(None, now)
         self.assertIn("s10435(王小明)  修機2.0hr", reply)
+
+    def test_date_label_replaces_today_wording(self):
+        # 2026/08/10使用者要求：指定日期查詢(例如"8/9工時")要顯示那個日期
+        # 而不是"今日"
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BA205", "e_tag": "R", "end_date": today, "end_time": "10:00",
+             "engineer_id": "s10435", "dur": 2.0},
+        ])
+        reply = query_bot.workhours_reply(None, now, date_label="08/09")
+        self.assertIn("【工時】08/09修機+改機總工時", reply)
+        self.assertNotIn("今日", reply)
+
+    def test_date_label_on_empty_result(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        query_bot.DB_PATH = _make_db_for_changeover_tests([])
+        reply = query_bot.workhours_reply("s10435", now, date_label="08/09")
+        self.assertIn("08/09目前沒有修機/改機紀錄", reply)
 
 
 if __name__ == "__main__":

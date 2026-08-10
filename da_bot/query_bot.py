@@ -877,16 +877,22 @@ def _category_avg_parts(rows):
     return parts
 
 
-def group_changeover_detail_reply(group_name: str, now: datetime.datetime = None) -> str:
+def group_changeover_detail_reply(group_name: str, now: datetime.datetime = None,
+                                   date_label: str = None) -> str:
     """
-    「<群組>改機」查詢(例如"DB改機")：今日該機型群組已完成的真正改機明細，
-    包含總台數、依CED/CEE/CD分類的平均改機工時，以及依人員(工號)分類的
-    改機台數+各分類平均工時(2026/08/09使用者要求)。「今日」跟班別對齊。
-    group_name要用內部代號(ESEC/DB/LOC/FC/EPOXY)，顯示文字會轉成
-    _CHANGEOVER_GROUP_DISPLAY對應的名稱(FC顯示成FlipChip)。
+    「<群組>改機」查詢(例如"DB改機")：指定日期(預設今日)該機型群組已完成的
+    真正改機明細，包含總台數、依CED/CEE/CD分類的平均改機工時，以及依人員
+    (工號)分類的改機台數+各分類平均工時(2026/08/09使用者要求)。「今日」/
+    指定日期跟班別對齊。group_name要用內部代號(ESEC/DB/LOC/FC/EPOXY)，
+    顯示文字會轉成_CHANGEOVER_GROUP_DISPLAY對應的名稱(FC顯示成FlipChip)。
+
+    date_label：訊息裡文字顯示用的日期字樣(例如"08/09")，不指定時顯示
+    "今日"；now要傳該日期班別日中午的datetime(呼叫端負責換算，這裡不重算)
+    (2026/08/10使用者要求支援"8/9改機"這種指定日期查詢)。
     """
     if now is None:
         now = datetime.datetime.now()
+    day_word = date_label or "今日"
     display_name = _CHANGEOVER_GROUP_DISPLAY.get(group_name, group_name)
     conn = get_conn()
     cur = conn.cursor()
@@ -894,9 +900,9 @@ def group_changeover_detail_reply(group_name: str, now: datetime.datetime = None
     conn.close()
 
     if not rows:
-        return f"{display_name}改機 今日目前沒有完成的改機紀錄"
+        return f"{display_name}改機 {day_word}目前沒有完成的改機紀錄"
 
-    lines = [f"【{display_name}改機】今日共{len(rows)}台"]
+    lines = [f"【{display_name}改機】{day_word}共{len(rows)}台"]
 
     # 早班(07:30~19:30)/夜班(19:30~次日07:30)改機台數(2026/08/10使用者要求)，
     # 跟hourly_push.get_epoxy_done_by_shift()同一套依end_time判斷班別的邏輯。
@@ -934,6 +940,27 @@ def group_changeover_detail_reply(group_name: str, now: datetime.datetime = None
     return "\n".join(lines)
 
 
+# 「改機」查詢(不指定群組時)要涵蓋的真正改機群組：EPOXY(=ESEC+DB合併顯示)/
+# LOC/FlipChip，不包含EE Maintenance資料裡查不到真正改機類別的其他群組。
+_ALL_CHANGEOVER_GROUPS = ["EPOXY", "LOC", "FC"]
+
+
+def all_changeover_reply(now: datetime.datetime = None, date_label: str = None) -> str:
+    """
+    「改機」查詢(不指定群組時，例如"8/9改機"或單獨打"改機")：列出EPOXY
+    (=ESEC+DB)/LOC/FlipChip三個真正改機群組，指定日期(預設今日)各自的
+    改機完成明細彙總(2026/08/10使用者要求)。逐一重用
+    group_changeover_detail_reply()同一套判斷邏輯串起來，不另外維護一份
+    篩選標準。
+    """
+    if now is None:
+        now = datetime.datetime.now()
+    sections = [
+        group_changeover_detail_reply(g, now, date_label) for g in _ALL_CHANGEOVER_GROUPS
+    ]
+    return "\n\n".join(sections)
+
+
 def _workhours_rows(cur, now, engineer_id=None):
     """
     回傳今日(跟班別對齊)所有e_tag屬於R(修機)/S(改機)的紀錄(e_tag/engineer_id/
@@ -968,14 +995,20 @@ def _workhours_rows(cur, now, engineer_id=None):
     return rows
 
 
-def workhours_reply(engineer_id: str = None, now: datetime.datetime = None) -> str:
+def workhours_reply(engineer_id: str = None, now: datetime.datetime = None,
+                     date_label: str = None) -> str:
     """
-    「工時」查詢：今日各工號人員的修機+改機總工時(2026/08/09使用者要求)。
-    engineer_id指定時只顯示該工號；不指定時列出今日所有有紀錄的工號，
-    依總工時由多到少排序。「今日」跟班別對齊。
+    「工時」查詢：指定日期(預設今日)各工號人員的修機+改機總工時
+    (2026/08/09使用者要求)。engineer_id指定時只顯示該工號；不指定時列出
+    當天所有有紀錄的工號，依總工時由多到少排序。「今日」/指定日期跟班別
+    對齊。
+
+    date_label：訊息裡文字顯示用的日期字樣(例如"08/09")，不指定時顯示
+    "今日"(2026/08/10使用者要求支援"8/9工時"這種指定日期查詢)。
     """
     if now is None:
         now = datetime.datetime.now()
+    day_word = date_label or "今日"
     conn = get_conn()
     cur = conn.cursor()
     rows = _workhours_rows(cur, now, engineer_id)
@@ -983,7 +1016,7 @@ def workhours_reply(engineer_id: str = None, now: datetime.datetime = None) -> s
 
     if not rows:
         target = f"{engineer_id} " if engineer_id else ""
-        return f"{target}今日目前沒有修機/改機紀錄"
+        return f"{target}{day_word}目前沒有修機/改機紀錄"
 
     by_engineer = {}
     for r in rows:
@@ -991,7 +1024,7 @@ def workhours_reply(engineer_id: str = None, now: datetime.datetime = None) -> s
         hrs = by_engineer.setdefault(eng, {"R": 0.0, "S": 0.0})
         hrs[r["e_tag"]] += r["dur"] or 0.0
 
-    lines = ["【工時】今日修機+改機總工時"]
+    lines = [f"【工時】{day_word}修機+改機總工時"]
     for eng, hrs in sorted(by_engineer.items(), key=lambda kv: -(kv[1]["R"] + kv[1]["S"])):
         total = hrs["R"] + hrs["S"]
         lines.append(

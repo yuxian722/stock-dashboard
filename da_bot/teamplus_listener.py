@@ -107,6 +107,32 @@ _CHANGEOVER_GROUP_PATTERNS = [
 _WORKHOURS_RE = re.compile(r"(?:總)?工時")
 _WORKHOURS_ENGINEER_RE = re.compile(r"([A-Za-z]?\d{4,6})\s*(?:總)?工時")
 
+# 只打群組關鍵字、沒加「改機」兩個字時(例如"8/9 DB")，一定要搭配日期才
+# 觸發成當天改機彙總查詢，不然裸的"DB"要維持原本查即時彙總(db_group_reply)
+# 的行為，這裡跟_CHANGEOVER_GROUP_PATTERNS共用同一份關鍵字清單，只是不
+# 要求後面接"改機"兩個字。
+_CHANGEOVER_GROUP_BARE_PATTERNS = [
+    (internal, _build_official_group_pattern(label)) for label, internal in _CHANGEOVER_GROUP_KEYWORDS
+]
+
+# 「8/9」這種指定日期(月/日，跟班別對齊)，可以加在「工時」「改機」「<群組>改機」
+# 這幾種查詢前後，改成查那一天的資料而不是預設的今日(2026/08/10使用者要求)。
+# 負向前瞻排除掉"8/9~8/10"這種區間寫法(區間是機台查詢既有的功能，不要互相干擾)。
+_SINGLE_DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})(?!\s*[~\-])")
+
+
+def _resolve_query_date(m):
+    """把_SINGLE_DATE_RE比對到的"8/9"這種字串轉成該班別日中午的datetime
+    (用中午是確保_shift_day_bounds()一定落在這個日期，不會因為訊息比對到
+    的時間點卡在07:30以前被誤判成前一天)。月份/日期不存在(例如"13/40")就
+    回傳None，呼叫端要能優雅忽略掉、當作沒抓到日期。"""
+    try:
+        mo, d = int(m.group(1)), int(m.group(2))
+        year = datetime.date.today().year
+        return datetime.datetime(year, mo, d, 12, 0)
+    except ValueError:
+        return None
+
 # 打這些字(整句、不含其他內容)就叫出關鍵字說明清單，忘記怎麼查的時候用
 HELP_TRIGGERS = {"查詢", "說明", "help", "指令", "用法", "選單", "?", "？"}
 
@@ -131,8 +157,11 @@ HELP_TEXT = (
     "改機明細/工時查詢：\n"
     "• <群組>改機 → 今日該群組改機台數＋CED/CEE/CD分類平均工時＋依人員(工號)分類明細\n"
     "  群組：EPOXY(=ESEC+DB) / ESEC / DB / LOC / FlipChip，例：DB改機\n"
+    "• 改機（不加群組）→ 列出今日EPOXY/LOC/FlipChip全部群組的改機彙總\n"
     "• <工號>工時 → 該工號今日修機＋改機總工時，例：s10435工時\n"
     "• 工時（不加工號） → 列出今日所有有紀錄工號的總工時\n"
+    "• 以上三種前面/後面可以加「8/9」這種日期(跟英文字母中間留個空格)，改查\n"
+    "  指定那一天，例：8/9 DB改機／8/9工時／8/9 DB\n"
     "\n"
     "官方GROUP彙總表原始數字（CPIS Utilization Analysis頁面原始列，不是我們自己逐台平均算的）：\n"
     "• <官方群組名稱>＋downrate/稼動明細/停機明細 → 例：DB800 downrate\n"
@@ -158,20 +187,52 @@ def parse_query(text):
     if text.lower() in HELP_TRIGGERS:
         return {"mode": "help"}
 
-    # 「<機型群組>改機」查詢(例如"DB改機")：今日該群組改機明細(台數+CED/CEE/CD
-    # 分類平均工時+依人員分類的台數跟平均工時，2026/08/09使用者要求)。必須排在
-    # 最前面判斷，否則"DB改機"會先被後面「DB」單獨出現的規則攔截，變成觸發
-    # db_group彙總查詢而不是這裡的改機明細查詢
+    # 「8/9」這種指定日期，可以搭配「<群組>改機」「改機」「工時」查詢
+    # (2026/08/10使用者要求)。這裡先抓出來，下面幾種模式各自決定要不要用。
+    m_date = _SINGLE_DATE_RE.search(text)
+    query_now = _resolve_query_date(m_date) if m_date else None
+    date_label = f"{query_now.month:02d}/{query_now.day:02d}" if query_now else None
+
+    # 「<機型群組>改機」查詢(例如"DB改機"、"8/9DB改機")：指定日期(預設今日)
+    # 該群組改機明細(台數+CED/CEE/CD分類平均工時+依人員分類的台數跟平均
+    # 工時，2026/08/09使用者要求)。必須排在最前面判斷，否則"DB改機"會先
+    # 被後面「DB」單獨出現的規則攔截，變成觸發db_group彙總查詢而不是這裡
+    # 的改機明細查詢
     for internal, pattern in _CHANGEOVER_GROUP_PATTERNS:
         if pattern.search(text):
-            return {"mode": "group_changeover_detail", "group_name": internal}
+            cmd = {"mode": "group_changeover_detail", "group_name": internal}
+            if query_now is not None:
+                cmd["now"], cmd["date_label"] = query_now, date_label
+            return cmd
 
-    # 「工時」查詢(例如"s10435工時"、"27512總工時"，或單獨打"工時"列出今天所有
-    # 人員)：今日該工號人員的修機+改機總工時(2026/08/09使用者要求)。也要排在
-    # 機台代號規則前面，避免"s10435"這種字串被誤判成機台代號
+    # 只打日期+群組關鍵字、沒加「改機」兩個字(例如"8/9 DB")：等同查那天
+    # 的<群組>改機彙總(2026/08/10使用者要求)。一定要先抓到日期才觸發，不然
+    # 裸的"DB"要維持原本查即時彙總(db_group_reply)的行為，不能被這裡攔截掉
+    if query_now is not None:
+        for internal, pattern in _CHANGEOVER_GROUP_BARE_PATTERNS:
+            if pattern.search(text):
+                return {"mode": "group_changeover_detail", "group_name": internal,
+                        "now": query_now, "date_label": date_label}
+
+    # 沒指定群組的「改機」查詢(例如"8/9改機"，或單獨打"改機")：列出EPOXY/LOC/
+    # FlipChip全部群組指定日期(預設今日)的改機彙總(2026/08/10使用者要求)。
+    # 排在上面兩種「有指定群組」的判斷之後，這裡才是真的沒抓到群組關鍵字。
+    if "改機" in text:
+        cmd = {"mode": "all_changeover"}
+        if query_now is not None:
+            cmd["now"], cmd["date_label"] = query_now, date_label
+        return cmd
+
+    # 「工時」查詢(例如"s10435工時"、"27512總工時"、"8/9工時"，或單獨打"工時"
+    # 列出今天所有人員)：指定日期(預設今日)該工號人員的修機+改機總工時
+    # (2026/08/09使用者要求)。也要排在機台代號規則前面，避免"s10435"這種
+    # 字串被誤判成機台代號
     if _WORKHOURS_RE.search(text):
         m = _WORKHOURS_ENGINEER_RE.search(text)
-        return {"mode": "workhours", "engineer_id": m.group(1) if m else None}
+        cmd = {"mode": "workhours", "engineer_id": m.group(1) if m else None}
+        if query_now is not None:
+            cmd["now"], cmd["date_label"] = query_now, date_label
+        return cmd
 
     # 官方GROUP彙總表數字查詢：「<官方群組名稱> + downrate/稼動明細/停機明細」關鍵字，
     # 回傳CPIS Utilization Analysis頁面最下方GROUP彙總表該群組的官方原始一列數字
@@ -286,13 +347,23 @@ def build_reply(cmd):
 
     if mode == "group_changeover_detail":
         try:
-            return query_bot.group_changeover_detail_reply(cmd["group_name"])
+            return query_bot.group_changeover_detail_reply(
+                cmd["group_name"], now=cmd.get("now"), date_label=cmd.get("date_label")
+            )
         except Exception as e:
             return f"{cmd['group_name']}改機查詢時發生錯誤: {type(e).__name__}: {e}"
 
+    if mode == "all_changeover":
+        try:
+            return query_bot.all_changeover_reply(now=cmd.get("now"), date_label=cmd.get("date_label"))
+        except Exception as e:
+            return f"改機查詢時發生錯誤: {type(e).__name__}: {e}"
+
     if mode == "workhours":
         try:
-            return query_bot.workhours_reply(cmd.get("engineer_id"))
+            return query_bot.workhours_reply(
+                cmd.get("engineer_id"), now=cmd.get("now"), date_label=cmd.get("date_label")
+            )
         except Exception as e:
             return f"工時查詢時發生錯誤: {type(e).__name__}: {e}"
 
