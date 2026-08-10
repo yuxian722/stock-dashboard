@@ -384,10 +384,12 @@ class TestPollOnceSelfAnswerLoop(unittest.TestCase):
     def setUp(self):
         self._orig_read = listener.teamplus_api.read_new_messages
         self._orig_send_bid = listener.teamplus_api.send_message_get_batch_id
+        self._orig_recent_self_sent = listener.teamplus_api.recent_self_sent_batch_ids
 
     def tearDown(self):
         listener.teamplus_api.read_new_messages = self._orig_read
         listener.teamplus_api.send_message_get_batch_id = self._orig_send_bid
+        listener.teamplus_api.recent_self_sent_batch_ids = self._orig_recent_self_sent
 
     def test_reply_containing_trigger_keywords_is_not_treated_as_new_query(self):
         # 機器人剛送出一則含有"downrate"字樣的回覆(bid="own-reply-1")，
@@ -424,6 +426,29 @@ class TestPollOnceSelfAnswerLoop(unittest.TestCase):
         listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
 
         self.assertEqual(len(sent), 1)
+
+    def test_own_hourly_push_read_back_is_not_treated_as_new_query(self):
+        # 2026/08/10使用者實測發現：整點推播(teamplus_push.py，獨立process)
+        # 送出的訊息內容剛好含有查詢關鍵字(群組名稱/日期)，讀回這則推播時
+        # 因為它的batchID從來沒被記到這個process的sent_batch_ids裡，被誤判
+        # 成新指令、多回了一則改機報告。修法是額外檢查跨process共用的
+        # teamplus_api.recent_self_sent_batch_ids()。
+        own_push_message = _msgs(
+            "【APG DA 整點推播】08/10 10:01\n🔧 今日改機統計\nEPOXY  改機6 | 改機中6 | 待改0",
+            start=1,
+        )
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: (own_push_message, "cursor-2")
+        listener.teamplus_api.recent_self_sent_batch_ids = lambda: {"b1"}
+
+        sent = []
+        listener.teamplus_api.send_message_get_batch_id = (
+            lambda message, chat_id=None: (sent.append(message) or (True, "ok", "should-not-be-called"))
+        )
+
+        state = {"cursor": "cursor-1", "sent_batch_ids": [], "recent_reply_times": []}
+        listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
+
+        self.assertEqual(sent, [])  # 不該回覆自己的推播
 
 
 class TestInitListenerStateBootstrap(unittest.TestCase):
@@ -495,8 +520,8 @@ class TestMultiRoomListening(unittest.TestCase):
         listener.teamplus_api.send_message_get_batch_id = (
             lambda message, chat_id=None: (True, "ok", f"boot-{chat_id}")
         )
-        # 額外聊天室(room-a/room-b)靜默開機，會呼叫read_new_messages(None,...)，
-        # 只有CHAT_ID才走送上線通知那條路徑(見另一個測試)
+        # 上線通知都成功時不該走到這條備援路徑，但還是給個能回應的假函式，
+        # 避免萬一意外呼叫到時整個測試因為簽章不符而報錯，模糊掉真正的問題
         listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: ([], f"cursor-{chat_id}")
 
         state = listener.init_listener_state()
@@ -505,9 +530,13 @@ class TestMultiRoomListening(unittest.TestCase):
             {listener.teamplus_api.CHAT_ID, "room-a", "room-b"},
         )
 
-    def test_extra_rooms_bootstrap_silently_without_boot_message(self):
-        # 主要聊天室(CHAT_ID)才送「已上線」通知，額外聊天室(通常是真人在用
-        # 的群組)開機時不該貼公告進去，改用靜默同步方式
+    def test_all_rooms_bootstrap_via_boot_message_not_silent_sync(self):
+        # 2026/08/10使用者實測發現：額外聊天室原本改用不留言的靜默同步方式
+        # (read_new_messages(None)，內部隨機UUID當cursor)開機，結果變成
+        # 那間聊天室之後的訊息永遠讀不到——team+對這種跟訊息紀錄無關的
+        # cursor顯然無法正確判斷「這之後有沒有新訊息」。改成全部聊天室
+        # (含額外聊天室)一律用送上線通知拿真實batchID這條可靠的路，不能
+        # 再靜默開機
         listener.teamplus_api._load_extra_chat_ids = lambda: ["room-a"]
         announced = []
 
@@ -515,16 +544,16 @@ class TestMultiRoomListening(unittest.TestCase):
             announced.append(chat_id)
             return True, "ok", f"boot-{chat_id}"
 
-        def fake_read(cursor, chat_id=None):
-            return [], f"fallback-cursor-{chat_id}"
+        def boom(cursor, chat_id=None):
+            self.fail("每間聊天室的上線通知都會成功時，不該有任何一間走到read_new_messages(None)的備援路徑")
 
         listener.teamplus_api.send_message_get_batch_id = fake_send_bid
-        listener.teamplus_api.read_new_messages = fake_read
+        listener.teamplus_api.read_new_messages = boom
 
         state = listener.init_listener_state()
-        self.assertEqual(announced, [listener.teamplus_api.CHAT_ID])  # 只有主要聊天室貼過公告
-        self.assertEqual(state["rooms"]["room-a"]["cursor"], "fallback-cursor-room-a")
-        self.assertEqual(state["rooms"]["room-a"]["sent_batch_ids"], [])
+        self.assertEqual(announced, [listener.teamplus_api.CHAT_ID, "room-a"])  # 每間都貼過公告
+        self.assertEqual(state["rooms"]["room-a"]["cursor"], "boot-room-a")
+        self.assertEqual(state["rooms"]["room-a"]["sent_batch_ids"], ["boot-room-a"])
 
     def test_poll_once_replies_in_the_same_room_the_question_came_from(self):
         listener.teamplus_api._load_extra_chat_ids = lambda: ["room-a"]

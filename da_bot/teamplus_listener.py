@@ -28,9 +28,10 @@ team+「機器人推播」室 - 即時問答監聽腳本 (08/06改版：HTTP API
 原本即時問答只在CHAT_ID(「機器人推播」室)運作。現在改成跟teamplus_push.py
 的推播共用同一份聊天室清單(config.txt的teamplus_extra_chat_ids，逗號分隔)，
 在這些額外聊天室裡問問題，機器人也會在同一間聊天室回覆。每個聊天室各自有
-獨立的cursor/自問自答保護狀態，不會互相干擾。CHAT_ID(機器人專屬房間)開機
-時會照舊貼一則「已上線」通知拿真實batchID當cursor；額外聊天室(通常是真人
-在用的群組)開機時改用靜默同步方式，不會多貼一則公告進去。
+獨立的cursor/自問自答保護狀態，不會互相干擾。每個聊天室開機時都會貼一則
+「已上線」通知、拿真實batchID當cursor(原本額外聊天室想改用不留言的靜默
+同步方式，但2026/08/10使用者實測發現那樣cursor不可靠，之後在那間聊天室
+打的訊息永遠讀不到，所以全部聊天室統一用送訊息這條可靠的路)。
 
 ════════════════════════════════════════
 08/06重大改版：改用team+ HTTP API(teamplus_api.py)，不再用Selenium操控Edge
@@ -437,39 +438,36 @@ RATE_LIMIT_WINDOW_SECONDS = 60
 BOOT_MESSAGE = "🤖 DA機器人已上線，輸入「查詢」看關鍵字說明"
 
 
-def _init_room_state(chat_id, announce):
+def _init_room_state(chat_id):
     """
     初始化單一聊天室的監聽狀態(cursor/sent_batch_ids/recent_reply_times)。
 
-    announce=True時用「先送一則已上線訊息，拿這則訊息真正的batchID(team+
-    親自確認、真實存在於訊息紀錄裡的值)當第一個cursor」開機——team+的
+    一律用「先送一則已上線訊息，拿這則訊息真正的batchID(team+親自確認、
+    真實存在於訊息紀錄裡的值)當第一個cursor」開機——team+的
     getNewestMessageList這支API，NewestBatchID傳空字串/隨便產生一個跟
     訊息紀錄無關的值，都不保證能拿到正確、穩定可用的cursor(甚至可能直接
-    被拒絕、參數錯誤)，這是同事逆向出來的teamplus_bot.py驗證過可靠的
-    開機方式，但會在該聊天室留下一則「已上線」訊息，只適合CHAT_ID這種
-    機器人專屬房間。
+    被拒絕、參數錯誤，或後續read_new_messages()永遠讀不到任何新訊息)，
+    這是同事逆向出來的teamplus_bot.py驗證過可靠的開機方式。
 
-    announce=False時改用靜默的備援同步方式(read_new_messages(None)，
-    teamplus_api內部會自動用隨機UUID當NewestBatchID)，不會留言，但cursor
-    可靠性較差；用在額外聊天室(2026/08/10使用者要求即時問答也要支援
-    config.txt裡teamplus_extra_chat_ids設定的聊天室)，不要每次重啟服務
-    就洗一則公告進真人在用的群組。
+    2026/08/10使用者實測發現：額外聊天室原本為了不留言、改用「靜默同步
+    (read_new_messages(None)，內部用隨機UUID當cursor)」開機，結果變成
+    那兩間聊天室之後打的訊息永遠讀不到——team+對這種跟訊息紀錄無關的
+    隨機cursor顯然無法正確判斷「這之後有沒有新訊息」，會議記錄可靠性 >
+    避免多貼一行「已上線」，所以全部聊天室統一改回送訊息拿真實batchID
+    這條路。
 
-    如果announce=True但上線通知送失敗(例如cookie過期)，一樣退回用
-    read_new_messages(None)，讓服務還能啟動、之後靠[警告]訊息提示需要
-    重新抓cookie。
+    如果上線通知送失敗(例如cookie過期)，退回用read_new_messages(None)，
+    讓服務還能啟動、之後靠[警告]訊息提示需要重新抓cookie。
     """
-    if announce:
-        ok, desc, bid = teamplus_api.send_message_get_batch_id(BOOT_MESSAGE, chat_id=chat_id)
-        if ok:
-            print(f"[啟動] 聊天室{chat_id}已送出上線通知，之後只會回應這則之後才出現的新訊息")
-            return {
-                "cursor": bid,
-                "sent_batch_ids": [bid],  # 記住機器人自己送出的訊息的BatchID，避免自問自答
-                "recent_reply_times": [],  # 防暴衝保護用的時間戳記錄
-            }
-        print(f"[警告] 聊天室{chat_id}上線通知送出失敗({desc})，改用備援方式啟動")
-
+    ok, desc, bid = teamplus_api.send_message_get_batch_id(BOOT_MESSAGE, chat_id=chat_id)
+    if ok:
+        print(f"[啟動] 聊天室{chat_id}已送出上線通知，之後只會回應這則之後才出現的新訊息")
+        return {
+            "cursor": bid,
+            "sent_batch_ids": [bid],  # 記住機器人自己送出的訊息的BatchID，避免自問自答
+            "recent_reply_times": [],  # 防暴衝保護用的時間戳記錄
+        }
+    print(f"[警告] 聊天室{chat_id}上線通知送出失敗({desc})，改用備援方式啟動")
     messages, cursor = teamplus_api.read_new_messages(None, chat_id=chat_id)
     print(f"[啟動] 聊天室{chat_id}已同步至最新訊息(略過{len(messages)}則既有訊息)，之後只會回應新出現的訊息")
     return {"cursor": cursor, "sent_batch_ids": [], "recent_reply_times": []}
@@ -487,11 +485,7 @@ def init_listener_state():
 
     回傳{"rooms": {chat_id: {cursor/sent_batch_ids/recent_reply_times}, ...}}。
     """
-    rooms = {}
-    for chat_id in teamplus_api.all_chat_ids():
-        # 只有CHAT_ID(機器人推播室)用會留言的開機方式，額外聊天室靜默開機
-        rooms[chat_id] = _init_room_state(chat_id, announce=(chat_id == teamplus_api.CHAT_ID))
-    return {"rooms": rooms}
+    return {"rooms": {chat_id: _init_room_state(chat_id) for chat_id in teamplus_api.all_chat_ids()}}
 
 
 def _poll_room_once(chat_id, room_state):
@@ -506,6 +500,12 @@ def _poll_room_once(chat_id, room_state):
 
     sent_batch_ids = room_state["sent_batch_ids"]
     recent_reply_times = room_state["recent_reply_times"]
+    # 整點推播(teamplus_push.py)是獨立的process(run_pipeline.py用subprocess
+    # 執行)，跟這裡的sent_batch_ids是不同process的記憶體，互相看不到彼此
+    # 送出的訊息。2026/08/10使用者實測發現：推播內容剛好含有查詢關鍵字
+    # (群組名稱/日期)，讀回自己的推播訊息時被誤判成新指令、多回了一則
+    # 報告。額外檢查這份跨process共用的記錄(見teamplus_api.broadcast_message())。
+    cross_process_sent_ids = teamplus_api.recent_self_sent_batch_ids()
 
     for msg in new_messages:
         text = msg["text"]
@@ -519,6 +519,8 @@ def _poll_room_once(chat_id, room_state):
         # 就是靠BatchID識別、不是比對文字，這裡照做)。
         if bid and bid in sent_batch_ids:
             sent_batch_ids.remove(bid)
+            continue
+        if bid and bid in cross_process_sent_ids:
             continue
 
         cmd = parse_query(text)

@@ -5,6 +5,7 @@
 import conftest  # noqa: F401  (設定 sys.path)
 
 import json
+import tempfile
 import unittest
 
 import teamplus_api
@@ -334,23 +335,32 @@ class TestAllChatIds(unittest.TestCase):
 
 
 class TestBroadcastMessage(unittest.TestCase):
+    """broadcast_message()改用send_message_get_batch_id()(不是send_message())，
+    這樣才能拿到batchID記進recent_self_sent_batch_ids()共用檔案，讓
+    (通常是不同process的)即時問答監聽認得出這是自己推播送出的訊息
+    (2026/08/10使用者實測發現：整點推播內容剛好含有查詢關鍵字，被監聽端
+    誤判成新指令、多回了一則報告)。"""
+
     def setUp(self):
-        self._orig_send = teamplus_api.send_message
+        self._orig_send_bid = teamplus_api.send_message_get_batch_id
         self._orig_extra = teamplus_api._load_extra_chat_ids
+        self._orig_log_path = teamplus_api.SELF_SENT_LOG_PATH
+        teamplus_api.SELF_SENT_LOG_PATH = tempfile.mktemp(suffix=".log")
 
     def tearDown(self):
-        teamplus_api.send_message = self._orig_send
+        teamplus_api.send_message_get_batch_id = self._orig_send_bid
         teamplus_api._load_extra_chat_ids = self._orig_extra
+        teamplus_api.SELF_SENT_LOG_PATH = self._orig_log_path
 
     def test_sends_to_default_room_when_no_extra_configured(self):
         teamplus_api._load_extra_chat_ids = lambda: []
         calls = []
 
-        def fake_send(message, chat_id=None):
+        def fake_send_bid(message, chat_id=None):
             calls.append(chat_id)
-            return True, "ok"
+            return True, "ok", f"bid-{chat_id}"
 
-        teamplus_api.send_message = fake_send
+        teamplus_api.send_message_get_batch_id = fake_send_bid
         results = teamplus_api.broadcast_message("hello")
         self.assertEqual(calls, [teamplus_api.CHAT_ID])
         self.assertEqual(results, [(teamplus_api.CHAT_ID, True, "ok")])
@@ -359,11 +369,11 @@ class TestBroadcastMessage(unittest.TestCase):
         teamplus_api._load_extra_chat_ids = lambda: ["room-a", "room-b"]
         calls = []
 
-        def fake_send(message, chat_id=None):
+        def fake_send_bid(message, chat_id=None):
             calls.append(chat_id)
-            return True, "ok"
+            return True, "ok", f"bid-{chat_id}"
 
-        teamplus_api.send_message = fake_send
+        teamplus_api.send_message_get_batch_id = fake_send_bid
         results = teamplus_api.broadcast_message("hello")
         self.assertEqual(calls, [teamplus_api.CHAT_ID, "room-a", "room-b"])
         self.assertEqual(len(results), 3)
@@ -371,17 +381,63 @@ class TestBroadcastMessage(unittest.TestCase):
     def test_reports_individual_room_failures(self):
         teamplus_api._load_extra_chat_ids = lambda: ["room-a"]
 
-        def fake_send(message, chat_id=None):
+        def fake_send_bid(message, chat_id=None):
             if chat_id == "room-a":
-                return False, "cookie過期"
-            return True, "ok"
+                return False, "cookie過期", "unused-bid"
+            return True, "ok", f"bid-{chat_id}"
 
-        teamplus_api.send_message = fake_send
+        teamplus_api.send_message_get_batch_id = fake_send_bid
         results = teamplus_api.broadcast_message("hello")
         self.assertEqual(
             results,
             [(teamplus_api.CHAT_ID, True, "ok"), ("room-a", False, "cookie過期")],
         )
+
+    def test_successful_sends_recorded_for_cross_process_self_answer_check(self):
+        teamplus_api._load_extra_chat_ids = lambda: []
+        teamplus_api.send_message_get_batch_id = (
+            lambda message, chat_id=None: (True, "ok", "push-bid-123")
+        )
+        teamplus_api.broadcast_message("整點推播內容")
+        self.assertIn("push-bid-123", teamplus_api.recent_self_sent_batch_ids())
+
+    def test_failed_send_not_recorded(self):
+        teamplus_api._load_extra_chat_ids = lambda: []
+        teamplus_api.send_message_get_batch_id = (
+            lambda message, chat_id=None: (False, "cookie過期", "unused-bid")
+        )
+        teamplus_api.broadcast_message("整點推播內容")
+        self.assertNotIn("unused-bid", teamplus_api.recent_self_sent_batch_ids())
+
+
+class TestSelfSentBatchIdLog(unittest.TestCase):
+    """_record_self_sent_batch_id()/recent_self_sent_batch_ids()：跨process
+    共用的「自己送出過的訊息BatchID」記錄，給即時問答監聽認出整點推播
+    (獨立process)送出的訊息，避免誤判成新指令。"""
+
+    def setUp(self):
+        self._orig_log_path = teamplus_api.SELF_SENT_LOG_PATH
+        teamplus_api.SELF_SENT_LOG_PATH = tempfile.mktemp(suffix=".log")
+
+    def tearDown(self):
+        teamplus_api.SELF_SENT_LOG_PATH = self._orig_log_path
+
+    def test_missing_file_returns_empty_set(self):
+        self.assertEqual(teamplus_api.recent_self_sent_batch_ids(), set())
+
+    def test_records_and_reads_back(self):
+        teamplus_api._record_self_sent_batch_id("bid-1")
+        teamplus_api._record_self_sent_batch_id("bid-2")
+        self.assertEqual(teamplus_api.recent_self_sent_batch_ids(), {"bid-1", "bid-2"})
+
+    def test_trims_to_keep_limit(self):
+        for i in range(teamplus_api._SELF_SENT_LOG_KEEP + 10):
+            teamplus_api._record_self_sent_batch_id(f"bid-{i}")
+        recorded = teamplus_api.recent_self_sent_batch_ids()
+        self.assertEqual(len(recorded), teamplus_api._SELF_SENT_LOG_KEEP)
+        # 最新的那筆一定還在，最舊的那幾筆應該已經被修剪掉
+        self.assertIn(f"bid-{teamplus_api._SELF_SENT_LOG_KEEP + 9}", recorded)
+        self.assertNotIn("bid-0", recorded)
 
 
 if __name__ == "__main__":

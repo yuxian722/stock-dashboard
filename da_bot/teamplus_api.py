@@ -266,15 +266,67 @@ def send_message_get_batch_id(message, chat_id=None):
     return ok, desc, bid
 
 
+SELF_SENT_LOG_PATH = os.path.join(SCRIPT_DIR, "sent_batch_ids.log")
+_SELF_SENT_LOG_KEEP = 200
+
+
+def _record_self_sent_batch_id(bid):
+    """
+    把自己送出的訊息的BatchID記到硬碟上的檔案(SELF_SENT_LOG_PATH)，跨
+    process共用。整點推播(teamplus_push.py，透過run_pipeline.py用
+    subprocess執行，是獨立的process)送出的訊息，跟teamplus_listener.py
+    (或da_bot_service.py合併服務)的即時問答監聽是不同的process，各自
+    在記憶體裡的sent_batch_ids互相看不到——2026/08/10使用者實測發現：
+    整點推播的內容剛好含有查詢關鍵字(群組名稱、日期)，監聽端讀回這則
+    推播訊息時，因為推播的batchID從來沒被記錄過，被誤判成新指令，自動
+    回覆了一則多餘的改機報告。這裡改成推播送出後也把batchID寫進共用檔案，
+    監聽端讀訊息時額外檢查這份清單，就能認出「這也是我們自己送的」。
+
+    只保留最後_SELF_SENT_LOG_KEEP筆，避免檔案無限成長；寫檔失敗(例如
+    磁碟權限問題)靜默略過，不影響推播本身送出成功與否。
+    """
+    try:
+        with open(SELF_SENT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(bid + "\n")
+        with open(SELF_SENT_LOG_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) > _SELF_SENT_LOG_KEEP:
+            with open(SELF_SENT_LOG_PATH, "w", encoding="utf-8") as f:
+                f.writelines(lines[-_SELF_SENT_LOG_KEEP:])
+    except OSError:
+        pass
+
+
+def recent_self_sent_batch_ids():
+    """
+    回傳_record_self_sent_batch_id()記錄過的BatchID集合，給
+    teamplus_listener.py跨process檢查「這則訊息是不是我們自己(不管是
+    推播還是問答監聽哪個process)送的」用。檔案不存在/讀取失敗回傳空
+    集合，不會讓呼叫端掛掉。
+    """
+    try:
+        with open(SELF_SENT_LOG_PATH, "r", encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except OSError:
+        return set()
+
+
 def broadcast_message(message):
     """
     送到CHAT_ID(機器人推播室)以及config.txt裡teamplus_extra_chat_ids設定的所有
     額外聊天室。回傳list of (chat_id, ok, desc)，方便呼叫端逐一檢查有沒有哪個
     房間送失敗。沒設定額外聊天室時，效果等同只呼叫send_message(message)一次。
+
+    送出成功的每一則都會把batchID記進recent_self_sent_batch_ids()共用的
+    檔案，讓即時問答監聽(通常是不同的process)能認出這是自己推播送出的
+    訊息，不會誤判成新指令、自動回覆一則多餘的報告
+    (見_record_self_sent_batch_id())。
     """
     results = []
     for chat_id in all_chat_ids():
-        ok, desc = send_message(message, chat_id=chat_id)
+        ok, desc, bid = send_message_get_batch_id(message, chat_id=chat_id)
+        if ok:
+            _record_self_sent_batch_id(bid)
         results.append((chat_id, ok, desc))
     return results
 
