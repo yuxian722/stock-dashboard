@@ -28,9 +28,14 @@ team+這部分的穩定性應該會好非常多。
     到目標聊天室畫面，用同樣的F12方式抓出該室的ChatID(網路分頁->送訊息的
     請求->表單資料裡的ChatID欄位)，填進config.txt的teamplus_extra_chat_ids
     (逗號分隔，可以填多個)，broadcast_message()就會一起送。沒設定的話維持
-    只送到CHAT_ID(機器人推播室)這一間，行為跟改版前一樣。
+    只送到CHAT_ID(機器人推播室)這一間，行為跟改版前一樣。群組聊天室跟
+    跟同事的1對1個人對話都可以填，不用另外標註是哪一種——P2P對話的
+    ChatID格式固定是"{自己的Mobile}_{對方Mobile}"(例如"903_1631")，
+    程式會自動判斷、換成正確的ChannelType/Recipients(2026/08/10使用者
+    實測發現：1對1對話原本用固定的群組ChannelType=1會讀不到/送不出去)。
 """
 import os
+import re
 import sys
 import json
 import uuid
@@ -56,6 +61,29 @@ RECIPIENTS = [{"Mobile": "903", "Email": ""}]
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
 _SSL_CTX.verify_mode = ssl.CERT_NONE
+
+# team+的一對一個人對話(P2P)跟群組聊天室(含「機器人推播」這種自己專屬的
+# 頻道)，送/讀訊息時要帶的ChannelType跟Recipients不一樣：群組是
+# ChannelType=1、Recipients帶自己的Mobile；P2P是ChannelType=0、Recipients
+# 要帶「對方」的Mobile。2026/08/10使用者實測發現：額外聊天室裡如果填的是
+# 跟同事的1對1對話(例如ChatID"903_1631"，這是APG_DA班長那個人)，用原本
+# 寫死的ChannelType=1會讀不到/送不出去。
+#
+# team+的P2P對話ChatID剛好就是"{我的Mobile}_{對方Mobile}"這種格式(F12
+# 實測驗證過)，不需要使用者額外在config.txt裡標註是群組還是P2P，直接從
+# ChatID的形狀自動判斷就好。
+_P2P_CHAT_ID_RE = re.compile(r"^(\d+)_(\d+)$")
+
+
+def _channel_info_for_chat(chat_id):
+    """依ChatID格式判斷這是群組(ChannelType=1)還是跟某人的1對1對話
+    (ChannelType=0，Recipients要換成對方的Mobile)，回傳(channel_type,
+    recipients)。判斷不出來(不符合P2P格式，或前半段不是自己的Mobile)一律
+    當群組處理，維持原本的行為。"""
+    m = _P2P_CHAT_ID_RE.match(chat_id or "")
+    if m and m.group(1) == MOBILE:
+        return "0", [{"Mobile": m.group(2), "Email": ""}]
+    return CHANNEL_TYPE, RECIPIENTS
 
 
 def load_cookie():
@@ -96,11 +124,13 @@ def read_new_messages(cursor=None, chat_id=None):
     """
     cookie = load_cookie()
     effective_cursor = cursor or str(uuid.uuid4())
+    effective_chat_id = chat_id or CHAT_ID
+    channel_type, _ = _channel_info_for_chat(effective_chat_id)
     body = urllib.parse.urlencode({
         "action": "getNewestMessageList",
-        "ChannelType": CHANNEL_TYPE,
+        "ChannelType": channel_type,
         "Mobile": MOBILE,
-        "ChatID": chat_id or CHAT_ID,
+        "ChatID": effective_chat_id,
         "NewestBatchID": effective_cursor,
         "FromNearline": "false",
         "LoadCount": "25",
@@ -175,12 +205,14 @@ def _send(message, chat_id, batch_id):
     """實際送出訊息的底層邏輯，batch_id由呼叫端決定(送訊息時自己產生的批次ID，
     team+會直接拿這個值當這則訊息的BatchID)。回傳 (ok: bool, desc: str)。"""
     cookie = load_cookie()
+    effective_chat_id = chat_id or CHAT_ID
+    channel_type, recipients = _channel_info_for_chat(effective_chat_id)
     data = {
         "action": "sendChatMessage",
         "batchID": batch_id,
-        "ChannelType": CHANNEL_TYPE,
-        "ChatID": chat_id or CHAT_ID,
-        "Recipients": json.dumps(RECIPIENTS, ensure_ascii=False, separators=(",", ":")),
+        "ChannelType": channel_type,
+        "ChatID": effective_chat_id,
+        "Recipients": json.dumps(recipients, ensure_ascii=False, separators=(",", ":")),
         "GroupList": "[]",
         "MsgContent": message,
         "Content2": "",

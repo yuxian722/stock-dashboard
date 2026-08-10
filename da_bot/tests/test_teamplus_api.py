@@ -164,6 +164,61 @@ class TestReadNewMessagesCursorBootstrap(unittest.TestCase):
         teamplus_api.read_new_messages(None)
         self.assertEqual(captured["ChatID"], teamplus_api.CHAT_ID)
 
+    def test_p2p_chat_id_sends_channel_type_zero(self):
+        # 2026/08/10使用者實測發現：跟同事的1對1對話(ChatID格式"我的Mobile_
+        # 對方Mobile")原本用固定的群組ChannelType=1會讀不到訊息，要自動判斷
+        # 換成ChannelType=0
+        captured = {}
+
+        def fake_urlopen(req, context=None, timeout=None):
+            body = req.data.decode("utf-8")
+            captured["ChannelType"] = teamplus_api.urllib.parse.parse_qs(body)["ChannelType"][0]
+            return _FakeResponse({"IsSuccess": True, "MessageList": [], "Description": "查無資料"})
+
+        teamplus_api.urllib.request.urlopen = fake_urlopen
+        teamplus_api.read_new_messages(None, chat_id=f"{teamplus_api.MOBILE}_1631")
+        self.assertEqual(captured["ChannelType"], "0")
+
+    def test_group_chat_id_still_sends_channel_type_one(self):
+        captured = {}
+
+        def fake_urlopen(req, context=None, timeout=None):
+            body = req.data.decode("utf-8")
+            captured["ChannelType"] = teamplus_api.urllib.parse.parse_qs(body)["ChannelType"][0]
+            return _FakeResponse({"IsSuccess": True, "MessageList": [], "Description": "查無資料"})
+
+        teamplus_api.urllib.request.urlopen = fake_urlopen
+        teamplus_api.read_new_messages(None, chat_id="F505A503-B077-489C-B596-AF9C52FF6224")
+        self.assertEqual(captured["ChannelType"], "1")
+
+
+class TestChannelInfoForChat(unittest.TestCase):
+    """_channel_info_for_chat()：依ChatID格式自動判斷群組(ChannelType=1)
+    還是1對1個人對話(ChannelType=0，Recipients換成對方Mobile)。"""
+
+    def test_p2p_format_matching_own_mobile_detected(self):
+        channel_type, recipients = teamplus_api._channel_info_for_chat(f"{teamplus_api.MOBILE}_1631")
+        self.assertEqual(channel_type, "0")
+        self.assertEqual(recipients, [{"Mobile": "1631", "Email": ""}])
+
+    def test_guid_chat_id_treated_as_group(self):
+        channel_type, recipients = teamplus_api._channel_info_for_chat(
+            "F505A503-B077-489C-B596-AF9C52FF6224"
+        )
+        self.assertEqual(channel_type, teamplus_api.CHANNEL_TYPE)
+        self.assertEqual(recipients, teamplus_api.RECIPIENTS)
+
+    def test_underscore_format_not_matching_own_mobile_treated_as_group(self):
+        # 前半段不是自己的Mobile，不符合P2P的假設，安全起見當群組處理
+        channel_type, recipients = teamplus_api._channel_info_for_chat("1631_903")
+        self.assertEqual(channel_type, teamplus_api.CHANNEL_TYPE)
+
+    def test_none_or_empty_treated_as_group(self):
+        channel_type, recipients = teamplus_api._channel_info_for_chat(None)
+        self.assertEqual(channel_type, teamplus_api.CHANNEL_TYPE)
+        channel_type, recipients = teamplus_api._channel_info_for_chat("")
+        self.assertEqual(channel_type, teamplus_api.CHANNEL_TYPE)
+
 
 class TestSendMessageGetBatchId(unittest.TestCase):
     """同事的teamplus_bot.py開機時靠「送一則上線通知、拿這則訊息真正的
@@ -202,6 +257,34 @@ class TestSendMessageGetBatchId(unittest.TestCase):
         ok, desc, bid = teamplus_api.send_message_get_batch_id("上線通知")
         self.assertFalse(ok)
         self.assertTrue(bid)
+
+    def test_p2p_chat_id_sends_other_partys_mobile_as_recipient(self):
+        # 2026/08/10使用者實測發現：P2P對話送出去的Recipients要帶對方的
+        # Mobile，不是固定帶自己的903，不然訊息送不出去/對方收不到
+        captured = {}
+
+        def fake_urlopen(req, context=None, timeout=None):
+            body = req.data.decode("utf-8")
+            captured["Recipients"] = teamplus_api.urllib.parse.parse_qs(body)["Recipients"][0]
+            captured["ChannelType"] = teamplus_api.urllib.parse.parse_qs(body)["ChannelType"][0]
+            return _FakeResponse({"IsSuccess": True})
+
+        teamplus_api.urllib.request.urlopen = fake_urlopen
+        teamplus_api.send_message_get_batch_id("測試訊息", chat_id=f"{teamplus_api.MOBILE}_1631")
+        self.assertEqual(captured["ChannelType"], "0")
+        self.assertIn('"Mobile":"1631"', captured["Recipients"])
+
+    def test_group_chat_id_still_sends_own_mobile_as_recipient(self):
+        captured = {}
+
+        def fake_urlopen(req, context=None, timeout=None):
+            body = req.data.decode("utf-8")
+            captured["Recipients"] = teamplus_api.urllib.parse.parse_qs(body)["Recipients"][0]
+            return _FakeResponse({"IsSuccess": True})
+
+        teamplus_api.urllib.request.urlopen = fake_urlopen
+        teamplus_api.send_message_get_batch_id("測試訊息", chat_id="F505A503-B077-489C-B596-AF9C52FF6224")
+        self.assertIn(f'"Mobile":"{teamplus_api.MOBILE}"', captured["Recipients"])
 
 
 class TestLoadExtraChatIds(unittest.TestCase):
