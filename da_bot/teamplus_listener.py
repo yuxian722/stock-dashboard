@@ -107,13 +107,30 @@ _CHANGEOVER_GROUP_KEYWORDS = [
 ]
 
 
-def _build_changeover_group_pattern(label):
+def _build_group_suffix_pattern(label, suffix):
+    """跟_build_official_group_pattern()類似，但關鍵字尾巴要接固定的動作字樣
+    (改機/修機/產品)，不是單純比對群組名稱本身。"""
     escaped = re.escape(label).replace(r"\ ", r"\s*")
-    return re.compile(r"(?<![A-Za-z0-9])" + escaped + r"\s*改機(?![A-Za-z0-9])", re.IGNORECASE)
+    return re.compile(r"(?<![A-Za-z0-9])" + escaped + r"\s*" + suffix + r"(?![A-Za-z0-9])", re.IGNORECASE)
 
 
 _CHANGEOVER_GROUP_PATTERNS = [
-    (internal, _build_changeover_group_pattern(label)) for label, internal in _CHANGEOVER_GROUP_KEYWORDS
+    (internal, _build_group_suffix_pattern(label, "改機")) for label, internal in _CHANGEOVER_GROUP_KEYWORDS
+]
+
+# 「<機型群組>修機」查詢(例如"2100修機"、"2100 修機")：今日該群組依修機
+# code分類的次數統計，每個code底下再列出各機台各自修了幾次(2026/08/10
+# 使用者要求)。跟_CHANGEOVER_GROUP_PATTERNS共用同一份群組別名清單，只是
+# 動作字樣換成「修機」。
+_REPAIR_GROUP_PATTERNS = [
+    (internal, _build_group_suffix_pattern(label, "修機")) for label, internal in _CHANGEOVER_GROUP_KEYWORDS
+]
+
+# 「<機型群組>產品」查詢(例如"DB產品"、"2100產品"、"LOC產品")：列出該群組
+# 每台機台目前是「加熱」還是「畫膠」產品(2026/08/10使用者要求)。同樣共用
+# 群組別名清單，動作字樣換成「產品」。
+_PRODUCT_GROUP_PATTERNS = [
+    (internal, _build_group_suffix_pattern(label, "產品")) for label, internal in _CHANGEOVER_GROUP_KEYWORDS
 ]
 
 # 「工時」查詢(例如"s10435工時"、"27512總工時")：今日該工號人員的修機+改機
@@ -179,7 +196,11 @@ HELP_TEXT = (
     "  加「歷史」→ 不限日期，查這台機台全部歷史紀錄，例：BAA02改機歷史\n"
     "• <工號>工時 → 該工號今日修機＋改機總工時，例：s10435工時\n"
     "• 工時（不加工號） → 列出今日所有有紀錄工號的總工時\n"
-    "• 以上（機台改機歷史除外）前面/後面可以加「8/9」這種日期(跟英文字母中間留個空格)，\n"
+    "• <群組>修機 → 今日該群組依修機代碼(code)分類的次數統計，每個代碼底下再列出\n"
+    "  各機台各自修了幾次，例：2100修機／2100 修機\n"
+    "• <群組>產品 → 該群組每台機台目前是「加熱」還是「畫膠」產品(依最後一次真正\n"
+    "  改機判斷，不是當天限定)，例：DB產品／2100產品／LOC產品(LOC全部都是加熱)\n"
+    "• 以上（機台改機歷史、群組產品除外）前面/後面可以加「8/9」這種日期(跟英文字母中間留個空格)，\n"
     "  改查指定那一天，例：8/9 DB改機／8/9工時／8/9 DB／8/9 BAA02改機\n"
     "\n"
     "官方GROUP彙總表原始數字（CPIS Utilization Analysis頁面原始列，不是我們自己逐台平均算的）：\n"
@@ -226,6 +247,25 @@ def parse_query(text):
             if query_now is not None:
                 cmd["now"], cmd["date_label"] = query_now, date_label
             return cmd
+
+    # 「<機型群組>修機」查詢(例如"2100修機"、"2100 修機")：指定日期(預設
+    # 今日)該群組依修機code分類的次數統計+每個code底下各機台的次數
+    # (2026/08/10使用者要求)。要排在上面「改機」判斷之後，避免動作字樣
+    # 判斷順序反過來影響到彼此(兩者關鍵字不同不會真的衝突，但保持一致)
+    for internal, pattern in _REPAIR_GROUP_PATTERNS:
+        if pattern.search(text):
+            cmd = {"mode": "group_repair_detail", "group_name": internal}
+            if query_now is not None:
+                cmd["now"], cmd["date_label"] = query_now, date_label
+            return cmd
+
+    # 「<機型群組>產品」查詢(例如"DB產品"、"2100產品"、"LOC產品")：列出該
+    # 群組每台機台目前是「加熱」還是「畫膠」產品(2026/08/10使用者要求)。
+    # 不支援指定日期——查的是機台「目前」的產品設定(最後一次真正改機決定
+    # 的，不是當天限定)，沒有「今日」的概念可以切換。
+    for internal, pattern in _PRODUCT_GROUP_PATTERNS:
+        if pattern.search(text):
+            return {"mode": "group_product_type", "group_name": internal}
 
     # 只打日期+群組關鍵字、沒加「改機」兩個字(例如"8/9 DB")：等同查那天
     # 的<群組>改機彙總(2026/08/10使用者要求)。一定要先抓到日期才觸發，不然
@@ -427,6 +467,20 @@ def build_reply(cmd):
             )
         except Exception as e:
             return f"{cmd['group_name']}改機查詢時發生錯誤: {type(e).__name__}: {e}"
+
+    if mode == "group_repair_detail":
+        try:
+            return query_bot.group_repair_detail_reply(
+                cmd["group_name"], now=cmd.get("now"), date_label=cmd.get("date_label")
+            )
+        except Exception as e:
+            return f"{cmd['group_name']}修機查詢時發生錯誤: {type(e).__name__}: {e}"
+
+    if mode == "group_product_type":
+        try:
+            return query_bot.group_product_type_reply(cmd["group_name"])
+        except Exception as e:
+            return f"{cmd['group_name']}產品查詢時發生錯誤: {type(e).__name__}: {e}"
 
     if mode == "all_changeover":
         try:

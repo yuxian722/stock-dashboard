@@ -1229,6 +1229,183 @@ def all_changeover_reply(now: datetime.datetime = None, date_label: str = None) 
     return "\n\n".join(sections)
 
 
+def _repair_rows_for_group(cur, group_name, now):
+    """
+    回傳指定機型群組今日(跟班別對齊)已完成的修機(e_tag='R')紀錄原始列
+    (machine_id/job_code/dur/wait_dur)，group_name="EPOXY"時涵蓋ESEC+DB
+    (2026/08/10使用者要求「<群組>修機」查詢：依修機code分類的次數統計)。
+
+    修機的job_code不像改機有CED/CEE/CD這種固定分類標準，這裡不篩選、
+    全部e_tag='R'紀錄都算，直接依job_code原始值分組(呼叫端負責分組)。
+    """
+    shift_date, next_date = hourly_push._shift_day_bounds(now)
+    cur.execute("""
+        SELECT DISTINCT machine_id, bgn_date, bgn_time, end_date, end_time, job_code, dur, wait_dur
+        FROM ee_maintenance_record
+        WHERE e_tag = 'R' AND (
+            (end_date = ? AND end_time >= ?)
+            OR (end_date = ? AND end_time < ?)
+        )
+    """, (shift_date, hourly_push.SHIFT_CHANGE_TIME, next_date, hourly_push.SHIFT_CHANGE_TIME))
+
+    rows = []
+    for r in cur.fetchall():
+        g = hourly_push._group_for_machine(r["machine_id"])
+        if group_name == "EPOXY":
+            if g not in ("ESEC", "DB"):
+                continue
+        elif g != group_name:
+            continue
+        rows.append({
+            "machine_id": r["machine_id"], "job_code": r["job_code"] or "未分類",
+            "dur": r["dur"], "wait_dur": r["wait_dur"],
+        })
+    return rows
+
+
+def _repair_stat_suffix(rows):
+    """把一批修機紀錄的dur(in-repair時間)/wait_dur(等待修機時間)平均起來，
+    組成"平均in-repair1.20hr 平均wait0.50hr"這種字串，兩者都沒有資料時
+    回傳空字串。"""
+    avg_dur = _avg(r["dur"] for r in rows)
+    avg_wait = _avg(r["wait_dur"] for r in rows)
+    parts = []
+    if avg_dur is not None:
+        parts.append(f"平均in-repair{avg_dur:.2f}hr")
+    if avg_wait is not None:
+        parts.append(f"平均wait{avg_wait:.2f}hr")
+    return " ".join(parts)
+
+
+def group_repair_detail_reply(group_name: str, now: datetime.datetime = None,
+                               date_label: str = None) -> str:
+    """
+    「<群組>修機」查詢(2026/08/10使用者要求，例："2100 修機"要列出每個
+    修機code、該code群組總次數、以及各機台各自修了幾次)：指定日期(預設
+    今日)該機型群組已完成的修機明細，依修機code分類，每個code底下再列出
+    各機台的次數+平均in-repair時間+平均等待修機(wait)時間。
+
+    group_name要用內部代號(ESEC/DB/LOC/FC/EPOXY)，跟group_changeover_
+    detail_reply()同一套；「今日」/指定日期跟班別對齊，now/date_label
+    語意也跟改機查詢一致。
+    """
+    if now is None:
+        now = datetime.datetime.now()
+    day_word = date_label or "今日"
+    display_name = _CHANGEOVER_GROUP_DISPLAY.get(group_name, group_name)
+    conn = get_conn()
+    cur = conn.cursor()
+    rows = _repair_rows_for_group(cur, group_name, now)
+    conn.close()
+
+    if not rows:
+        return f"{display_name}修機 {day_word}目前沒有完成的修機紀錄"
+
+    lines = [f"【{display_name}修機】{day_word}共{len(rows)}次"]
+
+    by_code = {}
+    for r in rows:
+        by_code.setdefault(r["job_code"], []).append(r)
+
+    for code, code_rows in sorted(by_code.items(), key=lambda kv: -len(kv[1])):
+        lines.append("")
+        suffix = _repair_stat_suffix(code_rows)
+        lines.append(f"{code}  修總次數{len(code_rows)}" + (f"  {suffix}" if suffix else ""))
+
+        by_machine = {}
+        for r in code_rows:
+            by_machine.setdefault(r["machine_id"], []).append(r)
+        for mid, m_rows in sorted(by_machine.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            m_suffix = _repair_stat_suffix(m_rows)
+            lines.append(f"  {mid}  修{len(m_rows)}次" + (f"  {m_suffix}" if m_suffix else ""))
+
+    return "\n".join(lines)
+
+
+# 「<群組>產品」查詢要用真實機台清單，但改機內部代號(ESEC/DB/LOC/EPOXY)
+# 跟MODEL_GROUPS的key是兩套不同命名(見_group_machine_ids()註解)，這裡對照
+# 過去，才能拿到_group_machine_ids()能認得的名稱。FC(FlipChip)目前沒有
+# 對應的MODEL_GROUPS清單，先不支援。
+_CHANGEOVER_TO_MODEL_GROUP = {
+    "DB": "EPOXY(DB)", "ESEC": "Esec2100", "LOC": "CM700", "EPOXY": "Epoxy",
+}
+
+
+def _latest_changeover_jcode(cur, machine_id):
+    """查該機台最新一筆已完成改機(e_tag='S')的job_code，不限日期——要找的
+    是「機台目前的產品設定」，是機台歷史上最後一次真正改機決定的，不是
+    當天限定(2026/08/10使用者要求「<群組>產品」查詢用)。查無紀錄回傳None。
+    """
+    cur.execute("""
+        SELECT job_code FROM ee_maintenance_record
+        WHERE machine_id = ? AND e_tag = 'S'
+        ORDER BY end_date DESC, end_time DESC
+        LIMIT 1
+    """, (machine_id,))
+    row = cur.fetchone()
+    return row["job_code"] if row else None
+
+
+def _product_type_for_jcode(group_name, job_code):
+    """
+    依job_code判斷機台目前是「加熱」還是「畫膠」產品(2026/08/10使用者
+    確認的分類標準)：
+      - ESEC/DB(EPOXY家族)：CED=加熱，CE(整個代碼就是CE)/CEE(含變體如
+        CEEO)=畫膠。CD不屬於這兩類，回傳None(呼叫端顯示「未知」)。
+      - LOC：全部都是加熱，CN/CD兩種改機代碼都算(LOC沒有畫膠產品)。
+    查無job_code(從未改機過)也回傳None。
+    """
+    if not job_code:
+        return None
+    jc = job_code.upper()
+    if group_name == "LOC":
+        return "加熱" if (jc.startswith("CN") or jc.startswith("CD")) else None
+    if jc == "CE" or jc.startswith("CEE"):
+        return "畫膠"
+    if jc.startswith("CED"):
+        return "加熱"
+    return None
+
+
+def group_product_type_reply(group_name: str) -> str:
+    """
+    「<群組>產品」查詢(2026/08/10使用者要求，例："DB產品"/"2100產品"/
+    "LOC產品")：列出該機型群組每台機台目前是「加熱」還是「畫膠」產品——
+    依每台機台「最新一筆已完成改機」的job_code判斷(_latest_changeover_
+    jcode())，不是當天限定，找的是機台目前真正的產品設定。
+
+    group_name要用改機內部代號(ESEC/DB/LOC/EPOXY)；FC(FlipChip)目前沒有
+    對應的真實機台清單來源，會回傳提示訊息而不是查詢結果。
+    """
+    display_name = _CHANGEOVER_GROUP_DISPLAY.get(group_name, group_name)
+    model_group = _CHANGEOVER_TO_MODEL_GROUP.get(group_name)
+    if model_group is None:
+        return f"{display_name}產品 目前不支援這個群組的產品分類查詢"
+
+    conn = get_conn()
+    cur = conn.cursor()
+    machine_ids = _group_machine_ids(cur, model_group)
+
+    by_type = {"加熱": [], "畫膠": [], "未知": []}
+    for mid in sorted(machine_ids):
+        jcode = _latest_changeover_jcode(cur, mid)
+        product = _product_type_for_jcode(group_name, jcode)
+        by_type[product or "未知"].append(mid)
+
+    conn.close()
+
+    lines = [f"【{display_name}產品】共{len(machine_ids)}台"]
+    for label in ("加熱", "畫膠", "未知"):
+        machines = by_type[label]
+        if not machines:
+            continue
+        lines.append("")
+        lines.append(f"{label}: 共{len(machines)}台")
+        lines.append("、".join(machines))
+
+    return "\n".join(lines)
+
+
 def _workhours_rows(cur, now, engineer_id=None):
     """
     回傳今日(跟班別對齊)所有e_tag屬於R(修機)/S(改機)的紀錄(e_tag/engineer_id/

@@ -205,6 +205,50 @@ class TestParseQueryDatedChangeoverAndWorkhours(unittest.TestCase):
         self.assertEqual(cmd["mode"], "group_changeover_detail")
         self.assertEqual(cmd["group_name"], "LOC")
 
+    def test_group_repair_query(self):
+        # "2100修機"(2026/08/10使用者要求)，跟改機共用同一份群組別名清單
+        cmd = listener.parse_query("2100修機")
+        self.assertEqual(cmd, {"mode": "group_repair_detail", "group_name": "ESEC"})
+
+    def test_group_repair_query_with_space(self):
+        # 使用者的例句本身就帶空格"2100 修機"，要能匹配
+        cmd = listener.parse_query("2100 修機")
+        self.assertEqual(cmd["mode"], "group_repair_detail")
+        self.assertEqual(cmd["group_name"], "ESEC")
+
+    def test_group_repair_query_with_date(self):
+        cmd = listener.parse_query("8/9 DB修機")
+        self.assertEqual(cmd["mode"], "group_repair_detail")
+        self.assertEqual(cmd["group_name"], "DB")
+        self.assertEqual(cmd["date_label"], "08/09")
+
+    def test_group_product_type_query(self):
+        # "DB產品"/"2100產品"/"LOC產品"(2026/08/10使用者要求)
+        self.assertEqual(listener.parse_query("DB產品"),
+                          {"mode": "group_product_type", "group_name": "DB"})
+        self.assertEqual(listener.parse_query("2100產品"),
+                          {"mode": "group_product_type", "group_name": "ESEC"})
+        self.assertEqual(listener.parse_query("LOC產品"),
+                          {"mode": "group_product_type", "group_name": "LOC"})
+
+    def test_build_reply_group_repair_detail_dispatches(self):
+        orig_db_path = query_bot.DB_PATH
+        query_bot.DB_PATH = tempfile.mktemp(suffix=".db")
+        try:
+            reply = listener.build_reply({"mode": "group_repair_detail", "group_name": "DB"})
+            self.assertIsInstance(reply, str)
+        finally:
+            query_bot.DB_PATH = orig_db_path
+
+    def test_build_reply_group_product_type_dispatches(self):
+        orig_db_path = query_bot.DB_PATH
+        query_bot.DB_PATH = tempfile.mktemp(suffix=".db")
+        try:
+            reply = listener.build_reply({"mode": "group_product_type", "group_name": "ESEC"})
+            self.assertIsInstance(reply, str)
+        finally:
+            query_bot.DB_PATH = orig_db_path
+
     def test_build_reply_machine_changeover_detail_dispatches(self):
         orig_db_path = query_bot.DB_PATH
         query_bot.DB_PATH = tempfile.mktemp(suffix=".db")
