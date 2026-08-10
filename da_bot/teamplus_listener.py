@@ -167,6 +167,8 @@ HELP_TEXT = (
     "官方GROUP彙總表原始數字（CPIS Utilization Analysis頁面原始列，不是我們自己逐台平均算的）：\n"
     "• <官方群組名稱>＋downrate/稼動明細/停機明細 → 例：DB800 downrate\n"
     "  官方群組名稱：2100SD / DATACON8800 / DB700 / DB800 / DB830 / EPOXY(DB) / Epoxy / Flip Chip / LOC\n"
+    "• downrate（不加群組）→ 列出全部官方群組的downrate彙總\n"
+    "• 以上可以加「8/9」這種日期，改查指定那一天，例：8/9 DB800downrate／8/9 down rate\n"
     "\n"
     "範例：BA220／BA220今天／BAA02上週／BAA08 down rate／DB800downrate\n"
     "\n"
@@ -193,6 +195,7 @@ def parse_query(text):
     m_date = _SINGLE_DATE_RE.search(text)
     query_now = _resolve_query_date(m_date) if m_date else None
     date_label = f"{query_now.month:02d}/{query_now.day:02d}" if query_now else None
+    date_ymd = query_now.strftime("%Y%m%d") if query_now else None
 
     # 「<機型群組>改機」查詢(例如"DB改機"、"8/9DB改機")：指定日期(預設今日)
     # 該群組改機明細(台數+CED/CEE/CD分類平均工時+依人員分類的台數跟平均
@@ -240,6 +243,7 @@ def parse_query(text):
     # (跟db_group/EPOXY(DB)/Epoxy等自己逐台平均算出來的數字可能有些微落差，
     # 這裡給的是CPIS官方原始列，供對照驗證用)。必須排在最前面判斷，
     # 否則"DB800 downrate"會先被底下的機台代號規則攔截，當成查機台DB800用。
+    # 可以搭配「8/9」這種日期查指定那一天的資料(2026/08/10使用者要求)。
     #
     # 先把關鍵字本身從文字裡拿掉(換成空格)再比對群組名稱，是為了處理
     # 「DB800downrate」這種中間沒空格的寫法：關鍵字緊貼著群組名稱時，
@@ -250,7 +254,20 @@ def parse_query(text):
         stripped = _DOWNRATE_KW_RE.sub(" ", stripped)
         for label, pattern in _OFFICIAL_GROUP_PATTERNS:
             if pattern.search(stripped):
-                return {"mode": "group_official_downrate", "group_label": label}
+                cmd = {"mode": "group_official_downrate", "group_label": label}
+                if query_now is not None:
+                    cmd["date_ymd"], cmd["date_label"] = date_ymd, date_label
+                return cmd
+
+        # 沒比對到任何特定官方群組名稱、也沒有機台代號(例如單獨"downrate"、
+        # "8/9 down rate")：回傳全部官方GROUP的彙總(2026/08/10使用者要求)。
+        # 一定要先排除掉機台代號存在的情況，不然"BAA08 downrate"這種既有的
+        # 單機查詢會被這裡攔截掉，變成回全部官方群組而不是BAA08自己的資料
+        if not MACHINE_RE.search(stripped):
+            cmd = {"mode": "all_groups_official_downrate"}
+            if query_now is not None:
+                cmd["date_ymd"], cmd["date_label"] = date_ymd, date_label
+            return cmd
 
     # 「EPOXY(DB)」出現(含括號)時，觸發EPOXY(DB)機型群組查詢(=DB700+DB800+DB830)
     # 必須排在單獨的「Epoxy」判斷跟後面的「DB」判斷之前，
@@ -342,9 +359,19 @@ def build_reply(cmd):
 
     if mode == "group_official_downrate":
         try:
-            return query_bot.group_official_downrate_reply(cmd["group_label"])
+            return query_bot.group_official_downrate_reply(
+                cmd["group_label"], date_ymd=cmd.get("date_ymd"), date_label=cmd.get("date_label")
+            )
         except Exception as e:
             return f"{cmd['group_label']} 官方GROUP彙總查詢時發生錯誤: {type(e).__name__}: {e}"
+
+    if mode == "all_groups_official_downrate":
+        try:
+            return query_bot.all_groups_official_downrate_reply(
+                date_ymd=cmd.get("date_ymd"), date_label=cmd.get("date_label")
+            )
+        except Exception as e:
+            return f"官方GROUP彙總查詢時發生錯誤: {type(e).__name__}: {e}"
 
     if mode == "group_changeover_detail":
         try:

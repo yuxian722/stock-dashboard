@@ -48,6 +48,18 @@ class TestParseQueryDownrate(unittest.TestCase):
         cmd = listener.parse_query("DB800 down rate")
         self.assertEqual(cmd, {"mode": "group_official_downrate", "group_label": "DB800"})
 
+    def test_bare_downrate_with_no_group_or_machine_lists_all_groups(self):
+        # 2026/08/10使用者要求：沒指定官方群組、也沒有機台代號時，
+        # "downrate"要回全部官方群組的彙總
+        cmd = listener.parse_query("downrate")
+        self.assertEqual(cmd, {"mode": "all_groups_official_downrate"})
+
+    def test_machine_downrate_without_official_group_still_targets_machine(self):
+        # "BAA08"不是官方群組名稱，要維持原本查BAA08自己downrate的行為，
+        # 不能被新增的"沒有指定群組就查全部"規則搶走
+        cmd = listener.parse_query("BAA08downrate")
+        self.assertEqual(cmd, {"machine": "BAA08", "mode": "downrate"})
+
 
 class TestParseQueryChangeoverGroupDetail(unittest.TestCase):
     """「<群組>改機」查詢(2026/08/09使用者要求)，必須排在「DB」等機型群組bare
@@ -215,6 +227,69 @@ class TestParseQueryDatedChangeoverAndWorkhours(unittest.TestCase):
                    "now": dt.datetime(2026, 8, 9, 12, 0), "date_label": "08/09"}
             reply = listener.build_reply(cmd)
             self.assertIn("【DB改機】08/09共1台", reply)
+        finally:
+            query_bot.DB_PATH = orig_db_path
+
+
+class TestParseQueryDatedDownrate(unittest.TestCase):
+    """「8/9」這種指定日期可以加在「<官方群組名稱>downrate」「downrate」
+    (不加群組)查詢前後，改查那一天的官方GROUP彙總資料(2026/08/10使用者
+    要求，例："8/9 down rate"要有全部群組那天的downrate)。"""
+
+    def test_date_with_specific_official_group(self):
+        cmd = listener.parse_query("8/9 DB800downrate")
+        self.assertEqual(cmd["mode"], "group_official_downrate")
+        self.assertEqual(cmd["group_label"], "DB800")
+        self.assertEqual(cmd["date_label"], "08/09")
+        self.assertEqual(len(cmd["date_ymd"]), 8)
+        self.assertEqual(cmd["date_ymd"][-4:], "0809")
+
+    def test_date_without_group_lists_all_groups(self):
+        cmd = listener.parse_query("8/9 down rate")
+        self.assertEqual(cmd["mode"], "all_groups_official_downrate")
+        self.assertEqual(cmd["date_label"], "08/09")
+        self.assertEqual(cmd["date_ymd"][-4:], "0809")
+
+    def test_downrate_without_date_has_no_date_keys(self):
+        cmd = listener.parse_query("downrate")
+        self.assertNotIn("date_ymd", cmd)
+        self.assertNotIn("date_label", cmd)
+
+    def test_build_reply_passes_date_through_to_query_bot(self):
+        import datetime as dt
+        import sqlite3
+
+        orig_db_path = query_bot.DB_PATH
+        path = tempfile.mktemp(suffix=".db")
+        conn = sqlite3.connect(path)
+        conn.execute("""
+            CREATE TABLE utilization_record (
+                MODEL TEXT, ENTITY TEXT, UTIL TEXT, fetched_at TEXT,
+                query_date_start TEXT, query_date_end TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO utilization_record (MODEL, ENTITY, UTIL, fetched_at, "
+            "query_date_start, query_date_end) "
+            "VALUES ('DB800', NULL, '82.0 %', '2026-08-09T12:00:00', '20260809', '20260809')"
+        )
+        conn.commit()
+        conn.close()
+        query_bot.DB_PATH = path
+        try:
+            cmd = {"mode": "group_official_downrate", "group_label": "DB800",
+                   "date_ymd": "20260809", "date_label": "08/09"}
+            reply = listener.build_reply(cmd)
+            self.assertIn("稼動(UTIL): 82.0 %", reply)
+        finally:
+            query_bot.DB_PATH = orig_db_path
+
+    def test_build_reply_all_groups_official_downrate_dispatches(self):
+        orig_db_path = query_bot.DB_PATH
+        query_bot.DB_PATH = tempfile.mktemp(suffix=".db")
+        try:
+            reply = listener.build_reply({"mode": "all_groups_official_downrate"})
+            self.assertIsInstance(reply, str)
         finally:
             query_bot.DB_PATH = orig_db_path
 

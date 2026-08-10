@@ -694,7 +694,8 @@ OFFICIAL_GROUP_LABELS = [
 ]
 
 
-def group_official_downrate_reply(group_label: str) -> str:
+def group_official_downrate_reply(group_label: str, date_ymd: str = None,
+                                   date_label: str = None) -> str:
     """
     回傳CPIS Utilization Analysis頁面最下方「GROUP」彙總表裡，
     指定群組(group_label需完全對應OFFICIAL_GROUP_LABELS裡的名稱，含大小寫)
@@ -703,16 +704,32 @@ def group_official_downrate_reply(group_label: str) -> str:
     這批資料存在utilization_record裡，跟一般個別機台的資料共用同一張表，
     差別在於：這種GROUP彙總列沒有ENTITY欄位(該欄位是NULL)，
     個別機台列一定有ENTITY(機台代號)，用這點區分兩者。
+
+    date_ymd：指定日期(YYYYMMDD格式，跟cpis_utilization_scraper.py抓取時
+    記錄的query_date_start/query_date_end一致)時，只查那一天抓到的資料
+    (取當天最後一次抓到、最完整的一筆，因為整點任務每小時會用同一個日期
+    重抓一次)；不指定時維持原行為(查全部歷史裡最新一筆)。date_label是
+    訊息裡顯示用的日期字樣，只影響查無資料時的說明文字，不指定時顯示
+    通用說明(2026/08/10使用者要求支援"8/9 down rate"這種指定日期查詢)。
     """
     conn = get_conn()
     cur = conn.cursor()
     try:
-        cur.execute("""
-            SELECT * FROM utilization_record
-            WHERE MODEL = ? AND (ENTITY IS NULL OR ENTITY = '')
-            ORDER BY fetched_at DESC
-            LIMIT 1
-        """, (group_label,))
+        if date_ymd:
+            cur.execute("""
+                SELECT * FROM utilization_record
+                WHERE MODEL = ? AND (ENTITY IS NULL OR ENTITY = '')
+                  AND query_date_start = ? AND query_date_end = ?
+                ORDER BY fetched_at DESC
+                LIMIT 1
+            """, (group_label, date_ymd, date_ymd))
+        else:
+            cur.execute("""
+                SELECT * FROM utilization_record
+                WHERE MODEL = ? AND (ENTITY IS NULL OR ENTITY = '')
+                ORDER BY fetched_at DESC
+                LIMIT 1
+            """, (group_label,))
         row = cur.fetchone()
     except sqlite3.OperationalError:
         conn.close()
@@ -720,6 +737,8 @@ def group_official_downrate_reply(group_label: str) -> str:
     conn.close()
 
     if not row:
+        if date_label:
+            return f"{group_label} {date_label}查無官方GROUP彙總資料(可能那天還沒抓過稼動率資料)"
         return f"{group_label} 查無官方GROUP彙總資料(可能尚未抓取到，或這次抓取時CPIS頁面上沒有這個群組)"
 
     keys = row.keys()
@@ -739,6 +758,20 @@ def group_official_downrate_reply(group_label: str) -> str:
     if run is not None:
         lines.append(f"RUN: {run}")
     return "\n".join(lines)
+
+
+def all_groups_official_downrate_reply(date_ymd: str = None, date_label: str = None) -> str:
+    """
+    「down rate」查詢(不指定官方群組時，例如"8/9 down rate"或單獨打
+    "downrate")：列出OFFICIAL_GROUP_LABELS全部官方群組(2100SD/DATACON8800/
+    DB700/DB800/DB830/EPOXY(DB)/Epoxy/Flip Chip/LOC)的downrate彙總
+    (2026/08/10使用者要求)。逐一重用group_official_downrate_reply()同一套
+    邏輯串起來，不另外維護一份查詢標準。
+    """
+    sections = [
+        group_official_downrate_reply(label, date_ymd, date_label) for label in OFFICIAL_GROUP_LABELS
+    ]
+    return "\n\n".join(sections)
 
 
 def health_reply(machine_id: str) -> str:

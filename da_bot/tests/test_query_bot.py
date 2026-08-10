@@ -390,6 +390,115 @@ class TestDbGroupReplyOvertimeRepairList(unittest.TestCase):
         self.assertIn("/s10435(王小明)", reply)
 
 
+def _make_db_for_official_downrate_tests(rows):
+    """rows是list of dict，每個可含model/entity/util/fetched_at/
+    query_date_start/query_date_end(缺的欄位當NULL)，寫進utilization_record。
+    entity留空(None)代表這是官方GROUP彙總列(不是個別機台列)。"""
+    path = tempfile.mktemp(suffix=".db")
+    conn = sqlite3.connect(path)
+    conn.execute("""
+        CREATE TABLE utilization_record (
+            MODEL TEXT, ENTITY TEXT, UTIL TEXT, "SETUP" TEXT, fetched_at TEXT,
+            query_date_start TEXT, query_date_end TEXT
+        )
+    """)
+    for row in rows:
+        conn.execute(
+            'INSERT INTO utilization_record (MODEL, ENTITY, UTIL, "SETUP", fetched_at, '
+            "query_date_start, query_date_end) VALUES (?,?,?,?,?,?,?)",
+            (row.get("model"), row.get("entity"), row.get("util"), row.get("setup"),
+             row.get("fetched_at"), row.get("query_date_start"), row.get("query_date_end")),
+        )
+    conn.commit()
+    conn.close()
+    return path
+
+
+class TestGroupOfficialDownrateReply(unittest.TestCase):
+    """「<官方群組名稱>downrate」查詢：CPIS官方GROUP彙總表原始一列數字，
+    可以加日期(例如"8/9 DB800downrate")指定查那一天抓到的資料
+    (2026/08/10使用者要求)。"""
+
+    def setUp(self):
+        self._orig_db_path = query_bot.DB_PATH
+
+    def tearDown(self):
+        query_bot.DB_PATH = self._orig_db_path
+
+    def test_returns_latest_row_when_no_date_given(self):
+        query_bot.DB_PATH = _make_db_for_official_downrate_tests([
+            {"model": "DB800", "entity": None, "util": "80.0 %", "setup": "5.0 %",
+             "fetched_at": "2026-08-08T12:00:00",
+             "query_date_start": "20260808", "query_date_end": "20260808"},
+            {"model": "DB800", "entity": None, "util": "82.0 %", "setup": "6.0 %",
+             "fetched_at": "2026-08-09T12:00:00",
+             "query_date_start": "20260809", "query_date_end": "20260809"},
+        ])
+        reply = query_bot.group_official_downrate_reply("DB800")
+        self.assertIn("稼動(UTIL): 82.0 %", reply)
+
+    def test_date_filters_to_that_days_latest_fetch(self):
+        query_bot.DB_PATH = _make_db_for_official_downrate_tests([
+            {"model": "DB800", "entity": None, "util": "80.0 %", "setup": "5.0 %",
+             "fetched_at": "2026-08-08T09:00:00",
+             "query_date_start": "20260808", "query_date_end": "20260808"},
+            {"model": "DB800", "entity": None, "util": "84.0 %", "setup": "4.0 %",
+             "fetched_at": "2026-08-08T20:00:00",
+             "query_date_start": "20260808", "query_date_end": "20260808"},
+            {"model": "DB800", "entity": None, "util": "82.0 %", "setup": "6.0 %",
+             "fetched_at": "2026-08-09T12:00:00",
+             "query_date_start": "20260809", "query_date_end": "20260809"},
+        ])
+        reply = query_bot.group_official_downrate_reply("DB800", date_ymd="20260808")
+        self.assertIn("稼動(UTIL): 84.0 %", reply)
+
+    def test_no_data_for_that_date_shows_date_specific_message(self):
+        query_bot.DB_PATH = _make_db_for_official_downrate_tests([
+            {"model": "DB800", "entity": None, "util": "82.0 %",
+             "fetched_at": "2026-08-09T12:00:00",
+             "query_date_start": "20260809", "query_date_end": "20260809"},
+        ])
+        reply = query_bot.group_official_downrate_reply("DB800", date_ymd="20260808", date_label="08/08")
+        self.assertIn("DB800 08/08查無官方GROUP彙總資料", reply)
+
+    def test_entity_rows_excluded_from_group_summary(self):
+        query_bot.DB_PATH = _make_db_for_official_downrate_tests([
+            {"model": "DB800", "entity": "BAB01", "util": "70.0 %",
+             "fetched_at": "2026-08-09T12:00:00",
+             "query_date_start": "20260809", "query_date_end": "20260809"},
+        ])
+        reply = query_bot.group_official_downrate_reply("DB800")
+        self.assertIn("查無官方GROUP彙總資料", reply)
+
+
+class TestAllGroupsOfficialDownrateReply(unittest.TestCase):
+    """「down rate」查詢(不指定官方群組時)：列出全部官方群組的downrate彙總，
+    可以加日期(2026/08/10使用者要求)。"""
+
+    def setUp(self):
+        self._orig_db_path = query_bot.DB_PATH
+
+    def tearDown(self):
+        query_bot.DB_PATH = self._orig_db_path
+
+    def test_lists_all_official_groups(self):
+        rows = [
+            {"model": label, "entity": None, "util": "80.0 %",
+             "fetched_at": "2026-08-09T12:00:00",
+             "query_date_start": "20260809", "query_date_end": "20260809"}
+            for label in query_bot.OFFICIAL_GROUP_LABELS
+        ]
+        query_bot.DB_PATH = _make_db_for_official_downrate_tests(rows)
+        reply = query_bot.all_groups_official_downrate_reply()
+        for label in query_bot.OFFICIAL_GROUP_LABELS:
+            self.assertIn(f"{label}(CPIS官方GROUP彙總)", reply)
+
+    def test_date_applies_to_every_group(self):
+        query_bot.DB_PATH = _make_db_for_official_downrate_tests([])
+        reply = query_bot.all_groups_official_downrate_reply(date_ymd="20260809", date_label="08/09")
+        self.assertEqual(reply.count("08/09查無官方GROUP彙總資料"), len(query_bot.OFFICIAL_GROUP_LABELS))
+
+
 class TestGetStdHours(unittest.TestCase):
     """2026/08/09使用者提供：CED-1(頂針)2.3hr、CED-M2/M3/M4(Multi step)2.9hr，
     跟hourly_push.py保持一致。"""
