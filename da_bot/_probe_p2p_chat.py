@@ -8,29 +8,52 @@ ChatID"903_1631")讀不到訊息的問題。
 getOneOnOneChatInfo回傳的ChatID也是"903_1631"，跟現在用的一樣，
 表示ChatID格式不是問題根源。
 
-這一版(v2)換個角度：v1的步驟2故意用「隨機UUID」當NewestBatchID，這其實
-跟之前額外聊天室「靜默bootstrap」被證實不可靠的那個模式一模一樣(cursor
-沒有對應到任何真實訊息，team+的API判斷不出「這之後有沒有新訊息」)，
-用隨機UUID讀到"查無資料"不能證明什麼。這一版改成完全比照
-teamplus_listener.py實際的運作方式：
+v2改用完全比照teamplus_listener.py實際運作方式的真實cursor(送一則訊息拿
+真正的batchID，而不是隨機UUID)重測，結果證實：就算用真實cursor、
+使用者也確實在聊天室打了字，read_new_messages()還是回傳空的messages。
+這代表問題不是cursor bootstrap方式，而是更底層的東西。
 
-  1. 送一則真正的訊息到這個聊天室，拿到它「真實」的batchID當cursor
-     (這就是_init_room_state()開機時做的事)
-  2. 請你實際在team+那個聊天室裡輸入任何文字(模擬你平常打「查詢」的
-     操作)
-  3. 用步驟1拿到的真實cursor呼叫getNewestMessageList(這就是
-     _poll_room_once()每一輪在做的事)，看能不能讀到你剛剛打的那則訊息
-
-如果步驟3還是讀不到，就能排除「cursor bootstrap方式不對」，問題應該在
-更底層(例如team+對P2P對話的getNewestMessageList本來就有其他限制)。
+v2的read_new_messages()只印出「解析後」的結果(messages/new_cursor)，
+沒印出team+實際回傳的原始JSON——這一版(v3)補上這塊：直接發送跟
+read_new_messages()完全一樣的原始HTTP請求，把team+真正回傳的內容整個
+印出來。懷疑的方向：getOneOnOneChatInfo的回應整個包在一層"Data"欄位
+底下(不是像群組聊天室的getNewestMessageList那樣訊息清單直接在最外層)，
+如果P2P的getNewestMessageList也是這樣包法，我們現有的解析邏輯(只看
+最外層的"MessageList"/"ChatMessageList")就會一直找不到、永遠當成
+「沒有新訊息」，即使team+其實真的有把訊息送回來。
 
 用法：
     python _probe_p2p_chat.py 903_1631
 """
 import sys
 import json
+import urllib.request
+import urllib.parse
 
 import teamplus_api
+
+
+def _raw_get_newest_message_list(chat_id, cursor):
+    cookie = teamplus_api.load_cookie()
+    channel_type, _ = teamplus_api._channel_info_for_chat(chat_id)
+    body = urllib.parse.urlencode({
+        "action": "getNewestMessageList",
+        "ChannelType": channel_type,
+        "Mobile": teamplus_api.MOBILE,
+        "ChatID": chat_id,
+        "NewestBatchID": cursor,
+        "FromNearline": "false",
+        "LoadCount": "25",
+    }).encode("utf-8")
+    req = urllib.request.Request(teamplus_api.READ_URL, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+    req.add_header("Accept", "application/json, text/javascript, */*; q=0.01")
+    req.add_header("X-Requested-With", "XMLHttpRequest")
+    req.add_header("Referer", teamplus_api.PAGE_URL)
+    req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+    req.add_header("Cookie", cookie)
+    with urllib.request.urlopen(req, context=teamplus_api._SSL_CTX, timeout=15) as resp:
+        return resp.read().decode("utf-8")
 
 
 def main():
@@ -49,23 +72,29 @@ def main():
     input("\n>>> 請現在切到team+，在「APG_DA班長」(或你指定的那個)聊天室裡輸入任何文字並送出，"
           "完成後回來這裡按 Enter 繼續... ")
 
-    print("\n===== 步驟2: 用剛剛拿到的真實cursor呼叫read_new_messages() =====")
-    print(f"(這一步跟teamplus_listener.py的_poll_room_once()做的事完全一樣，cursor={bid!r})")
+    print("\n===== 步驟2: 直接發送原始getNewestMessageList請求(不經過我們的解析邏輯) =====")
+    print(f"cursor={bid!r}")
+    try:
+        raw = _raw_get_newest_message_list(chat_id, bid)
+    except Exception as e:
+        print(f"[錯誤] 請求失敗: {type(e).__name__}: {e}")
+        sys.exit(1)
+    print("原始回應內容(team+實際回傳的，完全沒經過我們程式碼處理):")
+    print(raw)
+    try:
+        parsed = json.loads(raw)
+        print("解析後(縮排格式，方便看有幾層):")
+        print(json.dumps(parsed, ensure_ascii=False, indent=2))
+    except json.JSONDecodeError:
+        print("[警告] 回應不是合法JSON")
+
+    print("\n===== 步驟3: 用同一個cursor呼叫我們正式程式碼的read_new_messages() =====")
+    print("(這一步跟teamplus_listener.py的_poll_room_once()做的事完全一樣，用來對照步驟2的原始內容)")
     messages, new_cursor = teamplus_api.read_new_messages(bid, chat_id=chat_id)
     print(f"messages = {json.dumps(messages, ensure_ascii=False, indent=2)}")
     print(f"new_cursor = {new_cursor!r}")
 
-    if messages:
-        print("\n[結果] 有讀到訊息！代表cursor/ChatID都沒問題，"
-              "如果之前服務仍然沒反應，問題可能在別的地方(例如洗版保護、"
-              "parse_query()判斷邏輯，而不是team+ API本身)")
-    else:
-        print("\n[結果] 還是沒讀到任何訊息。用的已經是『真實』cursor("
-              "不是隨機UUID)，如果你剛剛確實有在那個聊天室打字，"
-              "這就證明team+的getNewestMessageList對這個P2P聊天室"
-              "本身有問題(不是我們cursor bootstrap方式的問題)。")
-
-    print("\n=== 診斷完成，請把上面全部輸出內容截圖/複製傳回 ===")
+    print("\n=== 診斷完成，請把上面全部輸出內容(尤其是步驟2的原始JSON)截圖/複製傳回 ===")
 
 
 if __name__ == "__main__":
