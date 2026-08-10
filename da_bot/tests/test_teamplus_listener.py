@@ -165,6 +165,42 @@ class TestParseQueryDatedChangeoverAndWorkhours(unittest.TestCase):
         self.assertEqual(cmd["date_label"], "08/09")
         self.assertEqual((cmd["now"].month, cmd["now"].day), (8, 9))
 
+    def test_machine_with_changeover_keyword_routes_to_machine_changeover_detail(self):
+        # "BAA02改機"要查BAA02自己的改機明細，不能被"沒指定群組的改機"
+        # 規則搶走、變成回全部群組彙總(2026/08/10使用者要求)
+        cmd = listener.parse_query("BAA02改機")
+        self.assertEqual(cmd, {"mode": "machine_changeover_detail", "machine": "BAA02", "all_history": False})
+
+    def test_machine_changeover_with_history_keyword(self):
+        cmd = listener.parse_query("BAA02改機歷史")
+        self.assertEqual(cmd["mode"], "machine_changeover_detail")
+        self.assertEqual(cmd["machine"], "BAA02")
+        self.assertTrue(cmd["all_history"])
+
+    def test_machine_changeover_with_date(self):
+        cmd = listener.parse_query("8/9 BAA02改機")
+        self.assertEqual(cmd["mode"], "machine_changeover_detail")
+        self.assertEqual(cmd["machine"], "BAA02")
+        self.assertFalse(cmd["all_history"])
+        self.assertEqual(cmd["date_label"], "08/09")
+        self.assertEqual((cmd["now"].month, cmd["now"].day), (8, 9))
+
+    def test_group_changeover_keyword_not_shadowed_by_machine_rule(self):
+        # 群組(例如"DB改機")的判斷排在前面，要確認新規則沒有搶走群組查詢
+        cmd = listener.parse_query("DB改機")
+        self.assertEqual(cmd["mode"], "group_changeover_detail")
+        self.assertEqual(cmd["group_name"], "DB")
+
+    def test_build_reply_machine_changeover_detail_dispatches(self):
+        orig_db_path = query_bot.DB_PATH
+        query_bot.DB_PATH = tempfile.mktemp(suffix=".db")
+        try:
+            reply = listener.build_reply({"mode": "machine_changeover_detail", "machine": "BAA02",
+                                           "all_history": False})
+            self.assertIsInstance(reply, str)
+        finally:
+            query_bot.DB_PATH = orig_db_path
+
     def test_bare_changeover_without_date_routes_to_all_changeover(self):
         cmd = listener.parse_query("改機")
         self.assertEqual(cmd, {"mode": "all_changeover"})

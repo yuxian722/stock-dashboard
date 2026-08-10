@@ -172,10 +172,12 @@ HELP_TEXT = (
     "• <群組>改機 → 今日該群組改機台數＋CED/CEE/CD分類平均工時＋依人員(工號)分類明細\n"
     "  群組：EPOXY(=ESEC+DB) / ESEC / DB / LOC / FlipChip，例：DB改機\n"
     "• 改機（不加群組）→ 列出今日EPOXY/LOC/FlipChip全部群組的改機彙總\n"
+    "• <機台代號>改機 → 該機台改機次數＋分類平均改機時間＋待改時間(即時＋歷史平均)＋改機人員，例：BAA02改機\n"
+    "  加「歷史」→ 不限日期，查這台機台全部歷史紀錄，例：BAA02改機歷史\n"
     "• <工號>工時 → 該工號今日修機＋改機總工時，例：s10435工時\n"
     "• 工時（不加工號） → 列出今日所有有紀錄工號的總工時\n"
-    "• 以上三種前面/後面可以加「8/9」這種日期(跟英文字母中間留個空格)，改查\n"
-    "  指定那一天，例：8/9 DB改機／8/9工時／8/9 DB\n"
+    "• 以上（機台改機歷史除外）前面/後面可以加「8/9」這種日期(跟英文字母中間留個空格)，\n"
+    "  改查指定那一天，例：8/9 DB改機／8/9工時／8/9 DB／8/9 BAA02改機\n"
     "\n"
     "官方GROUP彙總表原始數字（CPIS Utilization Analysis頁面原始列，不是我們自己逐台平均算的）：\n"
     "• <官方群組名稱>＋downrate/稼動明細/停機明細 → 例：DB800 downrate\n"
@@ -230,6 +232,21 @@ def parse_query(text):
             if pattern.search(text):
                 return {"mode": "group_changeover_detail", "group_name": internal,
                         "now": query_now, "date_label": date_label}
+
+    # 「<機台代號>改機」查詢(例如"BAA02改機"、"BAA02改機歷史")：單一機台
+    # 改機次數+平均改機時間+待改時間+改機人員(2026/08/10使用者要求)。要排
+    # 在上面「群組+改機」判斷之後(機台代號不會誤觸群組判斷，不影響順序)、
+    # 也要排在下面「沒指定群組的改機」判斷之前——不然"BAA02改機"會被那條
+    # 規則搶走，變成回全部群組彙總而不是BAA02自己的資料。「歷史」關鍵字
+    # 切換成不限日期查全部歷史紀錄，沒加就是今日(可以搭配"8/9"這種日期)。
+    if "改機" in text:
+        m_machine = MACHINE_RE.search(text)
+        if m_machine:
+            cmd = {"mode": "machine_changeover_detail", "machine": m_machine.group(1).upper(),
+                   "all_history": "歷史" in text}
+            if query_now is not None:
+                cmd["now"], cmd["date_label"] = query_now, date_label
+            return cmd
 
     # 沒指定群組的「改機」查詢(例如"8/9改機"，或單獨打"改機")：列出EPOXY/LOC/
     # FlipChip全部群組指定日期(預設今日)的改機彙總(2026/08/10使用者要求)。
@@ -413,6 +430,15 @@ def build_reply(cmd):
             return query_bot.all_changeover_reply(now=cmd.get("now"), date_label=cmd.get("date_label"))
         except Exception as e:
             return f"改機查詢時發生錯誤: {type(e).__name__}: {e}"
+
+    if mode == "machine_changeover_detail":
+        try:
+            return query_bot.machine_changeover_detail_reply(
+                cmd["machine"], now=cmd.get("now"), date_label=cmd.get("date_label"),
+                all_history=cmd.get("all_history", False)
+            )
+        except Exception as e:
+            return f"{cmd['machine']}改機查詢時發生錯誤: {type(e).__name__}: {e}"
 
     if mode == "all_live_status":
         try:

@@ -836,6 +836,135 @@ class TestAllChangeoverReply(unittest.TestCase):
         self.assertEqual(reply.count("08/09目前沒有完成的改機紀錄"), 3)
 
 
+def _make_db_for_machine_changeover_tests(ee_rows=None, pm_rows=None):
+    """跟_make_db_for_changeover_tests()類似，但多帶wait_dur欄位、還能選擇
+    寫進pm_monitor_record(供「<機台代號>改機」查詢的即時待改狀態測試用)。
+    ee_rows是list of dict(可含machine_id/e_tag/job_code/engineer_id/dur/
+    wait_dur/end_date/end_time)；pm_rows是list of dict(entity/status/in_time)。"""
+    path = tempfile.mktemp(suffix=".db")
+    conn = sqlite3.connect(path)
+    conn.execute("""
+        CREATE TABLE ee_maintenance_record (
+            machine_id TEXT, bgn_date TEXT, bgn_time TEXT, end_date TEXT, end_time TEXT,
+            job_code TEXT, e_tag TEXT, engineer_id TEXT, dur REAL, wait_dur REAL
+        )
+    """)
+    for row in (ee_rows or []):
+        conn.execute(
+            "INSERT INTO ee_maintenance_record "
+            "(machine_id, bgn_date, bgn_time, end_date, end_time, job_code, e_tag, engineer_id, dur, wait_dur) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (row.get("machine_id"), row.get("bgn_date"), row.get("bgn_time"), row.get("end_date"),
+             row.get("end_time"), row.get("job_code"), row.get("e_tag"), row.get("engineer_id"),
+             row.get("dur"), row.get("wait_dur")),
+        )
+    conn.execute("""
+        CREATE TABLE pm_monitor_record (
+            oper TEXT, entity TEXT, model TEXT, status TEXT,
+            lot_no TEXT, bond_id TEXT, wip TEXT, in_time TEXT,
+            outplan TEXT, jcode TEXT, operator TEXT, fetched_at TEXT
+        )
+    """)
+    pm_fetched_at = "2026-08-09T17:00:00"
+    for pm_row in (pm_rows or []):
+        conn.execute(
+            "INSERT INTO pm_monitor_record (entity, status, in_time, fetched_at) VALUES (?,?,?,?)",
+            (pm_row.get("entity"), pm_row.get("status"), pm_row.get("in_time"), pm_fetched_at),
+        )
+    conn.commit()
+    conn.close()
+    return path
+
+
+class TestMachineChangeoverDetailReply(unittest.TestCase):
+    """「<機台代號>改機」查詢(2026/08/10使用者要求)：單一機台改機次數＋
+    分類平均改機時間＋待改時間(即時＋歷史平均)＋改機人員。"""
+
+    def setUp(self):
+        self._orig_db_path = query_bot.DB_PATH
+        self._orig_master_path = engineer_master.PATH
+        self._orig_master_cache = engineer_master._cache
+        engineer_master.PATH = "/tmp/does_not_exist_engineer_master_test.json"
+        engineer_master._cache = None
+
+    def tearDown(self):
+        query_bot.DB_PATH = self._orig_db_path
+        engineer_master.PATH = self._orig_master_path
+        engineer_master._cache = self._orig_master_cache
+
+    def test_unknown_machine_group_returns_error_message(self):
+        query_bot.DB_PATH = _make_db_for_machine_changeover_tests()
+        reply = query_bot.machine_changeover_detail_reply("ZZ999")
+        self.assertIn("查無所屬機型群組", reply)
+
+    def test_no_records_today(self):
+        query_bot.DB_PATH = _make_db_for_machine_changeover_tests()
+        reply = query_bot.machine_changeover_detail_reply("BAA02")
+        self.assertIn("【BAA02改機】今日", reply)
+        self.assertIn("目前沒有完成的改機紀錄", reply)
+
+    def test_counts_avg_and_engineer_breakdown_for_today(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_machine_changeover_tests(ee_rows=[
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": today, "end_time": "09:00",
+             "job_code": "CED", "engineer_id": "s10435", "dur": 1.0, "wait_dur": 0.5},
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": today, "end_time": "11:00",
+             "job_code": "CED", "engineer_id": "s10435", "dur": 1.4, "wait_dur": 1.5},
+            # 不同機台的紀錄不能算進BAA02自己的統計
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "s10488", "dur": 9.0, "wait_dur": 9.0},
+        ])
+        reply = query_bot.machine_changeover_detail_reply("BAA02", now)
+        self.assertIn("【BAA02改機】今日", reply)
+        self.assertIn("改機次數: 2次", reply)
+        self.assertIn("CEDx2次平均1.2hr", reply)
+        self.assertIn("歷史平均等待改機時間: 1.00hr", reply)
+        self.assertIn("s10435  改機2次", reply)
+        self.assertNotIn("s10488", reply)
+
+    def test_non_changeover_jcode_excluded_from_count(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_machine_changeover_tests(ee_rows=[
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": today, "end_time": "09:00",
+             "job_code": "INK", "engineer_id": "s10435", "dur": 0.2, "wait_dur": 0.1},
+        ])
+        reply = query_bot.machine_changeover_detail_reply("BAA02", now)
+        self.assertIn("目前沒有完成的改機紀錄", reply)
+
+    def test_all_history_flag_ignores_date_and_includes_older_records(self):
+        query_bot.DB_PATH = _make_db_for_machine_changeover_tests(ee_rows=[
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": "2026-01-01", "end_time": "09:00",
+             "job_code": "CED", "engineer_id": "s10435", "dur": 1.0, "wait_dur": 0.5},
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": "2026-08-09", "end_time": "09:00",
+             "job_code": "CED", "engineer_id": "s10435", "dur": 1.0, "wait_dur": 0.5},
+        ])
+        reply = query_bot.machine_changeover_detail_reply("BAA02", all_history=True)
+        self.assertIn("【BAA02改機】全部歷史紀錄", reply)
+        self.assertIn("改機次數: 2次", reply)
+
+    def test_live_wait_setup_shows_elapsed_hours(self):
+        # _elapsed_hours_since()是拿目前真實時間算的(跟live_status_reply()
+        # 既有邏輯一致)，這裡不比對確切時數(那樣要mock datetime、跟現有
+        # 測試風格不一致)，只驗證有秀出「已等待」+單位hr的字樣
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        query_bot.DB_PATH = _make_db_for_machine_changeover_tests(pm_rows=[
+            {"entity": "BAA02", "status": "WAIT-SETUP", "in_time": "2026/08/09 12:00"},
+        ])
+        reply = query_bot.machine_changeover_detail_reply("BAA02", now)
+        self.assertIn("待改(即時): 目前等待改機中，已等待", reply)
+        self.assertIn("hr", reply.split("待改(即時):")[1])
+
+    def test_no_live_wait_when_not_in_wait_setup_status(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        query_bot.DB_PATH = _make_db_for_machine_changeover_tests(pm_rows=[
+            {"entity": "BAA02", "status": "IN-REPAIR", "in_time": "2026/08/09 12:00"},
+        ])
+        reply = query_bot.machine_changeover_detail_reply("BAA02", now)
+        self.assertIn("待改(即時): 目前無等待改機中紀錄", reply)
+
+
 class TestWorkhoursReply(unittest.TestCase):
     """「工時」查詢：今日各工號人員修機+改機總工時(2026/08/09使用者要求)。"""
 

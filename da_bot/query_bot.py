@@ -1050,6 +1050,153 @@ def group_changeover_detail_reply(group_name: str, now: datetime.datetime = None
     return "\n".join(lines)
 
 
+def _avg(values):
+    """values裡非None的數字取平均，全部是None(或空)回傳None。"""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+
+def _machine_category_avg_parts(rows):
+    """跟_category_avg_parts()一樣依job_code分類算平均改機工時，但顯示成
+    "CEDx3次平均1.2hr"這種單機用的「次」用語——_category_avg_parts()給
+    群組彙總用的「台」用語在單一機台查詢裡沒有意義(不會是"3台"，而是同
+    一台改了3次，2026/08/10使用者要求「<機台代號>改機」新增這種單機
+    查詢時一併調整用字)。"""
+    by_cat = {}
+    for r in rows:
+        by_cat.setdefault(r["category"], []).append(r["dur"] or 0.0)
+    parts = []
+    for label in _CHANGEOVER_LABEL_ORDER:
+        durs = by_cat.get(label)
+        if not durs:
+            continue
+        cat_code = label.replace("機台", "")
+        parts.append(f"{cat_code}x{len(durs)}次平均{sum(durs) / len(durs):.1f}hr")
+    return parts
+
+
+def _changeover_rows_for_machine(cur, machine_id, now=None, all_history=False):
+    """
+    回傳指定機台真正完成的改機紀錄原始列(job_code/engineer_id/dur/wait_dur/
+    end_time/category)，篩選標準(job_code要屬於該機台所屬群組的CED/CEE/CD
+    或CN/CD類別)跟_changeover_rows_for_group()一致，差別是這裡篩機台而不是
+    篩群組(2026/08/10使用者要求新增「<機台代號>改機」單機查詢：改機次數/
+    平均改機時間/待改時間/改機人員)。
+
+    all_history=True時不篩日期，回傳這台機台有史以來全部完成紀錄(使用者
+    要求「改機幾次」等統計可以切換算今日還是算全部歷史)；否則比照
+    _changeover_rows_for_group()只算now所屬班別日(今日，跟07:30分界對齊)。
+
+    回傳(rows, group)；machine_id不屬於任何已知機型群組時，group是None、
+    rows是[]，呼叫端要自己決定怎麼提示使用者(無法判斷改機標準)。
+    """
+    group = hourly_push._group_for_machine(machine_id)
+    if group is None:
+        return [], None
+
+    # SELECT要帶bgn_date/bgn_time/end_date(即使輸出用不到)，是為了讓DISTINCT
+    # 能正確分辨「兩筆不同時間發生、但job_code/engineer_id/dur/wait_dur/
+    # end_time(僅時分)剛好重複」的事件，不會被誤判成同一筆而少算(這種重複在
+    # all_history模式尤其容易發生：同一台機台不同天的改機，很有機會duration
+    # 剛好一樣、又剛好在同一個時間點完成)。
+    if all_history:
+        cur.execute("""
+            SELECT DISTINCT bgn_date, bgn_time, end_date, job_code, engineer_id, dur, wait_dur, end_time
+            FROM ee_maintenance_record
+            WHERE e_tag = 'S' AND machine_id = ?
+        """, (machine_id,))
+    else:
+        if now is None:
+            now = datetime.datetime.now()
+        shift_date, next_date = hourly_push._shift_day_bounds(now)
+        cur.execute("""
+            SELECT DISTINCT bgn_date, bgn_time, end_date, job_code, engineer_id, dur, wait_dur, end_time
+            FROM ee_maintenance_record
+            WHERE e_tag = 'S' AND machine_id = ? AND (
+                (end_date = ? AND end_time >= ?)
+                OR (end_date = ? AND end_time < ?)
+            )
+        """, (machine_id, shift_date, hourly_push.SHIFT_CHANGE_TIME, next_date, hourly_push.SHIFT_CHANGE_TIME))
+
+    rows = []
+    for r in cur.fetchall():
+        category = hourly_push._changeover_jcode_category(group, r["job_code"])
+        if category is None:
+            continue
+        rows.append({
+            "job_code": r["job_code"], "engineer_id": r["engineer_id"],
+            "dur": r["dur"], "wait_dur": r["wait_dur"], "end_time": r["end_time"],
+            "category": category,
+        })
+    return rows, group
+
+
+def machine_changeover_detail_reply(machine_id: str, now: datetime.datetime = None,
+                                     date_label: str = None, all_history: bool = False) -> str:
+    """
+    「<機台代號>改機」查詢(2026/08/10使用者要求：BAA02改機幾次、待改幾
+    小時、平均改機時間、改機人員)：單一機台的改機次數、依CED/CEE/CD(或
+    CN/CD)分類的平均改機工時、依人員(工號)分類的改機次數+平均工時，以及
+    待改時間——同時顯示「現在正在等」的即時狀態(PM Monitor WAIT-SETUP
+    快照，已等待幾小時)跟「過去平均要等多久」的歷史平均(wait_dur欄位)，
+    兩者都要顯示(使用者確認過)。
+
+    預設只算今日(跟班別對齊，跟<群組>改機查詢一致)，可以搭配"8/9"這種
+    指定日期(now/date_label由呼叫端換算好傳入)；all_history=True時改成
+    不限日期，算這台機台有史以來全部完成紀錄，用「歷史」關鍵字觸發。
+    """
+    if now is None:
+        now = datetime.datetime.now()
+    conn = get_conn()
+    cur = conn.cursor()
+    rows, group = _changeover_rows_for_machine(cur, machine_id, now, all_history)
+
+    if group is None:
+        conn.close()
+        return f"{machine_id} 查無所屬機型群組，無法判斷改機標準"
+
+    range_word = "全部歷史紀錄" if all_history else (date_label or "今日")
+    lines = [f"【{machine_id}改機】{range_word}"]
+
+    if not rows:
+        lines.append("目前沒有完成的改機紀錄")
+    else:
+        lines.append(f"改機次數: {len(rows)}次")
+        cat_parts = _machine_category_avg_parts(rows)
+        if cat_parts:
+            lines.append(" ".join(cat_parts))
+        avg_wait = _avg(r["wait_dur"] for r in rows)
+        if avg_wait is not None:
+            lines.append(f"歷史平均等待改機時間: {avg_wait:.2f}hr")
+
+        by_engineer = {}
+        for r in rows:
+            eng = r["engineer_id"] or "未指定"
+            by_engineer.setdefault(eng, []).append(r)
+
+        lines.append("")
+        lines.append("改機人員:")
+        for eng, eng_rows in sorted(by_engineer.items(), key=lambda kv: -len(kv[1])):
+            eng_cat_parts = _machine_category_avg_parts(eng_rows)
+            lines.append(f"{engineer_master.format_engineer(eng)}  改機{len(eng_rows)}次  " + " ".join(eng_cat_parts))
+
+    # 即時待改狀態：不管上面歷史紀錄查詢範圍是今日還是全部歷史，都額外
+    # 顯示PM Monitor當下的真實快照，是「現在正在等」還是「現在沒在等」
+    pm_row = get_latest_pm_monitor_status(cur, machine_id)
+    lines.append("")
+    if pm_row is not None and pm_row["status"] == "WAIT-SETUP":
+        elapsed = _elapsed_hours_since(pm_row["in_time"])
+        elapsed_txt = f"{elapsed:.2f}hr" if elapsed is not None else "?"
+        lines.append(f"待改(即時): 目前等待改機中，已等待{elapsed_txt}")
+    else:
+        lines.append("待改(即時): 目前無等待改機中紀錄")
+
+    conn.close()
+    return "\n".join(lines)
+
+
 # 「改機」查詢(不指定群組時)要涵蓋的真正改機群組：EPOXY(=ESEC+DB合併顯示)/
 # LOC/FlipChip，不包含EE Maintenance資料裡查不到真正改機類別的其他群組。
 _ALL_CHANGEOVER_GROUPS = ["EPOXY", "LOC", "FC"]
