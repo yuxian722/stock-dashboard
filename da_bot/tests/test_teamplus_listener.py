@@ -191,6 +191,20 @@ class TestParseQueryDatedChangeoverAndWorkhours(unittest.TestCase):
         self.assertEqual(cmd["mode"], "group_changeover_detail")
         self.assertEqual(cmd["group_name"], "DB")
 
+    def test_2100_alias_routes_to_esec_group(self):
+        # "2100"是Esec2100機型群組的別名，改機統計要對到跟"ESEC改機"
+        # 同一組內部代號(2026/08/10使用者要求)
+        cmd = listener.parse_query("2100改機")
+        self.assertEqual(cmd["mode"], "group_changeover_detail")
+        self.assertEqual(cmd["group_name"], "ESEC")
+
+    def test_cm700_alias_routes_to_loc_group(self):
+        # "CM700"是CM700機型群組的別名，跟"LOC改機"同一組內部代號
+        # (CM700機台就是BA8開頭、跟LOC共用同一組，2026/08/10使用者要求)
+        cmd = listener.parse_query("CM700改機")
+        self.assertEqual(cmd["mode"], "group_changeover_detail")
+        self.assertEqual(cmd["group_name"], "LOC")
+
     def test_build_reply_machine_changeover_detail_dispatches(self):
         orig_db_path = query_bot.DB_PATH
         query_bot.DB_PATH = tempfile.mktemp(suffix=".db")

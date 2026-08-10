@@ -97,10 +97,13 @@ _DOWNRATE_KW_RE = re.compile(r"down\s*rate|停機明細|稼動明細", re.IGNORE
 # query_bot.group_changeover_detail_reply()認得的內部群組代號——一定要跟
 # hourly_push._group_for_machine()回傳的值一致(ESEC/DB/LOC/FC)，FlipChip
 # 機台回傳的是"FC"不是"FlipChip"/"FLIPCHIP"，這裡不能對到錯的代號，不然
-# 查詢永遠是空的
+# 查詢永遠是空的。"2100"/"CM700"是2026/08/10使用者額外要求的別名，分別
+# 對到ESEC(Esec2100機型群組跟改機內部群組"ESEC"是同一批BA2/BA4開頭機台)、
+# LOC(CM700機型群組跟改機內部群組"LOC"是同一批BA8開頭機台，見query_bot.
+# MODEL_GROUPS的機台清單定義)，不是新的獨立群組。
 _CHANGEOVER_GROUP_KEYWORDS = [
-    ("EPOXY", "EPOXY"), ("ESEC", "ESEC"), ("DB", "DB"),
-    ("LOC", "LOC"), ("FLIP CHIP", "FC"), ("FLIPCHIP", "FC"), ("FC", "FC"),
+    ("EPOXY", "EPOXY"), ("ESEC", "ESEC"), ("2100", "ESEC"), ("DB", "DB"),
+    ("LOC", "LOC"), ("CM700", "LOC"), ("FLIP CHIP", "FC"), ("FLIPCHIP", "FC"), ("FC", "FC"),
 ]
 
 
@@ -150,14 +153,13 @@ HELP_TRIGGERS = {"查詢", "說明", "help", "指令", "用法", "選單", "?", 
 
 HELP_TEXT = (
     "🤖 DA機器人 查詢指令（機台代號可加在關鍵字前後，不用空格也可以）：\n"
-    "• 機台代號 → 完整資訊（即時狀態＋統計摘要＋稼動率＋健康監控，例：BAA08）\n"
+    "• 機台代號 → 完整資訊（即時狀態＋統計摘要＋稼動率，例：BAA08）\n"
     "• 機台代號＋今天 / 昨天 → 當天修機/改機明細\n"
     "• 機台代號＋上週 / 上周 → 過去7天（不含今天）統計摘要\n"
     "• 機台代號＋本週 / 本周 → 本週一到今天統計摘要\n"
     "• 機台代號＋07/24~07/30 → 指定區間統計摘要\n"
     "• 機台代號＋稼動 / 稼動率 → 最新一筆稼動率資料\n"
     "• 機台代號＋downrate / down rate / 停機明細 → 該機台稼動細項（改機/工程/停機/閒置...）\n"
-    "• 機台代號＋健康 → 設備健康監控資料\n"
     "• 機台代號＋機況 / 即時機況 → 該機台即時狀態（PM Monitor真實快照）\n"
     "\n"
     "機型群組查詢（不用加機台代號）：\n"
@@ -171,7 +173,7 @@ HELP_TEXT = (
     "改機明細/工時查詢：\n"
     "• <群組>改機 → 今日該群組改機台數＋CED/CEE/CD分類平均工時＋依人員(工號)分類明細＋\n"
     "  逐台機台明細(待改時間＋改機時間＋人員工號)\n"
-    "  群組：EPOXY(=ESEC+DB) / ESEC / DB / LOC / FlipChip，例：DB改機\n"
+    "  群組：EPOXY(=ESEC+DB) / ESEC(=2100) / DB / LOC(=CM700) / FlipChip，例：DB改機／2100改機／CM700改機\n"
     "• 改機（不加群組）→ 列出今日EPOXY/LOC/FlipChip全部群組的改機彙總\n"
     "• <機台代號>改機 → 該機台改機次數＋分類平均改機時間＋待改時間(即時＋歷史平均)＋改機人員，例：BAA02改機\n"
     "  加「歷史」→ 不限日期，查這台機台全部歷史紀錄，例：BAA02改機歷史\n"
