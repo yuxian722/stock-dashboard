@@ -52,11 +52,27 @@ READ_URL = "https://teamplus.chipmos.com/EIM/Chat/ChatMainHandler.ashx"
 SEND_URL = "https://teamplus.chipmos.com/EIM/Common/SendMsgHandler.ashx"
 PAGE_URL = "https://teamplus.chipmos.com/EIM/Messenger/MessengerMain.aspx"
 
-# 08/06從F12開發者工具實際抓到、確認可用的「機器人推播」室設定
-CHAT_ID = "702193c7-0029-4b5c-a819-4fa17fdf4f16"
+# 08/06從F12開發者工具實際抓到、確認可用的「機器人推播」室設定(余毓賢/903自己
+# 帳號的預設值)。2026/08/10起這兩個值改成優先讀config.txt的teamplus_mobile／
+# teamplus_chat_id，沒設定才 fallback 回這裡的預設值——這樣把整份da_bot資料夾
+# 複製給別人用時，對方只要填自己的config.txt，完全不用碰這支程式碼裡的任何一行，
+# 就能指到「他自己」的team+帳號代碼跟「他自己」的機器人推播室。
+_DEFAULT_MOBILE = "903"
+_DEFAULT_CHAT_ID = "702193c7-0029-4b5c-a819-4fa17fdf4f16"
 CHANNEL_TYPE = "1"
-MOBILE = "903"  # 使用者(余毓賢)自己帳號的內部代碼，讀/送訊息都要帶
-RECIPIENTS = [{"Mobile": "903", "Email": ""}]
+
+
+def _load_cfg_value(key, default):
+    try:
+        cfg = config.load()
+    except FileNotFoundError:
+        return default
+    return cfg.get(key, "").strip() or default
+
+
+MOBILE = _load_cfg_value("teamplus_mobile", _DEFAULT_MOBILE)  # 使用者自己帳號的內部代碼，讀/送訊息都要帶
+CHAT_ID = _load_cfg_value("teamplus_chat_id", _DEFAULT_CHAT_ID)
+RECIPIENTS = [{"Mobile": MOBILE, "Email": ""}]
 
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False

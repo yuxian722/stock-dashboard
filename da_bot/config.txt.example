@@ -10,6 +10,15 @@ apg_password=your_apg_password
 util_user=your_util_account
 util_password=your_util_password
 
+# (選填，把整份da_bot資料夾複製給別人用時才需要填) 這個帳號自己在team+的
+# Mobile內部代碼、以及自己「機器人推播」室的ChatID——不填的話會用原始開發者
+# (余毓賢/903)的值當預設值，等於還是用同一個team+帳號在運作，通常不是你要的。
+# 抓法都一樣：先用「你自己的team+帳號」登入、開好你自己的「機器人推播」室，
+# F12開發者工具->網路分頁->在該室送一則訊息->找SendMsgHandler.ashx這個請求->
+# 表單資料裡的Mobile欄位(填teamplus_mobile)、ChatID欄位(填teamplus_chat_id)。
+# teamplus_mobile=你的Mobile代碼
+# teamplus_chat_id=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+
 # (選填) team+整點推播除了預設的「機器人推播」室，還要多推播到哪些聊天室，
 # 逗號分隔，可填多個。ChatID取得方式：到目標聊天室畫面，F12開發者工具->
 # 網路分頁->送出一則訊息->找SendMsgHandler.ashx那個請求->表單資料裡的ChatID欄位。
