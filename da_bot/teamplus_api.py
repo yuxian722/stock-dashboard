@@ -71,10 +71,14 @@ def load_cookie():
     return cookie
 
 
-def read_new_messages(cursor=None):
+def read_new_messages(cursor=None, chat_id=None):
     """
-    讀「機器人推播」室裡比cursor新的訊息。
+    讀指定聊天室(預設CHAT_ID，「機器人推播」室)裡比cursor新的訊息。
     cursor是上次讀到的最新BatchID，第一次呼叫可傳None。
+
+    chat_id：2026/08/10使用者要求即時問答也要能在額外聊天室(config.txt
+    的teamplus_extra_chat_ids，原本只有broadcast_message()的推播會用到)
+    運作，所以這裡開放指定要讀哪一間，不指定時維持原行為(讀CHAT_ID)。
 
     重要：NewestBatchID傳空字串會被team+的API直接拒絕("參數錯誤：NewestBatchID")，
     這是之前即時問答完全沒反應的真正原因——第一次呼叫永遠失敗，cursor永遠
@@ -96,7 +100,7 @@ def read_new_messages(cursor=None):
         "action": "getNewestMessageList",
         "ChannelType": CHANNEL_TYPE,
         "Mobile": MOBILE,
-        "ChatID": CHAT_ID,
+        "ChatID": chat_id or CHAT_ID,
         "NewestBatchID": effective_cursor,
         "FromNearline": "false",
         "LoadCount": "25",
@@ -151,6 +155,20 @@ def _load_extra_chat_ids():
         return []
     raw = cfg.get("teamplus_extra_chat_ids", "")
     return [c.strip() for c in raw.split(",") if c.strip()]
+
+
+def all_chat_ids():
+    """
+    回傳CHAT_ID(機器人推播室)+config.txt裡teamplus_extra_chat_ids設定的所有
+    額外聊天室(去重、保留順序)。broadcast_message()推播訊息、
+    teamplus_listener.py的即時問答監聽(2026/08/10使用者要求Q&A也要支援
+    額外聊天室，不再只有推播)都共用這份清單，同一個地方設定就好。
+    """
+    seen = []
+    for chat_id in [CHAT_ID] + _load_extra_chat_ids():
+        if chat_id not in seen:
+            seen.append(chat_id)
+    return seen
 
 
 def _send(message, chat_id, batch_id):
@@ -223,7 +241,7 @@ def broadcast_message(message):
     房間送失敗。沒設定額外聊天室時，效果等同只呼叫send_message(message)一次。
     """
     results = []
-    for chat_id in [CHAT_ID] + _load_extra_chat_ids():
+    for chat_id in all_chat_ids():
         ok, desc = send_message(message, chat_id=chat_id)
         results.append((chat_id, ok, desc))
     return results

@@ -23,6 +23,16 @@ team+「機器人推播」室 - 即時問答監聽腳本 (08/06改版：HTTP API
 剛好含有查詢關鍵字，只比文字會誤判成新指令、觸發下一輪回覆)。
 
 ════════════════════════════════════════
+2026/08/10：即時問答支援多聊天室
+════════════════════════════════════════
+原本即時問答只在CHAT_ID(「機器人推播」室)運作。現在改成跟teamplus_push.py
+的推播共用同一份聊天室清單(config.txt的teamplus_extra_chat_ids，逗號分隔)，
+在這些額外聊天室裡問問題，機器人也會在同一間聊天室回覆。每個聊天室各自有
+獨立的cursor/自問自答保護狀態，不會互相干擾。CHAT_ID(機器人專屬房間)開機
+時會照舊貼一則「已上線」通知拿真實batchID當cursor；額外聊天室(通常是真人
+在用的群組)開機時改用靜默同步方式，不會多貼一則公告進去。
+
+════════════════════════════════════════
 08/06重大改版：改用team+ HTTP API(teamplus_api.py)，不再用Selenium操控Edge
 ════════════════════════════════════════
 原本這支腳本靠附身模式Edge讀取畫面上的DOM內容、模擬打字送出，這條路線
@@ -427,52 +437,75 @@ RATE_LIMIT_WINDOW_SECONDS = 60
 BOOT_MESSAGE = "🤖 DA機器人已上線，輸入「查詢」看關鍵字說明"
 
 
+def _init_room_state(chat_id, announce):
+    """
+    初始化單一聊天室的監聽狀態(cursor/sent_batch_ids/recent_reply_times)。
+
+    announce=True時用「先送一則已上線訊息，拿這則訊息真正的batchID(team+
+    親自確認、真實存在於訊息紀錄裡的值)當第一個cursor」開機——team+的
+    getNewestMessageList這支API，NewestBatchID傳空字串/隨便產生一個跟
+    訊息紀錄無關的值，都不保證能拿到正確、穩定可用的cursor(甚至可能直接
+    被拒絕、參數錯誤)，這是同事逆向出來的teamplus_bot.py驗證過可靠的
+    開機方式，但會在該聊天室留下一則「已上線」訊息，只適合CHAT_ID這種
+    機器人專屬房間。
+
+    announce=False時改用靜默的備援同步方式(read_new_messages(None)，
+    teamplus_api內部會自動用隨機UUID當NewestBatchID)，不會留言，但cursor
+    可靠性較差；用在額外聊天室(2026/08/10使用者要求即時問答也要支援
+    config.txt裡teamplus_extra_chat_ids設定的聊天室)，不要每次重啟服務
+    就洗一則公告進真人在用的群組。
+
+    如果announce=True但上線通知送失敗(例如cookie過期)，一樣退回用
+    read_new_messages(None)，讓服務還能啟動、之後靠[警告]訊息提示需要
+    重新抓cookie。
+    """
+    if announce:
+        ok, desc, bid = teamplus_api.send_message_get_batch_id(BOOT_MESSAGE, chat_id=chat_id)
+        if ok:
+            print(f"[啟動] 聊天室{chat_id}已送出上線通知，之後只會回應這則之後才出現的新訊息")
+            return {
+                "cursor": bid,
+                "sent_batch_ids": [bid],  # 記住機器人自己送出的訊息的BatchID，避免自問自答
+                "recent_reply_times": [],  # 防暴衝保護用的時間戳記錄
+            }
+        print(f"[警告] 聊天室{chat_id}上線通知送出失敗({desc})，改用備援方式啟動")
+
+    messages, cursor = teamplus_api.read_new_messages(None, chat_id=chat_id)
+    print(f"[啟動] 聊天室{chat_id}已同步至最新訊息(略過{len(messages)}則既有訊息)，之後只會回應新出現的訊息")
+    return {"cursor": cursor, "sent_batch_ids": [], "recent_reply_times": []}
+
+
 def init_listener_state():
     """
     初始化監聽狀態(第一次啟動時呼叫一次)。
 
-    重要：team+的getNewestMessageList這支API，NewestBatchID傳空字串/隨便產生
-    一個跟訊息紀錄無關的值，都不保證能拿到正確、穩定可用的cursor(甚至可能直接
-    被拒絕、參數錯誤)。同事逆向出來的teamplus_bot.py開機時的做法，是先送一則
-    「已上線」的訊息，用這則訊息真正的batchID(team+親自確認、真實存在於訊息
-    紀錄裡的值)當第一個cursor，之後的訊息只要比這個batchID新就一定抓得到。
-    這裡照做，不再靠讀取空cursor去猜「目前最新」是什麼。
+    對teamplus_api.all_chat_ids()回傳的每一間聊天室各自初始化獨立的
+    cursor/sent_batch_ids/recent_reply_times(2026/08/10使用者要求即時
+    問答不再只在CHAT_ID運作，要能在額外聊天室也回答問題)，每間聊天室
+    互不干擾——不會因為A聊天室洗版就影響B聊天室的回覆額度，也不會把
+    A聊天室的自己人訊息誤判成B聊天室的新指令。
 
-    如果連上線通知都送失敗(例如cookie過期)，退回用read_new_messages(None)
-    (teamplus_api內部會自動用隨機UUID當NewestBatchID，至少不會直接卡死)，
-    讓服務還能啟動、之後靠[警告]訊息提示需要重新抓cookie。
+    回傳{"rooms": {chat_id: {cursor/sent_batch_ids/recent_reply_times}, ...}}。
     """
-    ok, desc, bid = teamplus_api.send_message_get_batch_id(BOOT_MESSAGE)
-    sent_batch_ids = []
-    if ok:
-        cursor = bid
-        sent_batch_ids.append(bid)
-        print("[啟動] 已送出上線通知，之後只會回應這則之後才出現的新訊息")
-    else:
-        print(f"[警告] 上線通知送出失敗({desc})，改用備援方式啟動")
-        messages, cursor = teamplus_api.read_new_messages(None)
-        print(f"[啟動] 已同步至最新訊息(略過{len(messages)}則既有訊息)，之後只會回應新出現的訊息")
-    return {
-        "cursor": cursor,
-        "sent_batch_ids": sent_batch_ids,  # 記住機器人自己送出的訊息的BatchID，避免自問自答
-        "recent_reply_times": [],          # 防暴衝保護用的時間戳記錄
-    }
+    rooms = {}
+    for chat_id in teamplus_api.all_chat_ids():
+        # 只有CHAT_ID(機器人推播室)用會留言的開機方式，額外聊天室靜默開機
+        rooms[chat_id] = _init_room_state(chat_id, announce=(chat_id == teamplus_api.CHAT_ID))
+    return {"rooms": rooms}
 
 
-def poll_once(state):
+def _poll_room_once(chat_id, room_state):
     """
-    檢查一次「機器人推播」室有沒有新訊息，有的話解析、回覆。
-    是main()裡while迴圈的其中一輪內容，抽出來讓da_bot_service.py
-    合併服務也能在自己的迴圈裡呼叫這個函式，共用同一套邏輯。
-    state是init_listener_state()回傳的dict，會被就地更新。
+    檢查一次指定聊天室有沒有新訊息，有的話解析、回覆(回覆會送回同一間
+    聊天室)。room_state是_init_room_state()回傳的dict，會被就地更新。
     """
-    new_messages, new_cursor = teamplus_api.read_new_messages(state["cursor"])
+    new_messages, new_cursor = teamplus_api.read_new_messages(room_state["cursor"], chat_id=chat_id)
     if not new_messages:
         return
-    state["cursor"] = new_cursor
+    room_state["cursor"] = new_cursor
 
-    sent_batch_ids = state["sent_batch_ids"]
-    recent_reply_times = state["recent_reply_times"]
+    sent_batch_ids = room_state["sent_batch_ids"]
+    recent_reply_times = room_state["recent_reply_times"]
 
     for msg in new_messages:
         text = msg["text"]
@@ -499,21 +532,32 @@ def poll_once(state):
             # 一起殺掉，之後除非有人發現、手動重開，不然機器人會一直保持沒反應的狀態。
             # 改成只跳過這批訊息剩下的部分不回覆，讓服務繼續跑，等這波次數退到
             # RATE_LIMIT_WINDOW_SECONDS之外自動恢復正常回覆。
-            print(f"[警告] {RATE_LIMIT_WINDOW_SECONDS}秒內已回覆{len(recent_reply_times)}次，"
+            print(f"[警告] 聊天室{chat_id} {RATE_LIMIT_WINDOW_SECONDS}秒內已回覆{len(recent_reply_times)}次，"
                   "疑似自問自答或異常迴圈，這批訊息剩下的部分先不回覆，服務繼續運作")
             break
 
-        print(f"[收到指令] {text!r} -> {cmd}")
+        print(f"[聊天室{chat_id}][收到指令] {text!r} -> {cmd}")
         reply = build_reply(cmd)
-        print(f"[回覆] {reply}")
-        ok, desc, reply_bid = teamplus_api.send_message_get_batch_id(reply)
+        print(f"[聊天室{chat_id}][回覆] {reply}")
+        ok, desc, reply_bid = teamplus_api.send_message_get_batch_id(reply, chat_id=chat_id)
         if ok:
             recent_reply_times.append(now)
             sent_batch_ids.append(reply_bid)
             if len(sent_batch_ids) > 30:
                 sent_batch_ids.pop(0)
         else:
-            print(f"[警告] 送出訊息失敗: {desc}")
+            print(f"[警告] 聊天室{chat_id}送出訊息失敗: {desc}")
+
+
+def poll_once(state):
+    """
+    檢查一輪所有聊天室有沒有新訊息，有的話解析、回覆。
+    是main()裡while迴圈的其中一輪內容，抽出來讓da_bot_service.py
+    合併服務也能在自己的迴圈裡呼叫這個函式，共用同一套邏輯。
+    state是init_listener_state()回傳的dict(含"rooms")，會被就地更新。
+    """
+    for chat_id, room_state in state["rooms"].items():
+        _poll_room_once(chat_id, room_state)
 
 
 def main():

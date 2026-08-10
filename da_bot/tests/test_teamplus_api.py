@@ -138,6 +138,32 @@ class TestReadNewMessagesCursorBootstrap(unittest.TestCase):
         teamplus_api.read_new_messages(cursor1)
         self.assertEqual(captured["NewestBatchID"], cursor1)
 
+    def test_chat_id_param_used_when_given(self):
+        # 2026/08/10使用者要求即時問答支援額外聊天室：read_new_messages()
+        # 要能指定要讀哪一間聊天室，不指定時維持原本讀CHAT_ID的行為
+        captured = {}
+
+        def fake_urlopen(req, context=None, timeout=None):
+            body = req.data.decode("utf-8")
+            captured["ChatID"] = teamplus_api.urllib.parse.parse_qs(body)["ChatID"][0]
+            return _FakeResponse({"IsSuccess": True, "MessageList": [], "Description": "查無資料"})
+
+        teamplus_api.urllib.request.urlopen = fake_urlopen
+        teamplus_api.read_new_messages(None, chat_id="room-a")
+        self.assertEqual(captured["ChatID"], "room-a")
+
+    def test_defaults_to_chat_id_constant_when_not_given(self):
+        captured = {}
+
+        def fake_urlopen(req, context=None, timeout=None):
+            body = req.data.decode("utf-8")
+            captured["ChatID"] = teamplus_api.urllib.parse.parse_qs(body)["ChatID"][0]
+            return _FakeResponse({"IsSuccess": True, "MessageList": [], "Description": "查無資料"})
+
+        teamplus_api.urllib.request.urlopen = fake_urlopen
+        teamplus_api.read_new_messages(None)
+        self.assertEqual(captured["ChatID"], teamplus_api.CHAT_ID)
+
 
 class TestSendMessageGetBatchId(unittest.TestCase):
     """同事的teamplus_bot.py開機時靠「送一則上線通知、拿這則訊息真正的
@@ -198,6 +224,30 @@ class TestLoadExtraChatIds(unittest.TestCase):
     def test_parses_comma_separated_list_and_strips_whitespace(self):
         teamplus_api.config.load = lambda path=None: {"teamplus_extra_chat_ids": " room-a , room-b ,"}
         self.assertEqual(teamplus_api._load_extra_chat_ids(), ["room-a", "room-b"])
+
+
+class TestAllChatIds(unittest.TestCase):
+    """all_chat_ids()：CHAT_ID+額外聊天室(去重、保留順序)，
+    broadcast_message()推播跟teamplus_listener.py的即時問答監聽
+    (2026/08/10使用者要求Q&A也要支援額外聊天室)共用這份清單。"""
+
+    def setUp(self):
+        self._orig_extra = teamplus_api._load_extra_chat_ids
+
+    def tearDown(self):
+        teamplus_api._load_extra_chat_ids = self._orig_extra
+
+    def test_returns_only_chat_id_when_no_extra_configured(self):
+        teamplus_api._load_extra_chat_ids = lambda: []
+        self.assertEqual(teamplus_api.all_chat_ids(), [teamplus_api.CHAT_ID])
+
+    def test_appends_extra_rooms_in_order(self):
+        teamplus_api._load_extra_chat_ids = lambda: ["room-a", "room-b"]
+        self.assertEqual(teamplus_api.all_chat_ids(), [teamplus_api.CHAT_ID, "room-a", "room-b"])
+
+    def test_deduplicates_if_chat_id_repeated_in_extra_list(self):
+        teamplus_api._load_extra_chat_ids = lambda: [teamplus_api.CHAT_ID, "room-a"]
+        self.assertEqual(teamplus_api.all_chat_ids(), [teamplus_api.CHAT_ID, "room-a"])
 
 
 class TestBroadcastMessage(unittest.TestCase):

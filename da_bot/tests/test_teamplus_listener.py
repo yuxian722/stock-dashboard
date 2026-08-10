@@ -342,7 +342,7 @@ class TestPollOnceFloodProtection(unittest.TestCase):
         flood_size = listener.MAX_REPLIES_PER_WINDOW + 3
         messages = _msgs(*(["查詢"] * flood_size))
 
-        listener.teamplus_api.read_new_messages = lambda cursor: (messages, "cursor-1")
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: (messages, "cursor-1")
         sent = []
         listener.teamplus_api.send_message_get_batch_id = (
             lambda message, chat_id=None: (sent.append(message) or (True, "ok", "reply-bid"))
@@ -350,24 +350,24 @@ class TestPollOnceFloodProtection(unittest.TestCase):
 
         state = {"cursor": None, "sent_batch_ids": [], "recent_reply_times": []}
         try:
-            listener.poll_once(state)
+            listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
         except SystemExit:
-            self.fail("poll_once() 不應該用sys.exit()把整個服務殺掉")
+            self.fail("_poll_room_once() 不應該用sys.exit()把整個服務殺掉")
 
         # 應該在達到上限那一刻就停手，不是把整批洗版訊息全部回完
         self.assertEqual(len(sent), listener.MAX_REPLIES_PER_WINDOW)
 
     def test_cursor_still_advances_after_flood_stops_early(self):
         # 就算這批訊息因為洗版保護提早跳出，cursor還是要更新，
-        # 不然下次poll_once()會重複讀到同一批舊訊息卡在無限迴圈
+        # 不然下次_poll_room_once()會重複讀到同一批舊訊息卡在無限迴圈
         messages = _msgs(*(["查詢"] * (listener.MAX_REPLIES_PER_WINDOW + 3)))
-        listener.teamplus_api.read_new_messages = lambda cursor: (messages, "cursor-new")
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: (messages, "cursor-new")
         listener.teamplus_api.send_message_get_batch_id = (
             lambda message, chat_id=None: (True, "ok", "reply-bid")
         )
 
         state = {"cursor": "cursor-old", "sent_batch_ids": [], "recent_reply_times": []}
-        listener.poll_once(state)
+        listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
         self.assertEqual(state["cursor"], "cursor-new")
 
 
@@ -396,7 +396,7 @@ class TestPollOnceSelfAnswerLoop(unittest.TestCase):
         echoed_own_reply = _msgs(
             "【EPOXY(DB)機型群組】downrate(有資料49/54台): 稼動82.7%", start=1
         )
-        listener.teamplus_api.read_new_messages = lambda cursor: (echoed_own_reply, "cursor-2")
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: (echoed_own_reply, "cursor-2")
 
         sent = []
         listener.teamplus_api.send_message_get_batch_id = (
@@ -404,7 +404,7 @@ class TestPollOnceSelfAnswerLoop(unittest.TestCase):
         )
 
         state = {"cursor": "cursor-1", "sent_batch_ids": ["b1"], "recent_reply_times": []}
-        listener.poll_once(state)
+        listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
 
         self.assertEqual(sent, [])  # 不該再回覆
         self.assertNotIn("b1", state["sent_batch_ids"])  # 用掉一次後要從清單移除
@@ -413,7 +413,7 @@ class TestPollOnceSelfAnswerLoop(unittest.TestCase):
         # 對照組：如果這則訊息的batch_id不是機器人自己送的(代表是別人重新
         # 打了一模一樣的字)，就還是要正常回覆，不能因為文字剛好重複就跳過
         someone_elses_message = _msgs("EPOXY(DB) downrate", start=99)
-        listener.teamplus_api.read_new_messages = lambda cursor: (someone_elses_message, "cursor-2")
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: (someone_elses_message, "cursor-2")
 
         sent = []
         listener.teamplus_api.send_message_get_batch_id = (
@@ -421,7 +421,7 @@ class TestPollOnceSelfAnswerLoop(unittest.TestCase):
         )
 
         state = {"cursor": "cursor-1", "sent_batch_ids": ["b1"], "recent_reply_times": []}
-        listener.poll_once(state)
+        listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
 
         self.assertEqual(len(sent), 1)
 
@@ -447,32 +447,143 @@ class TestInitListenerStateBootstrap(unittest.TestCase):
             lambda message, chat_id=None: (True, "發送成功", "real-batch-id-123")
         )
 
-        def boom(cursor):
+        def boom(cursor, chat_id=None):
             self.fail("開機通知送出成功的話，不該再去呼叫read_new_messages(None)")
 
         listener.teamplus_api.read_new_messages = boom
 
         state = listener.init_listener_state()
-        self.assertEqual(state["cursor"], "real-batch-id-123")
+        self.assertEqual(state["rooms"][listener.teamplus_api.CHAT_ID]["cursor"], "real-batch-id-123")
 
     def test_boot_message_batch_id_added_to_sent_ids(self):
         listener.teamplus_api.send_message_get_batch_id = (
             lambda message, chat_id=None: (True, "發送成功", "real-batch-id-123")
         )
-        listener.teamplus_api.read_new_messages = lambda cursor: self.fail("不該呼叫")
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: self.fail("不該呼叫")
 
         state = listener.init_listener_state()
-        self.assertIn("real-batch-id-123", state["sent_batch_ids"])
+        self.assertIn("real-batch-id-123", state["rooms"][listener.teamplus_api.CHAT_ID]["sent_batch_ids"])
 
     def test_falls_back_to_read_new_messages_when_boot_message_fails(self):
         # cookie過期之類的狀況，上線通知送不出去，至少服務還是要能啟動
         listener.teamplus_api.send_message_get_batch_id = (
             lambda message, chat_id=None: (False, "cookie過期", "unused-bid")
         )
-        listener.teamplus_api.read_new_messages = lambda cursor: ([], "fallback-cursor")
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: ([], "fallback-cursor")
 
         state = listener.init_listener_state()
-        self.assertEqual(state["cursor"], "fallback-cursor")
+        self.assertEqual(state["rooms"][listener.teamplus_api.CHAT_ID]["cursor"], "fallback-cursor")
+
+
+class TestMultiRoomListening(unittest.TestCase):
+    """2026/08/10使用者要求：即時問答不再只在CHAT_ID(機器人推播室)運作，
+    也要能在config.txt的teamplus_extra_chat_ids設定的額外聊天室回答問題，
+    回覆要送回同一間聊天室，每間聊天室的cursor/自問自答保護互相獨立。"""
+
+    def setUp(self):
+        self._orig_send_bid = listener.teamplus_api.send_message_get_batch_id
+        self._orig_read = listener.teamplus_api.read_new_messages
+        self._orig_extra = listener.teamplus_api._load_extra_chat_ids
+
+    def tearDown(self):
+        listener.teamplus_api.send_message_get_batch_id = self._orig_send_bid
+        listener.teamplus_api.read_new_messages = self._orig_read
+        listener.teamplus_api._load_extra_chat_ids = self._orig_extra
+
+    def test_init_creates_a_room_per_configured_chat_id(self):
+        listener.teamplus_api._load_extra_chat_ids = lambda: ["room-a", "room-b"]
+        listener.teamplus_api.send_message_get_batch_id = (
+            lambda message, chat_id=None: (True, "ok", f"boot-{chat_id}")
+        )
+        # 額外聊天室(room-a/room-b)靜默開機，會呼叫read_new_messages(None,...)，
+        # 只有CHAT_ID才走送上線通知那條路徑(見另一個測試)
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: ([], f"cursor-{chat_id}")
+
+        state = listener.init_listener_state()
+        self.assertEqual(
+            set(state["rooms"].keys()),
+            {listener.teamplus_api.CHAT_ID, "room-a", "room-b"},
+        )
+
+    def test_extra_rooms_bootstrap_silently_without_boot_message(self):
+        # 主要聊天室(CHAT_ID)才送「已上線」通知，額外聊天室(通常是真人在用
+        # 的群組)開機時不該貼公告進去，改用靜默同步方式
+        listener.teamplus_api._load_extra_chat_ids = lambda: ["room-a"]
+        announced = []
+
+        def fake_send_bid(message, chat_id=None):
+            announced.append(chat_id)
+            return True, "ok", f"boot-{chat_id}"
+
+        def fake_read(cursor, chat_id=None):
+            return [], f"fallback-cursor-{chat_id}"
+
+        listener.teamplus_api.send_message_get_batch_id = fake_send_bid
+        listener.teamplus_api.read_new_messages = fake_read
+
+        state = listener.init_listener_state()
+        self.assertEqual(announced, [listener.teamplus_api.CHAT_ID])  # 只有主要聊天室貼過公告
+        self.assertEqual(state["rooms"]["room-a"]["cursor"], "fallback-cursor-room-a")
+        self.assertEqual(state["rooms"]["room-a"]["sent_batch_ids"], [])
+
+    def test_poll_once_replies_in_the_same_room_the_question_came_from(self):
+        listener.teamplus_api._load_extra_chat_ids = lambda: ["room-a"]
+
+        def fake_read(cursor, chat_id=None):
+            if chat_id == "room-a":
+                return _msgs("查詢", start=1), "room-a-cursor-2"
+            return [], cursor
+
+        sent_to = []
+
+        def fake_send_bid(message, chat_id=None):
+            sent_to.append(chat_id)
+            return True, "ok", "reply-bid"
+
+        listener.teamplus_api.read_new_messages = fake_read
+        listener.teamplus_api.send_message_get_batch_id = fake_send_bid
+
+        state = {
+            "rooms": {
+                listener.teamplus_api.CHAT_ID: {"cursor": None, "sent_batch_ids": [], "recent_reply_times": []},
+                "room-a": {"cursor": None, "sent_batch_ids": [], "recent_reply_times": []},
+            }
+        }
+        listener.poll_once(state)
+
+        self.assertEqual(sent_to, ["room-a"])  # 只回覆到訊息來源的那間聊天室
+
+    def test_flood_protection_is_independent_per_room(self):
+        # room-a洗版超過上限，不該影響room-b的正常回覆額度
+        listener.teamplus_api._load_extra_chat_ids = lambda: ["room-a", "room-b"]
+
+        def fake_read(cursor, chat_id=None):
+            if chat_id == "room-a":
+                return _msgs(*(["查詢"] * (listener.MAX_REPLIES_PER_WINDOW + 3)), start=1), "room-a-cursor"
+            if chat_id == "room-b":
+                return _msgs("查詢", start=999), "room-b-cursor"
+            return [], cursor
+
+        sent_to = []
+
+        def fake_send_bid(message, chat_id=None):
+            sent_to.append(chat_id)
+            return True, "ok", "reply-bid"
+
+        listener.teamplus_api.read_new_messages = fake_read
+        listener.teamplus_api.send_message_get_batch_id = fake_send_bid
+
+        state = {
+            "rooms": {
+                listener.teamplus_api.CHAT_ID: {"cursor": None, "sent_batch_ids": [], "recent_reply_times": []},
+                "room-a": {"cursor": None, "sent_batch_ids": [], "recent_reply_times": []},
+                "room-b": {"cursor": None, "sent_batch_ids": [], "recent_reply_times": []},
+            }
+        }
+        listener.poll_once(state)
+
+        self.assertEqual(sent_to.count("room-a"), listener.MAX_REPLIES_PER_WINDOW)
+        self.assertEqual(sent_to.count("room-b"), 1)  # room-a洗版不影響room-b
 
 
 if __name__ == "__main__":

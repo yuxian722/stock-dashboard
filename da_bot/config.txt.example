@@ -14,4 +14,7 @@ util_password=your_util_password
 # 逗號分隔，可填多個。ChatID取得方式：到目標聊天室畫面，F12開發者工具->
 # 網路分頁->送出一則訊息->找SendMsgHandler.ashx那個請求->表單資料裡的ChatID欄位。
 # 不填的話維持只推播到teamplus_api.py裡CHAT_ID那一間，行為不變。
+# 2026/08/10起：即時問答(teamplus_listener.py/da_bot_service.py)也會在這裡
+# 設定的每一間聊天室運作，不再只回答CHAT_ID那一間——同一份清單，不用另外設定。
+# 額外聊天室開機時不會貼「已上線」公告(只有CHAT_ID那間會)，避免打擾真人在用的群組。
 # teamplus_extra_chat_ids=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx,yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
