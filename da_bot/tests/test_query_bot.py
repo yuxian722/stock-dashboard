@@ -452,6 +452,37 @@ class TestGroupOfficialDownrateReply(unittest.TestCase):
         reply = query_bot.group_official_downrate_reply("DB800", date_ymd="20260808")
         self.assertIn("稼動(UTIL): 84.0 %", reply)
 
+    def test_warns_when_last_fetch_of_the_day_looks_incomplete(self):
+        # 2026/08/10使用者實測發現：DB700那天我們回82.1%，CPIS網頁事後查是
+        # 80.3%，追查是我們存的「當天最後一筆」停在15:00(服務中途停過)。
+        # 加這個警告提示使用者數字可能不是事後結算的最終版本
+        query_bot.DB_PATH = _make_db_for_official_downrate_tests([
+            {"model": "DB700", "entity": None, "util": "82.1 %",
+             "fetched_at": "2026-08-09 15:00:26",
+             "query_date_start": "20260809", "query_date_end": "20260809"},
+        ])
+        reply = query_bot.group_official_downrate_reply("DB700", date_ymd="20260809", date_label="08/09")
+        self.assertIn("⚠️", reply)
+        self.assertIn("cpis_utilization_scraper.py 20260809 20260809", reply)
+
+    def test_no_warning_when_last_fetch_is_late_in_the_day(self):
+        query_bot.DB_PATH = _make_db_for_official_downrate_tests([
+            {"model": "DB700", "entity": None, "util": "80.3 %",
+             "fetched_at": "2026-08-09 22:00:00",
+             "query_date_start": "20260809", "query_date_end": "20260809"},
+        ])
+        reply = query_bot.group_official_downrate_reply("DB700", date_ymd="20260809", date_label="08/09")
+        self.assertNotIn("⚠️", reply)
+
+    def test_no_warning_when_date_not_specified(self):
+        query_bot.DB_PATH = _make_db_for_official_downrate_tests([
+            {"model": "DB700", "entity": None, "util": "82.1 %",
+             "fetched_at": "2026-08-09 15:00:26",
+             "query_date_start": "20260809", "query_date_end": "20260809"},
+        ])
+        reply = query_bot.group_official_downrate_reply("DB700")
+        self.assertNotIn("⚠️", reply)
+
     def test_no_data_for_that_date_shows_date_specific_message(self):
         query_bot.DB_PATH = _make_db_for_official_downrate_tests([
             {"model": "DB800", "entity": None, "util": "82.0 %",

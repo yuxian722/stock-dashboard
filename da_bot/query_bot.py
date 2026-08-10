@@ -757,7 +757,37 @@ def group_official_downrate_reply(group_label: str, date_ymd: str = None,
     run = g("RUN")
     if run is not None:
         lines.append(f"RUN: {run}")
+
+    # 指定日期查詢時，如果抓到的最後一筆是當天較早的時間(不像是快到日終
+    # 才抓的)，數字很可能還沒反映CPIS事後結算的最終版本——CPIS的UTIL%是
+    # 累計到查詢當下的數字，同一天不同時間點查會不一樣，服務中途停過的話
+    # 我們存的「當天最後一筆」可能停在中午/下午，跟隔天事後用CPIS網頁重新
+    # 查同一天會不一致(2026/08/10使用者實測發現：DB700同一天我們回82.1%，
+    # CPIS網頁事後查是80.3%，追查是我們最後一筆停在15:00)。加這個提示，
+    # 並告訴使用者可以事後補抓(CPIS允許查詢過去日期，補抓會拿到最終數字)。
+    if date_ymd:
+        fetched_dt = _parse_fetched_at(g("fetched_at"))
+        if fetched_dt is not None and fetched_dt.hour < 21:
+            lines.append(
+                f"⚠️ 這是{date_label or date_ymd}當天最後一次抓到的資料，"
+                "可能不是CPIS事後結算的最終數字(服務可能中途停止抓取)。"
+                f"要補抓最終數字可以事後執行 python cpis_utilization_scraper.py {date_ymd} {date_ymd}"
+            )
     return "\n".join(lines)
+
+
+def _parse_fetched_at(s):
+    """utilization_record.fetched_at是SQLite datetime('now')產生的
+    "YYYY-MM-DD HH:MM:SS"格式，但測試資料/其他來源有時會用"YYYY-MM-DDTHH:MM:SS"
+    (ISO格式帶T)，這裡兩種都容忍，都轉不了回傳None。"""
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def all_groups_official_downrate_reply(date_ymd: str = None, date_label: str = None) -> str:
