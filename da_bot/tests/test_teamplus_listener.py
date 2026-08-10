@@ -248,13 +248,13 @@ class TestParseQueryDatedChangeoverAndWorkhours(unittest.TestCase):
         conn.execute("""
             CREATE TABLE ee_maintenance_record (
                 machine_id TEXT, bgn_date TEXT, bgn_time TEXT, end_date TEXT, end_time TEXT,
-                job_code TEXT, e_tag TEXT, engineer_id TEXT, dur REAL
+                job_code TEXT, e_tag TEXT, engineer_id TEXT, dur REAL, wait_dur REAL
             )
         """)
         conn.execute(
             "INSERT INTO ee_maintenance_record "
-            "(machine_id, end_date, end_time, job_code, e_tag, engineer_id, dur) "
-            "VALUES ('BAA01', '2026-08-09', '10:00', 'CED', 'S', 's10435', 1.0)"
+            "(machine_id, end_date, end_time, job_code, e_tag, engineer_id, dur, wait_dur) "
+            "VALUES ('BAA01', '2026-08-09', '10:00', 'CED', 'S', 's10435', 1.0, 0.5)"
         )
         conn.commit()
         conn.close()

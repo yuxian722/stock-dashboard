@@ -930,11 +930,11 @@ def _changeover_rows_for_group(cur, group_name, now):
     """
     回傳指定機型群組今日(跟班別對齊，見hourly_push._shift_day_bounds())已
     完成的真正改機(job_code屬於CED/CEE/CD類別)紀錄原始列(machine_id/
-    job_code/engineer_id/dur)，group_name="EPOXY"時涵蓋ESEC+DB。
+    job_code/engineer_id/dur/wait_dur)，group_name="EPOXY"時涵蓋ESEC+DB。
     """
     shift_date, next_date = hourly_push._shift_day_bounds(now)
     cur.execute("""
-        SELECT DISTINCT machine_id, bgn_date, bgn_time, end_time, job_code, engineer_id, dur
+        SELECT DISTINCT machine_id, bgn_date, bgn_time, end_time, job_code, engineer_id, dur, wait_dur
         FROM ee_maintenance_record
         WHERE e_tag = 'S' AND (
             (end_date = ? AND end_time >= ?)
@@ -959,8 +959,8 @@ def _changeover_rows_for_group(cur, group_name, now):
             continue
         rows.append({
             "machine_id": r["machine_id"], "job_code": r["job_code"],
-            "engineer_id": r["engineer_id"], "dur": r["dur"], "category": category,
-            "end_time": r["end_time"],
+            "engineer_id": r["engineer_id"], "dur": r["dur"], "wait_dur": r["wait_dur"],
+            "category": category, "end_time": r["end_time"],
         })
     return rows
 
@@ -1046,6 +1046,17 @@ def group_changeover_detail_reply(group_name: str, now: datetime.datetime = None
     for eng, eng_rows in sorted(by_engineer.items(), key=lambda kv: -len(kv[1])):
         eng_cat_parts = _category_avg_parts(eng_rows)
         lines.append(f"{engineer_master.format_engineer(eng)}  改機{len(eng_rows)}台  " + " ".join(eng_cat_parts))
+
+    # 機台明細：逐筆列出機台號碼+待改時間(wait_dur)+改機時間(dur)+人員工號
+    # (2026/08/10使用者要求：打DB改機/2100改機/LOC改機這種<群組>改機查詢，
+    # 要看到每一台機台各自的wait時間和改機時間，不是只有彙總統計)
+    lines.append("")
+    lines.append("機台明細:")
+    for r in sorted(rows, key=lambda r: r["machine_id"]):
+        wait_txt = f"{r['wait_dur']:.2f}hr" if r["wait_dur"] is not None else "?"
+        dur_txt = f"{r['dur']:.2f}hr" if r["dur"] is not None else "?"
+        eng_txt = engineer_master.format_engineer(r["engineer_id"]) if r["engineer_id"] else "未指定"
+        lines.append(f"{r['machine_id']}  待{wait_txt}  改機{dur_txt}  {eng_txt}")
 
     return "\n".join(lines)
 

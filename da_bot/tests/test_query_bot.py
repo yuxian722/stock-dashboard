@@ -601,23 +601,23 @@ class TestGetStdHours(unittest.TestCase):
 
 def _make_db_for_changeover_tests(rows):
     """rows是list of dict，可含machine_id/e_tag/job_code/engineer_id/dur/
-    end_date/end_time(缺的欄位當NULL)，寫進ee_maintenance_record。"""
+    wait_dur/end_date/end_time(缺的欄位當NULL)，寫進ee_maintenance_record。"""
     path = tempfile.mktemp(suffix=".db")
     conn = sqlite3.connect(path)
     conn.execute("""
         CREATE TABLE ee_maintenance_record (
             machine_id TEXT, bgn_date TEXT, bgn_time TEXT, end_date TEXT, end_time TEXT,
-            job_code TEXT, e_tag TEXT, engineer_id TEXT, dur REAL
+            job_code TEXT, e_tag TEXT, engineer_id TEXT, dur REAL, wait_dur REAL
         )
     """)
     for row in rows:
         conn.execute(
             "INSERT INTO ee_maintenance_record "
-            "(machine_id, bgn_date, bgn_time, end_date, end_time, job_code, e_tag, engineer_id, dur) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "(machine_id, bgn_date, bgn_time, end_date, end_time, job_code, e_tag, engineer_id, dur, wait_dur) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (row.get("machine_id"), row.get("bgn_date"), row.get("bgn_time"), row.get("end_date"),
              row.get("end_time"), row.get("job_code"), row.get("e_tag"), row.get("engineer_id"),
-             row.get("dur")),
+             row.get("dur"), row.get("wait_dur")),
         )
     conn.commit()
     conn.close()
@@ -659,6 +659,26 @@ class TestGroupChangeoverDetailReply(unittest.TestCase):
         self.assertIn("CED機台2台平均1.2hr", reply)
         self.assertIn("CEE機台1台平均1.0hr", reply)
         self.assertIn("s10435  改機3台", reply)
+
+    def test_machine_detail_section_lists_each_machine_with_wait_and_duration(self):
+        # 2026/08/10使用者要求：打DB改機/2100改機/LOC改機這種<群組>改機查詢，
+        # 要多一段「機台明細」逐台列出wait時間+改機時間+機台號碼+人員工號，
+        # 不能只有彙總統計
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_changeover_tests([
+            {"machine_id": "BAA02", "e_tag": "S", "end_date": today, "end_time": "10:00",
+             "job_code": "CED", "engineer_id": "s10435", "dur": 1.5, "wait_dur": 0.5},
+            {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "11:00",
+             "job_code": "CEE", "engineer_id": None, "dur": 2.0, "wait_dur": None},
+        ])
+        reply = query_bot.group_changeover_detail_reply("DB", now)
+        self.assertIn("機台明細:", reply)
+        # 依機台代號排序，BAA01排在BAA02前面
+        detail_section = reply.split("機台明細:")[1]
+        self.assertIn("BAA01  待?  改機2.00hr  未指定", detail_section)
+        self.assertIn("BAA02  待0.50hr  改機1.50hr  s10435", detail_section)
+        self.assertLess(detail_section.index("BAA01"), detail_section.index("BAA02"))
 
     def test_non_changeover_jcode_excluded(self):
         now = datetime.datetime(2026, 8, 9, 14, 0)
