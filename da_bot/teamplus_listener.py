@@ -71,6 +71,13 @@ POLL_INTERVAL_SECONDS = 10
 
 MACHINE_RE = re.compile(r"([A-Za-z]{1,4}\d{2,4})")
 
+# 「<機台代號>改機」要求機台代號緊鄰"改機"(可留空白)，不能像"改機"在文字
+# 某處出現、機台代號在文字另一處出現這樣各自獨立成立就觸發——這正是
+# 2026/08/10發現的"ACON8800"自問自答案例的根因(見下面parse_query裡的
+# 詳細說明)。前面加(?<![A-Za-z0-9])避免從更長的英數字串中間擷取出子字串
+# (例如"DATACON8800"裡的"ACON8800")。
+_MACHINE_CHANGEOVER_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}\d{2,4})\s*改機(?![A-Za-z0-9])", re.IGNORECASE)
+
 # CPIS Utilization Analysis 頁面最下方「GROUP」彙總表官方群組名稱，
 # 對應query_bot.OFFICIAL_GROUP_LABELS，用來辨識「<官方群組名稱>+downrate關鍵字」
 # 這種要查官方原始彙總數字(而非我們自己算的平均)的訊息
@@ -282,14 +289,22 @@ def parse_query(text):
     # 也要排在下面「沒指定群組的改機」判斷之前——不然"BAA02改機"會被那條
     # 規則搶走，變成回全部群組彙總而不是BAA02自己的資料。「歷史」關鍵字
     # 切換成不限日期查全部歷史紀錄，沒加就是今日(可以搭配"8/9"這種日期)。
-    if "改機" in text:
-        m_machine = MACHINE_RE.search(text)
-        if m_machine:
-            cmd = {"mode": "machine_changeover_detail", "machine": m_machine.group(1).upper(),
-                   "all_history": "歷史" in text}
-            if query_now is not None:
-                cmd["now"], cmd["date_label"] = query_now, date_label
-            return cmd
+    #
+    # 2026/08/10發現真實自問自答案例：原本這裡是「"改機"在text裡」+「text
+    # 裡任何地方出現機台代號」兩個獨立條件(不要求相鄰)，導致機器人自己回覆
+    # 的"ACON8800查無所屬機型群組，無法判斷改機標準"這種錯誤訊息(機台代號
+    # 錯誤解析自"DATACON8800"官方群組名稱裡的子字串，"改機"兩字則來自訊息
+    # 本文)又被自己讀回去、誤判成新的"ACON8800改機"查詢，無限循環下去。
+    # 改用_MACHINE_CHANGEOVER_RE要求機台代號跟"改機"緊鄰(可留空白)，
+    # 跟_build_group_suffix_pattern()對群組關鍵字的嚴謹度一致，不能像
+    # 這樣讓兩個獨立條件各自在文字不同地方成立就觸發。
+    m_machine_changeover = _MACHINE_CHANGEOVER_RE.search(text)
+    if m_machine_changeover:
+        cmd = {"mode": "machine_changeover_detail", "machine": m_machine_changeover.group(1).upper(),
+               "all_history": "歷史" in text}
+        if query_now is not None:
+            cmd["now"], cmd["date_label"] = query_now, date_label
+        return cmd
 
     # 沒指定群組的「改機」查詢(例如"8/9改機"，或單獨打"改機")：列出EPOXY/LOC/
     # FlipChip全部群組指定日期(預設今日)的改機彙總(2026/08/10使用者要求)。
@@ -573,11 +588,14 @@ def _init_room_state(chat_id):
             "cursor": bid,
             "sent_batch_ids": [bid],  # 記住機器人自己送出的訊息的BatchID，避免自問自答
             "recent_reply_times": [],  # 防暴衝保護用的時間戳記錄
+            "last_query_text": None,  # 內容型防迴圈用：上一次觸發查詢的文字
+            "same_text_streak": 0,  # 同一段文字連續觸發查詢的次數
         }
     print(f"[警告] 聊天室{chat_id}上線通知送出失敗({desc})，改用備援方式啟動")
     messages, cursor = teamplus_api.read_new_messages(None, chat_id=chat_id)
     print(f"[啟動] 聊天室{chat_id}已同步至最新訊息(略過{len(messages)}則既有訊息)，之後只會回應新出現的訊息")
-    return {"cursor": cursor, "sent_batch_ids": [], "recent_reply_times": []}
+    return {"cursor": cursor, "sent_batch_ids": [], "recent_reply_times": [],
+            "last_query_text": None, "same_text_streak": 0}
 
 
 def init_listener_state():
@@ -632,6 +650,22 @@ def _poll_room_once(chat_id, room_state):
 
         cmd = parse_query(text)
         if cmd is None:
+            continue
+
+        # 內容型防迴圈：不管BatchID比對出於什麼原因失效(例如2026/08/10發現
+        # 的"ACON8800"案例——機器人自己的錯誤訊息剛好又能被解析成新查詢，
+        # 一路循環到洗版保護的次數上限)，只要「同一段文字」連續觸發查詢
+        # 超過3次，就先靜音這段文字、不再回覆，等下一段不一樣的文字出現才
+        # 恢復——這是比對「內容」而不是BatchID，能攔住BatchID機制本身
+        # 出問題的情況，是最後一道防線(使用者2026/08/10要求)。
+        if text == room_state.get("last_query_text"):
+            room_state["same_text_streak"] = room_state.get("same_text_streak", 0) + 1
+        else:
+            room_state["last_query_text"] = text
+            room_state["same_text_streak"] = 1
+        if room_state["same_text_streak"] > 3:
+            print(f"[警告] 聊天室{chat_id} 同一段文字連續觸發查詢第{room_state['same_text_streak']}次: "
+                  f"{text!r}，疑似自問自答迴圈，暫停回覆這段文字，直到出現不同內容為止")
             continue
 
         now = time.time()

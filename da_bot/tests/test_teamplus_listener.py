@@ -185,6 +185,22 @@ class TestParseQueryDatedChangeoverAndWorkhours(unittest.TestCase):
         self.assertEqual(cmd["date_label"], "08/09")
         self.assertEqual((cmd["now"].month, cmd["now"].day), (8, 9))
 
+    def test_unrelated_machine_and_changeover_word_not_adjacent_does_not_match(self):
+        # 2026/08/10發現的真實自問自答案例：機器人自己的錯誤訊息"ACON8800
+        # 查無所屬機型群組，無法判斷改機標準"，"ACON8800"(其實是"DATACON8800"
+        # 官方群組名稱裡擷取出來的子字串，不是真的機台代號)跟"改機"分別出現
+        # 在文字不同地方(不相鄰)，不該被誤判成"ACON8800改機"這種單機查詢，
+        # 不然機器人會自問自答自己這則錯誤訊息，無限循環下去
+        cmd = listener.parse_query("ACON8800 查無所屬機型群組，無法判斷改機標準")
+        self.assertNotEqual(cmd.get("mode") if cmd else None, "machine_changeover_detail")
+
+    def test_machine_code_extracted_from_longer_alnum_run_not_matched(self):
+        # 同一個bug的另一個角度：即使"改機"緊跟在後面，也不該從更長的英數
+        # 字串中間擷取出"機台代號"(例如"DATACON8800改機"不該被解讀成
+        # "ACON8800改機")
+        cmd = listener.parse_query("DATACON8800改機")
+        self.assertNotEqual(cmd.get("mode") if cmd else None, "machine_changeover_detail")
+
     def test_group_changeover_keyword_not_shadowed_by_machine_rule(self):
         # 群組(例如"DB改機")的判斷排在前面，要確認新規則沒有搶走群組查詢
         cmd = listener.parse_query("DB改機")
@@ -474,8 +490,11 @@ class TestPollOnceFloodProtection(unittest.TestCase):
         listener.teamplus_api.send_message_get_batch_id = self._orig_send_bid
 
     def test_flood_within_one_batch_does_not_raise_systemexit(self):
+        # 用不同文字的查詢(不是同一段文字重複)，這裡要測的是次數上限的
+        # 洗版保護，不要被2026/08/10新增的「同一段文字連續3次」內容型
+        # 防迴圈提早攔截，兩者是各自獨立的保護機制
         flood_size = listener.MAX_REPLIES_PER_WINDOW + 3
-        messages = _msgs(*(["查詢"] * flood_size))
+        messages = _msgs(*(f"BA{200 + i}" for i in range(flood_size)))
 
         listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: (messages, "cursor-1")
         sent = []
@@ -584,6 +603,71 @@ class TestPollOnceSelfAnswerLoop(unittest.TestCase):
         listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
 
         self.assertEqual(sent, [])  # 不該回覆自己的推播
+
+
+class TestPollOnceContentBasedLoopBreaker(unittest.TestCase):
+    """
+    最後一道防線：不管BatchID比對出於什麼原因失效(2026/08/10發現真實案例
+    "ACON8800"——機器人自己的錯誤訊息剛好又被解析成新查詢，無限循環)，只要
+    「同一段文字」連續觸發查詢超過3次，就先靜音這段文字，直到出現不同內容
+    才恢復回覆(使用者要求)。這裡直接餵一批同字重複的訊息(不透過batch_id
+    比對，模擬batch_id機制本身失效的情況)，驗證只回前3次、第4次起不回。
+    """
+
+    def setUp(self):
+        self._orig_read = listener.teamplus_api.read_new_messages
+        self._orig_send_bid = listener.teamplus_api.send_message_get_batch_id
+
+    def tearDown(self):
+        listener.teamplus_api.read_new_messages = self._orig_read
+        listener.teamplus_api.send_message_get_batch_id = self._orig_send_bid
+
+    def test_same_text_stops_replying_after_three_times(self):
+        # 6則一模一樣的文字，每則batch_id都不一樣(模擬batch_id防呆完全
+        # 沒攔到的最壞情況)，應該只回前3次
+        messages = _msgs(*(["查BA220"] * 6))
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: (messages, "cursor-2")
+        sent = []
+        listener.teamplus_api.send_message_get_batch_id = (
+            lambda message, chat_id=None: (sent.append(message) or (True, "ok", "reply-bid"))
+        )
+
+        state = {"cursor": "cursor-1", "sent_batch_ids": [], "recent_reply_times": []}
+        listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
+
+        self.assertEqual(len(sent), 3)
+
+    def test_different_text_resumes_replying(self):
+        # 前4則一樣的文字(第4則該被靜音)，第5則換成不一樣的文字，要恢復回覆
+        messages = _msgs(*(["查BA220"] * 4), "查BA221")
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: (messages, "cursor-2")
+        sent = []
+        listener.teamplus_api.send_message_get_batch_id = (
+            lambda message, chat_id=None: (sent.append(message) or (True, "ok", "reply-bid"))
+        )
+
+        state = {"cursor": "cursor-1", "sent_batch_ids": [], "recent_reply_times": []}
+        listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
+
+        self.assertEqual(len(sent), 4)  # 前3次"查BA220" + 1次"查BA221"
+
+    def test_streak_persists_across_poll_calls_via_room_state(self):
+        # streak要存在room_state裡跨輪poll_once()持續累計，不是只在同一批
+        # 訊息內才算，不然分批讀到的同段文字重複會失去保護效果
+        state = {"cursor": "cursor-1", "sent_batch_ids": [], "recent_reply_times": [],
+                 "last_query_text": "查BA220", "same_text_streak": 3}
+        listener.teamplus_api.read_new_messages = (
+            lambda cursor, chat_id=None: (_msgs("查BA220"), "cursor-2")
+        )
+        sent = []
+        listener.teamplus_api.send_message_get_batch_id = (
+            lambda message, chat_id=None: (sent.append(message) or (True, "ok", "reply-bid"))
+        )
+
+        listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
+
+        self.assertEqual(sent, [])  # 這是第4次，延續前一輪的streak，不該回覆
+        self.assertEqual(state["same_text_streak"], 4)
 
 
 class TestInitListenerStateBootstrap(unittest.TestCase):
@@ -723,7 +807,9 @@ class TestMultiRoomListening(unittest.TestCase):
 
         def fake_read(cursor, chat_id=None):
             if chat_id == "room-a":
-                return _msgs(*(["查詢"] * (listener.MAX_REPLIES_PER_WINDOW + 3)), start=1), "room-a-cursor"
+                # 用不同文字，測的是次數上限而不是2026/08/10新增的內容型防迴圈
+                flood = [f"BA{200 + i}" for i in range(listener.MAX_REPLIES_PER_WINDOW + 3)]
+                return _msgs(*flood, start=1), "room-a-cursor"
             if chat_id == "room-b":
                 return _msgs("查詢", start=999), "room-b-cursor"
             return [], cursor
