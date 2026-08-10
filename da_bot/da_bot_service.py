@@ -60,6 +60,7 @@ import datetime
 
 import teamplus_listener as listener
 import run_pipeline
+import singleton_lock
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LAST_PIPELINE_HOUR_PATH = os.path.join(SCRIPT_DIR, "last_pipeline_hour.txt")
@@ -89,6 +90,11 @@ def _run_pipeline_in_background(hour_key):
 
 
 def main():
+    # 確保同時間只有一個process在監聽team+訊息(不管是這支合併服務還是單獨的
+    # teamplus_listener.py)，避免兩個process互相把對方的回覆當成新指令、
+    # 無限自問自答(2026/08/10使用者回報的DB改機無限迴圈，見singleton_lock.py)
+    singleton_lock.acquire_or_exit()
+
     state = listener.init_listener_state()
 
     # 記錄上次「觸發」整點任務是哪個小時(格式YYYYMMDDHH)，避免同一小時內重複觸發

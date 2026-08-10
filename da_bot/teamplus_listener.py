@@ -51,6 +51,7 @@ import datetime
 
 import query_bot
 import teamplus_api
+import singleton_lock
 
 POLL_INTERVAL_SECONDS = 10
 
@@ -493,6 +494,7 @@ def main():
     獨立執行teamplus_listener.py時的進入點(只做即時問答，不含整點推播)。
     整點推播+即時問答合併執行請改用 da_bot_service.py。
     """
+    singleton_lock.acquire_or_exit()
     state = init_listener_state()
     print(f"[監聽中] 每 {POLL_INTERVAL_SECONDS} 秒檢查一次「機器人推播」室有沒有新訊息，Ctrl+C 結束")
 
