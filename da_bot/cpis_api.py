@@ -49,6 +49,20 @@ EE_R_PATH = "/APG/APGREPORT/EE/wFrmEEMaintenanceRecord/maintenance_record_r.aspx
 # chunk()。
 EE_H_PATH = "/APG/APGREPORT/EE/wFrmEEMaintenanceRecord/maintenance_record_h.aspx"
 
+# 2026/08/12使用者實測發現：即使補齊__EVENTTARGET/__EVENTARGUMENT等標準
+# ASP.NET欄位，直接登入後POST maintenance_record_h.aspx仍然回500 Internal
+# Server Error。使用者截圖顯示這個表單平常是透過內部選單框架頁Default.aspx
+# (帶isCopy/FuncId/ServerName/UserName這幾個查詢參數)進入的——懷疑CPIS
+# 伺服器端會在存取這個報表模組時檢查session是否已經透過選單「授權」進入
+# 過這個FuncId(=569)，不是打完帳密就直接能查maintenance_record_h.aspx。
+# 這裡先GET一次這個帶FuncId的入口頁「暖身」session，再GET/POST真正的
+# 查詢表單。EQS01不像本系統其他地方的工號格式(例如s10435)，比較像是這個
+# 選單項目固定帶的識別碼(不是登入者本人的帳號)，先原樣沿用。
+EE_H_ENTRY_PATH = (
+    "/APG/APGREPORT/EE/wFrmEEMaintenanceRecord/Default.aspx"
+    "?isCopy=True&FuncId=569&ServerName=CPIS&UserName=EQS01"
+)
+
 UTIL_BASE = "http://tncpis.tn.chipmos.com.tw"
 UTIL_DATA_PATH = "/APG/APGPROD/EQUIPMENT/wFrmUtilizationAnalysis/util_overa2.aspx"
 
@@ -310,7 +324,7 @@ def _fetch_ee_maintenance_shift_chunk(date_start, date_end, entity, shift, jobco
     config.require(cfg, "apg_user", "apg_password")
 
     ee_h_url = f"{EE_R_BASE}{EE_H_PATH}"
-    login_url = f"{EE_R_BASE}/APG/Logon.aspx?ReturnUrl=" + urllib.parse.quote(EE_H_PATH, safe="")
+    login_url = f"{EE_R_BASE}/APG/Logon.aspx?ReturnUrl=" + urllib.parse.quote(EE_H_ENTRY_PATH, safe="")
 
     opener = build_opener()
     login_html, _ = _read(opener, login_url, timeout=20)
@@ -327,10 +341,13 @@ def _fetch_ee_maintenance_shift_chunk(date_start, date_end, entity, shift, jobco
     if "logon" in final_url.lower():
         raise CpisAuthError(f"EE Maintenance(班別)登入失敗，仍停留在登入頁：{final_url}")
 
-    # 登入後理論上會直接redirect到maintenance_record_h.aspx這個查詢表單頁；
-    # 萬一沒有(例如落到某個通用的登入後首頁)，這裡保險再GET一次拿表單初始狀態。
-    if "maintenance_record_h" not in final_url.lower():
-        html, final_url = _read(opener, ee_h_url, timeout=30)
+    # 登入後應該落在EE_H_ENTRY_PATH(帶FuncId的選單入口頁，讓session被伺服器
+    # 端登記成「已授權進入這個報表模組」)，不是maintenance_record_h.aspx本身
+    # (那是個frameset，真正的查詢表單在裡面的frame)。這裡不管入口頁長什麼
+    # 樣子，直接再GET一次maintenance_record_h.aspx拿表單目前狀態——此時
+    # session已經透過上面那次入口頁請求「暖身」過，理論上不會再被伺服器
+    # 認為是未授權的直接存取。
+    html, final_url = _read(opener, ee_h_url, timeout=30)
 
     fields = {
         # 2026/08/12使用者用瀏覽器開發人員工具擷取到的真實POST請求，最前面
