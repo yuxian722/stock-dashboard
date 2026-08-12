@@ -926,24 +926,17 @@ _CHANGEOVER_GROUP_DISPLAY = {
 }
 
 
-def _changeover_rows_for_group(cur, group_name, now):
+def _filter_changeover_rows(raw_rows, group_name):
     """
-    回傳指定機型群組今日(跟班別對齊，見hourly_push._shift_day_bounds())已
-    完成的真正改機(job_code屬於CED/CEE/CD類別)紀錄原始列(machine_id/
-    job_code/engineer_id/dur/wait_dur)，group_name="EPOXY"時涵蓋ESEC+DB。
+    對raw_rows(每個元素要能用[]取machine_id/job_code/engineer_id/dur/
+    wait_dur/end_time，sqlite3.Row或plain dict都可以)套用改機的群組+
+    job_code分類篩選標準，回傳篩過的rows(多了category欄位)。
+    group_changeover_detail_reply()(從本地DB查)、shift_query.py的即時
+    班別查詢(即時查CPIS，不經過本地DB)共用同一套篩選邏輯，不要分開維護
+    兩份標準(2026/08/10使用者要求新增班別查詢時抽出來的)。
     """
-    shift_date, next_date = hourly_push._shift_day_bounds(now)
-    cur.execute("""
-        SELECT DISTINCT machine_id, bgn_date, bgn_time, end_time, job_code, engineer_id, dur, wait_dur
-        FROM ee_maintenance_record
-        WHERE e_tag = 'S' AND (
-            (end_date = ? AND end_time >= ?)
-            OR (end_date = ? AND end_time < ?)
-        )
-    """, (shift_date, hourly_push.SHIFT_CHANGE_TIME, next_date, hourly_push.SHIFT_CHANGE_TIME))
-
     rows = []
-    for r in cur.fetchall():
+    for r in raw_rows:
         g = hourly_push._group_for_machine(r["machine_id"])
         if group_name == "EPOXY":
             if g not in ("ESEC", "DB"):
@@ -963,6 +956,24 @@ def _changeover_rows_for_group(cur, group_name, now):
             "category": category, "end_time": r["end_time"],
         })
     return rows
+
+
+def _changeover_rows_for_group(cur, group_name, now):
+    """
+    回傳指定機型群組今日(跟班別對齊，見hourly_push._shift_day_bounds())已
+    完成的真正改機(job_code屬於CED/CEE/CD類別)紀錄原始列(machine_id/
+    job_code/engineer_id/dur/wait_dur)，group_name="EPOXY"時涵蓋ESEC+DB。
+    """
+    shift_date, next_date = hourly_push._shift_day_bounds(now)
+    cur.execute("""
+        SELECT DISTINCT machine_id, bgn_date, bgn_time, end_time, job_code, engineer_id, dur, wait_dur
+        FROM ee_maintenance_record
+        WHERE e_tag = 'S' AND (
+            (end_date = ? AND end_time >= ?)
+            OR (end_date = ? AND end_time < ?)
+        )
+    """, (shift_date, hourly_push.SHIFT_CHANGE_TIME, next_date, hourly_push.SHIFT_CHANGE_TIME))
+    return _filter_changeover_rows(cur.fetchall(), group_name)
 
 
 # 各群組job_code分類標籤的固定顯示順序，沒有資料的類別不顯示。
@@ -1009,6 +1020,17 @@ def group_changeover_detail_reply(group_name: str, now: datetime.datetime = None
     rows = _changeover_rows_for_group(cur, group_name, now)
     conn.close()
 
+    return _changeover_report_text(display_name, day_word, rows)
+
+
+def _changeover_report_text(display_name, day_word, rows):
+    """
+    把一批已經篩過群組/類別的改機紀錄(rows：machine_id/job_code/engineer_id/
+    dur/wait_dur/category/end_time)組成完整的改機報告文字——早班/夜班台數、
+    MFG/EE台數、分類平均工時、人員明細、機台明細。group_changeover_detail_
+    reply()(查本地DB)、shift_query.py的即時班別查詢(即時查CPIS)共用這份
+    格式，不要各自維護一份(2026/08/10使用者要求新增班別查詢時抽出來的)。
+    """
     if not rows:
         return f"{display_name}改機 {day_word}目前沒有完成的改機紀錄"
 

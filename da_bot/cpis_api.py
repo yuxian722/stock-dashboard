@@ -154,11 +154,11 @@ def _check_entity_pattern(entity_pattern):
         )
 
 
-def _ee_query_string(date_start, date_end, entity, jobcode=""):
+def _ee_query_string(date_start, date_end, entity, jobcode="", shift="None"):
     return (
         "HIDCOUNT=1&pkg_type=T"
         f"&start_date={date_start}&end_date={date_end}"
-        f"&entity={entity}&shift=None&floor=A2&operation=None"
+        f"&entity={entity}&shift={shift}&floor=A2&operation=None"
         f"&etag=None&jobcode={jobcode}&enginerr=&value=WD&oper_type=0"
         "&dept=None&description=&bd_id=None&assylot=&product="
     )
@@ -175,12 +175,19 @@ def _find_ejp_url(html):
     return None
 
 
-def _fetch_ee_maintenance_chunk(date_start, date_end, entity, jobcode=""):
-    """單一區間(<=30天)查詢，回傳EJP報表(.xls)的原始bytes。"""
+def _fetch_ee_maintenance_chunk(date_start, date_end, entity, jobcode="", shift="None"):
+    """單一區間(<=30天)查詢，回傳EJP報表(.xls)的原始bytes。
+
+    shift：CPIS查詢頁「Shift」下拉選單的值(None/AD/AN/BD/BN，2026/08/10
+    使用者截圖確認，A/B是班組、D/N是早/夜班)。這是「查詢時的過濾參數」，
+    不是報表欄位——同一個時段查shift=None會拿到AD+AN+BD+BN全部班別的
+    紀錄合在一起，沒辦法事後從資料裡分辨出處，要分班別就得帶不同的shift
+    值分開查。
+    """
     cfg = config.load()
     config.require(cfg, "apg_user", "apg_password")
 
-    qs = _ee_query_string(date_start, date_end, entity, jobcode)
+    qs = _ee_query_string(date_start, date_end, entity, jobcode, shift)
     ee_path_qs = f"{EE_R_PATH}?{qs}"
     login_url = f"{EE_R_BASE}/APG/Logon.aspx?ReturnUrl=" + urllib.parse.quote(ee_path_qs, safe="")
 
@@ -211,7 +218,7 @@ def _fetch_ee_maintenance_chunk(date_start, date_end, entity, jobcode=""):
     return raw
 
 
-def fetch_ee_maintenance_xls(date_start, date_end, entity="BA*", jobcode=""):
+def fetch_ee_maintenance_xls(date_start, date_end, entity="BA*", jobcode="", shift="None"):
     """
     查詢EE Maintenance Record，回傳EJP報表(.xls, 舊版BIFF格式)原始bytes的清單
     (區間>30天時會自動拆成多段查詢，所以是清單而非單一結果)。
@@ -221,6 +228,9 @@ def fetch_ee_maintenance_xls(date_start, date_end, entity="BA*", jobcode=""):
       - 區間<=7天：entity可用萬用字元，jobcode可留空
       - 區間8天~1個月：entity與jobcode皆為必填(可用萬用字元，預設用*涵蓋所有JobCode)
       - 區間>1個月：自動切成多段(每段<=30天)分別查詢
+
+    shift：見_fetch_ee_maintenance_chunk()說明，預設"None"(不篩班別，維持
+    原本行為)，2026/08/10使用者要求新增班別(AD/AN/BD/BN)查詢時才會帶別的值。
     """
     _check_entity_pattern(entity)
 
@@ -235,7 +245,7 @@ def fetch_ee_maintenance_xls(date_start, date_end, entity="BA*", jobcode=""):
             chunk_end = min(cur + datetime.timedelta(days=29), d2)
             chunks.extend(
                 fetch_ee_maintenance_xls(
-                    cur.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d"), entity, jobcode
+                    cur.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d"), entity, jobcode, shift
                 )
             )
             cur = chunk_end + datetime.timedelta(days=1)
@@ -245,7 +255,7 @@ def fetch_ee_maintenance_xls(date_start, date_end, entity="BA*", jobcode=""):
     if total_days > 7 and not jc:
         jc = "*"
 
-    return [_fetch_ee_maintenance_chunk(date_start, date_end, entity, jc)]
+    return [_fetch_ee_maintenance_chunk(date_start, date_end, entity, jc, shift)]
 
 
 # ---------------------------------------------------------------------------

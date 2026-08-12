@@ -7,6 +7,7 @@ import unittest
 
 import query_bot
 import hourly_push
+import shift_query
 import teamplus_listener as listener
 
 
@@ -264,6 +265,55 @@ class TestParseQueryDatedChangeoverAndWorkhours(unittest.TestCase):
             self.assertIsInstance(reply, str)
         finally:
             query_bot.DB_PATH = orig_db_path
+
+    def test_group_shift_changeover_query_defaults_to_today(self):
+        # "2100 AD改機"(2026/08/10使用者要求，AD=A班早班)：即時查CPIS，
+        # 沒指定日期時預設今天
+        import datetime as dt
+        cmd = listener.parse_query("2100 AD改機")
+        self.assertEqual(cmd["mode"], "live_group_shift_changeover")
+        self.assertEqual(cmd["group_name"], "ESEC")
+        self.assertEqual(cmd["shift"], "AD")
+        self.assertEqual(cmd["date_ymd"], dt.date.today().strftime("%Y%m%d"))
+        self.assertEqual(cmd["date_label"], dt.date.today().strftime("%m/%d"))
+
+    def test_group_shift_changeover_query_with_date(self):
+        cmd = listener.parse_query("8/11 2100 AD改機")
+        self.assertEqual(cmd["mode"], "live_group_shift_changeover")
+        self.assertEqual(cmd["group_name"], "ESEC")
+        self.assertEqual(cmd["shift"], "AD")
+        self.assertEqual(cmd["date_ymd"], "20260811")
+        self.assertEqual(cmd["date_label"], "08/11")
+
+    def test_all_four_shift_codes_recognized(self):
+        for shift in ("AD", "AN", "BD", "BN"):
+            cmd = listener.parse_query(f"DB {shift}改機")
+            self.assertEqual(cmd["mode"], "live_group_shift_changeover", msg=shift)
+            self.assertEqual(cmd["shift"], shift, msg=shift)
+
+    def test_shift_changeover_not_shadowed_by_repair_code_pattern(self):
+        # "2100 AD改機"不能被"<群組> <修機代碼>"那組規則搶走，變成去查
+        # "AD"這個修機代碼(AD本身也符合[A-Z]{1,8}的形狀)
+        cmd = listener.parse_query("2100 AD改機")
+        self.assertNotEqual(cmd["mode"], "group_repair_code_detail")
+
+    def test_bare_group_and_code_without_changeover_word_still_repair_code(self):
+        # 反過來："2100 AD"沒有"改機"兩個字，還是要維持原本的修機代碼查詢，
+        # 不能被班別規則吃掉
+        cmd = listener.parse_query("2100 AD")
+        self.assertEqual(cmd, {"mode": "group_repair_code_detail", "group_name": "ESEC", "code": "AD"})
+
+    def test_build_reply_live_group_shift_changeover_dispatches(self):
+        orig_fetch = shift_query.cpis_api.fetch_ee_maintenance_xls
+        shift_query.cpis_api.fetch_ee_maintenance_xls = lambda *a, **k: []
+        try:
+            reply = listener.build_reply({
+                "mode": "live_group_shift_changeover", "group_name": "DB", "shift": "AD",
+                "date_ymd": "20260811", "date_label": "08/11",
+            })
+            self.assertIsInstance(reply, str)
+        finally:
+            shift_query.cpis_api.fetch_ee_maintenance_xls = orig_fetch
 
     def test_group_repair_code_query(self):
         # "2100 BWD"(2026/08/10使用者要求)：群組後面直接接大寫代碼，
@@ -638,6 +688,122 @@ class TestPollOnceSelfAnswerLoop(unittest.TestCase):
         listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
 
         self.assertEqual(sent, [])  # 不該回覆自己的推播
+
+
+class _SyncThread:
+    """測試用假threading.Thread：start()時直接同步執行target，不真的開
+    執行緒，這樣測試才能確定性地驗證背景查詢完成後的行為(2026/08/10
+    新增班別即時查詢，正式流程用真的背景執行緒，測試裡換成這個同步版本)。
+    """
+
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        self._target(*self._args, **self._kwargs)
+
+
+class TestPollOnceLiveShiftQuery(unittest.TestCase):
+    """「<群組> <班別>改機」查詢(2026/08/10使用者要求)：即時查CPIS，不能
+    卡住問答主迴圈，要先送「查詢中」提示、把實際查詢丟到背景執行緒，
+    查完才把結果送回同一個聊天室。"""
+
+    def setUp(self):
+        self._orig_read = listener.teamplus_api.read_new_messages
+        self._orig_send_bid = listener.teamplus_api.send_message_get_batch_id
+        self._orig_recent_self_sent = listener.teamplus_api.recent_self_sent_batch_ids
+        self._orig_record_self_sent = listener.teamplus_api._record_self_sent_batch_id
+        self._orig_thread = listener.threading.Thread
+        self._orig_fetch = shift_query.cpis_api.fetch_ee_maintenance_xls
+        self._orig_parse = shift_query.cpis_scraper.parse_ee_maintenance_xls
+        listener.threading.Thread = _SyncThread
+
+    def tearDown(self):
+        listener.teamplus_api.read_new_messages = self._orig_read
+        listener.teamplus_api.send_message_get_batch_id = self._orig_send_bid
+        listener.teamplus_api.recent_self_sent_batch_ids = self._orig_recent_self_sent
+        listener.teamplus_api._record_self_sent_batch_id = self._orig_record_self_sent
+        listener.threading.Thread = self._orig_thread
+        shift_query.cpis_api.fetch_ee_maintenance_xls = self._orig_fetch
+        shift_query.cpis_scraper.parse_ee_maintenance_xls = self._orig_parse
+
+    def test_sends_ack_then_final_result_and_records_both_as_self_sent(self):
+        messages = _msgs("2100 AD改機")
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: (messages, "cursor-2")
+        listener.teamplus_api.recent_self_sent_batch_ids = lambda: set()
+
+        sent = []
+        bid_counter = [0]
+
+        def fake_send_bid(message, chat_id=None):
+            bid_counter[0] += 1
+            bid = f"bid-{bid_counter[0]}"
+            sent.append((message, bid))
+            return True, "ok", bid
+
+        listener.teamplus_api.send_message_get_batch_id = fake_send_bid
+
+        recorded = []
+        listener.teamplus_api._record_self_sent_batch_id = lambda bid: recorded.append(bid)
+
+        shift_query.cpis_api.fetch_ee_maintenance_xls = lambda *a, **k: []
+        shift_query.cpis_scraper.parse_ee_maintenance_xls = lambda raw: []
+
+        state = {"cursor": "cursor-1", "sent_batch_ids": [], "recent_reply_times": []}
+        listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
+
+        self.assertEqual(len(sent), 2)  # 「查詢中」提示 + 背景查詢完成後的結果
+        self.assertIn("查詢中", sent[0][0])
+        self.assertNotIn("改機", sent[0][0])  # 提示文字刻意不緊鄰放group+shift+改機，避免自我觸發
+        self.assertIn("ESEC改機", sent[1][0].replace(" ", ""))  # 最終結果應該是shift_query組出來的報告
+        # 兩則都要記進跨process共用的sent_batch_ids，避免被自己讀回去誤判成新查詢
+        self.assertIn(sent[1][1], recorded)
+
+    def test_does_not_block_main_loop_synchronously(self):
+        # 用真正的threading.Thread(不換成_SyncThread)驗證_poll_room_once()
+        # 本身很快就回傳，不會等CPIS查詢跑完才繼續(即使shift_query那支函式
+        # 內部模擬長時間執行)。測試結束前一定要join()這個背景執行緒，不然
+        # 它會活過這個測試方法、之後才完成並呼叫到下一個測試已經換掉的
+        # mock，汙染下一個測試的斷言(這裡曾經真的因為沒join()而炸過)。
+        import threading as real_threading
+        import time as real_time
+
+        created_threads = []
+        real_thread_cls = self._orig_thread
+
+        def tracking_thread(*args, **kwargs):
+            t = real_thread_cls(*args, **kwargs)
+            created_threads.append(t)
+            return t
+
+        listener.threading.Thread = tracking_thread
+
+        messages = _msgs("2100 AD改機")
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: (messages, "cursor-2")
+        listener.teamplus_api.recent_self_sent_batch_ids = lambda: set()
+        listener.teamplus_api.send_message_get_batch_id = lambda message, chat_id=None: (True, "ok", "bid-x")
+        listener.teamplus_api._record_self_sent_batch_id = lambda bid: None
+
+        release = real_threading.Event()
+
+        def slow_fetch(*a, **k):
+            release.wait(timeout=5)  # 模擬即時查CPIS要花很久
+            return []
+
+        shift_query.cpis_api.fetch_ee_maintenance_xls = slow_fetch
+        shift_query.cpis_scraper.parse_ee_maintenance_xls = lambda raw: []
+
+        state = {"cursor": "cursor-1", "sent_batch_ids": [], "recent_reply_times": []}
+        start = real_time.monotonic()
+        listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
+        elapsed = real_time.monotonic() - start
+
+        release.set()  # 讓背景執行緒的slow_fetch結束
+        for t in created_threads:
+            t.join(timeout=5)  # 一定要等它做完，不能讓它活到下一個測試才觸發mock
+        self.assertLess(elapsed, 1.0)  # 主流程應該立刻回傳，不會等slow_fetch跑完
 
 
 class TestPollOnceContentBasedLoopBreaker(unittest.TestCase):

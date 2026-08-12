@@ -101,6 +101,16 @@ class TestEeQueryString(unittest.TestCase):
         qs = cpis_api._ee_query_string("20260801", "20260809", "BA*")
         self.assertIn("jobcode=&", qs)
 
+    def test_shift_defaults_to_none(self):
+        qs = cpis_api._ee_query_string("20260801", "20260809", "BA*")
+        self.assertIn("shift=None", qs)
+
+    def test_shift_can_be_overridden(self):
+        # 2026/08/10使用者要求：CPIS查詢頁的Shift下拉選單值是AD/AN/BD/BN
+        # (A/B班組×早/夜班)，這是查詢時的過濾參數(不是回傳資料裡的欄位)
+        qs = cpis_api._ee_query_string("20260801", "20260809", "BA*", shift="AD")
+        self.assertIn("shift=AD", qs)
+
 
 class TestFindEjpUrl(unittest.TestCase):
     def test_finds_full_url(self):

@@ -59,10 +59,12 @@ for _s in (sys.stdout, sys.stderr):
 import re
 import time
 import datetime
+import threading
 
 import query_bot
 import teamplus_api
 import singleton_lock
+import shift_query
 
 POLL_INTERVAL_SECONDS = 10
 
@@ -138,6 +140,30 @@ _REPAIR_GROUP_PATTERNS = [
 # 群組別名清單，動作字樣換成「產品」。
 _PRODUCT_GROUP_PATTERNS = [
     (internal, _build_group_suffix_pattern(label, "產品")) for label, internal in _CHANGEOVER_GROUP_KEYWORDS
+]
+
+
+# 「<群組> <班別> 改機」查詢(例如"2100 AD改機"、"8/11 2100 AD改機")：
+# CPIS EE Maintenance Record報表的Shift(AD/AN/BD/BN，A/B班組×早/夜班，
+# 2026/08/10使用者截圖確認)是查詢時的過濾參數，不是本地資料庫裡存的
+# 欄位——這種查詢要即時連線CPIS查(見shift_query.py)，不是查本地DB，
+# 一定要排在_GROUP_REPAIR_CODE_PATTERNS前面判斷："2100 AD改機"如果沒被
+# 這裡先攔下來，會被下面「<群組> <修機代碼>」那組規則搶走(AD剛好也符合
+# [A-Z]{1,8}的代碼形狀)，變成去查「AD」這個修機代碼、而不是觸發班別
+# 改機查詢。
+_SHIFT_CODES = ("AD", "AN", "BD", "BN")
+
+
+def _build_group_shift_pattern(label):
+    escaped = re.escape(label).replace(r"\ ", r"\s*")
+    shift_alt = "|".join(_SHIFT_CODES)
+    return re.compile(
+        r"(?<![A-Za-z0-9])(?i:" + escaped + r")\s+(" + shift_alt + r")\s*改機(?![A-Za-z0-9])"
+    )
+
+
+_GROUP_SHIFT_CHANGEOVER_PATTERNS = [
+    (internal, _build_group_shift_pattern(label)) for label, internal in _CHANGEOVER_GROUP_KEYWORDS
 ]
 
 
@@ -225,7 +251,11 @@ HELP_TEXT = (
     "  in repair總時數＋有修過的機台號碼，例：2100 BWD／DB BWD\n"
     "• <群組>產品 → 該群組每台機台目前是「加熱」還是「畫膠」產品＋Product ID＋B/D\n"
     "  (依最後一次真正改機判斷，不是當天限定)，例：DB產品／2100產品／LOC產品(LOC全部都是加熱)\n"
-    "• 以上（機台改機歷史、群組產品除外）前面/後面可以加「8/9」這種日期(跟英文字母中間留個空格)，\n"
+    "• <群組> <班別>改機 → 指定班別(AD=A班早班／AN=A班夜班／BD=B班早班／BN=B班夜班)\n"
+    "  的改機明細，即時向CPIS查詢(不是查本地資料，要等幾秒)，沒指定日期預設查今天，\n"
+    "  例：2100 AD改機／8/11 2100 AD改機／DB BN改機\n"
+    "• 以上（機台改機歷史、群組產品、群組班別改機除外）前面/後面可以加「8/9」這種日期\n"
+    "  (跟英文字母中間留個空格)，\n"
     "  改查指定那一天，例：8/9 DB改機／8/9工時／8/9 DB／8/9 BAA02改機\n"
     "\n"
     "官方GROUP彙總表原始數字（CPIS Utilization Analysis頁面原始列，不是我們自己逐台平均算的）：\n"
@@ -291,6 +321,20 @@ def parse_query(text):
     for internal, pattern in _PRODUCT_GROUP_PATTERNS:
         if pattern.search(text):
             return {"mode": "group_product_type", "group_name": internal}
+
+    # 「<機型群組> <班別> 改機」查詢(例如"2100 AD改機"、"8/11 2100 AD改機")：
+    # 即時查CPIS的特定班別(AD/AN/BD/BN)改機資料(2026/08/10使用者要求，見
+    # shift_query.py開頭說明)。要排在「<群組> <修機代碼>」判斷之前，不然
+    # "AD"會先被那條規則當成修機代碼截走。沒指定日期預設今日。
+    for internal, pattern in _GROUP_SHIFT_CHANGEOVER_PATTERNS:
+        m_shift = pattern.search(text)
+        if m_shift:
+            resolved_ymd = date_ymd or datetime.date.today().strftime("%Y%m%d")
+            resolved_label = date_label or datetime.date.today().strftime("%m/%d")
+            return {
+                "mode": "live_group_shift_changeover", "group_name": internal,
+                "shift": m_shift.group(1).upper(), "date_ymd": resolved_ymd, "date_label": resolved_label,
+            }
 
     # 「<機型群組> <修機代碼>」查詢(例如"2100 BWD")：只看單一修機代碼的
     # 統計，不用"修機"這種動作字樣(2026/08/10使用者要求)。程式碼部分要求
@@ -530,6 +574,18 @@ def build_reply(cmd):
         except Exception as e:
             return f"{cmd['group_name']} {cmd['code']}修機查詢時發生錯誤: {type(e).__name__}: {e}"
 
+    if mode == "live_group_shift_changeover":
+        # 正式流程走_poll_room_once()裡的背景執行緒(即時查CPIS要幾十秒，
+        # 不能卡住問答主迴圈)，這裡是給直接呼叫build_reply()的情境用的
+        # 同步版本(例如測試、或未來其他呼叫端)，行為上等同直接拿到最終
+        # 結果，不會有中間的「查詢中」提示。
+        try:
+            return shift_query.live_group_shift_changeover_reply(
+                cmd["group_name"], cmd["shift"], cmd["date_ymd"], cmd["date_label"]
+            )
+        except Exception as e:
+            return f"{cmd['group_name']} {cmd['shift']}改機即時查詢時發生錯誤: {type(e).__name__}: {e}"
+
     if mode == "group_product_type":
         try:
             return query_bot.group_product_type_reply(cmd["group_name"])
@@ -652,6 +708,37 @@ def init_listener_state():
     return {"rooms": {chat_id: _init_room_state(chat_id) for chat_id in teamplus_api.all_chat_ids()}}
 
 
+def _handle_live_shift_query_async(chat_id, cmd):
+    """
+    在背景執行緒實際執行班別(AD/AN/BD/BN)改機的即時CPIS查詢，完成後把
+    結果送回同一個聊天室(2026/08/10使用者要求)。這支函式本身要對所有
+    例外負責(不能讓背景執行緒不明不白地死掉、使用者永遠等不到回覆)，
+    shift_query.live_group_shift_changeover_reply()內部已經包了CPIS連線
+    失敗的處理，這裡多包一層是防呆(萬一有沒預期到的例外，也要讓使用者
+    知道查詢失敗，而不是石沉大海)。
+
+    送出結果後要記到跨process共用的sent_batch_ids.log(_record_self_sent_
+    batch_id())，理由跟teamplus_api.broadcast_message()一樣：這個回覆內容
+    包含群組名稱+"改機"，讀回去時可能被自己的規則誤判成新查詢，不記錄
+    的話會自問自答(這裡走的是背景執行緒直接送訊息，不是經過_poll_room_
+    once()主流程那個in-memory的sent_batch_ids，所以要靠這份跨process
+    記錄，跟監聽主流程共用同一套判斷)。
+    """
+    try:
+        reply = shift_query.live_group_shift_changeover_reply(
+            cmd["group_name"], cmd["shift"], cmd["date_ymd"], cmd["date_label"]
+        )
+    except Exception as e:
+        reply = f"{cmd['group_name']} {cmd['shift']}改機即時查詢時發生未預期錯誤: {type(e).__name__}: {e}"
+
+    print(f"[聊天室{chat_id}][背景班別查詢完成][回覆] {reply}")
+    ok, desc, reply_bid = teamplus_api.send_message_get_batch_id(reply, chat_id=chat_id)
+    if ok:
+        teamplus_api._record_self_sent_batch_id(reply_bid)
+    else:
+        print(f"[警告] 聊天室{chat_id}背景班別查詢結果送出失敗: {desc}")
+
+
 def _poll_room_once(chat_id, room_state):
     """
     檢查一次指定聊天室有沒有新訊息，有的話解析、回覆(回覆會送回同一間
@@ -719,6 +806,32 @@ def _poll_room_once(chat_id, room_state):
             break
 
         print(f"[聊天室{chat_id}][收到指令] {text!r} -> {cmd}")
+
+        # 班別(AD/AN/BD/BN)改機查詢是即時查CPIS(2026/08/10使用者要求，見
+        # shift_query.py開頭說明：不進整點排程，問的當下才即時抓)，實測
+        # 其他CPIS報表要花幾十秒，不能像其他模式一樣同步呼叫build_reply()
+        # 卡住這個迴圈——那樣會讓「其他房間」「這個房間的其他查詢」全部
+        # 卡住等這一次CPIS查詢跑完，等於重蹈2026/08/09整點任務卡住問答
+        # 主迴圈那個bug的覆轍(da_bot_service.py後來把整點任務丟背景執行緒
+        # 就是同一個理由)。這裡先送一則「查詢中」提示(且刻意不在提示文字
+        # 裡緊鄰放group+shift+"改機"，避免讀回時又被自己的規則誤判成新
+        # 查詢)，實際查詢丟到背景執行緒，查完才把結果送回同一個聊天室。
+        if cmd["mode"] == "live_group_shift_changeover":
+            ack = "🔄 查詢中，這是即時向CPIS查詢的班別資料，請稍候幾秒..."
+            print(f"[聊天室{chat_id}][回覆(即時查詢中)] {ack}")
+            ok, desc, ack_bid = teamplus_api.send_message_get_batch_id(ack, chat_id=chat_id)
+            if ok:
+                recent_reply_times.append(now)
+                sent_batch_ids.append(ack_bid)
+                if len(sent_batch_ids) > 30:
+                    sent_batch_ids.pop(0)
+                threading.Thread(
+                    target=_handle_live_shift_query_async, args=(chat_id, cmd), daemon=True
+                ).start()
+            else:
+                print(f"[警告] 聊天室{chat_id}送出「查詢中」提示失敗: {desc}")
+            continue
+
         reply = build_reply(cmd)
         print(f"[聊天室{chat_id}][回覆] {reply}")
         ok, desc, reply_bid = teamplus_api.send_message_get_batch_id(reply, chat_id=chat_id)
