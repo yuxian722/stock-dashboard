@@ -685,12 +685,44 @@ def _init_room_state(chat_id):
             "recent_reply_times": [],  # 防暴衝保護用的時間戳記錄
             "last_query_text": None,  # 內容型防迴圈用：上一次觸發查詢的文字
             "same_text_streak": 0,  # 同一段文字連續觸發查詢的次數
+            "recent_own_reply_texts": [],  # 機器人自己最近送出過的訊息「文字內容」(見下方說明)
         }
     print(f"[警告] 聊天室{chat_id}上線通知送出失敗({desc})，改用備援方式啟動")
     messages, cursor = teamplus_api.read_new_messages(None, chat_id=chat_id)
     print(f"[啟動] 聊天室{chat_id}已同步至最新訊息(略過{len(messages)}則既有訊息)，之後只會回應新出現的訊息")
     return {"cursor": cursor, "sent_batch_ids": [], "recent_reply_times": [],
-            "last_query_text": None, "same_text_streak": 0}
+            "last_query_text": None, "same_text_streak": 0, "recent_own_reply_texts": []}
+
+
+_OWN_REPLY_TEXT_KEEP = 20
+
+
+def _remember_own_reply(room_state, text):
+    """
+    把機器人剛送出的訊息「文字內容本身」記到room_state裡(2026/08/12使用者
+    要求的第二道自問自答防線)。
+
+    背景：班別即時查詢(shift_query.py)的最終結果是從背景執行緒
+    (_handle_live_shift_query_async())送出的，只會記到跨process共用的
+    sent_batch_ids.log(_record_self_sent_batch_id())，不會進到這個room的
+    in-memory sent_batch_ids清單。實測發現：即使有記錄，仍然觀察到這則
+    自己送出的報告被讀回去、誤判成新查詢(懷疑是send成功到寫檔記錄之間的
+    時間差，被剛好卡在中間那一輪poll讀到)——而且報告文字本身開頭就是
+    「【ESEC改機】」這種群組+"改機"緊鄰的格式，會被_CHANGEOVER_GROUP_
+    PATTERNS(檢查順序在_GROUP_SHIFT_CHANGEOVER_PATTERNS前面)當成一般
+    (非班別)的「群組改機」查詢误觸發，兩種格式的報告文字不同，內容型
+    3次防迴圈(同一段文字連續3次)也可能因此追不上，繼續產生第二輪誤觸發。
+
+    這裡改成不管BatchID機制有沒有正常運作，只要收到的文字「完全等於」
+    機器人自己最近送出過的某一則訊息，一律當作自己的回音、直接跳過，
+    連內容型3次防迴圈的次數都不算——比對「文字」而不是猜測BatchID記錄
+    時序，最直接、最不依賴時序假設的一道防線。只保留最近
+    _OWN_REPLY_TEXT_KEEP則，避免無限成長。
+    """
+    texts = room_state.setdefault("recent_own_reply_texts", [])
+    texts.append(text)
+    if len(texts) > _OWN_REPLY_TEXT_KEEP:
+        del texts[:-_OWN_REPLY_TEXT_KEEP]
 
 
 def init_listener_state():
@@ -708,7 +740,7 @@ def init_listener_state():
     return {"rooms": {chat_id: _init_room_state(chat_id) for chat_id in teamplus_api.all_chat_ids()}}
 
 
-def _handle_live_shift_query_async(chat_id, cmd):
+def _handle_live_shift_query_async(chat_id, cmd, room_state):
     """
     在背景執行緒實際執行班別(AD/AN/BD/BN)改機的即時CPIS查詢，完成後把
     結果送回同一個聊天室(2026/08/10使用者要求)。這支函式本身要對所有
@@ -723,6 +755,12 @@ def _handle_live_shift_query_async(chat_id, cmd):
     的話會自問自答(這裡走的是背景執行緒直接送訊息，不是經過_poll_room_
     once()主流程那個in-memory的sent_batch_ids，所以要靠這份跨process
     記錄，跟監聽主流程共用同一套判斷)。
+
+    2026/08/12使用者實測發現：即使有上面這層跨process記錄，班別查詢的
+    最終報告仍然偶爾被讀回去、誤判成新查詢(懷疑是send成功到寫檔記錄之間
+    的極短時間差，剛好被下一輪poll讀到)。這裡額外把回覆文字記進room_state
+    (跟主執行緒共用同一個dict，執行緒安全地append)，靠_remember_own_reply()
+    這道不依賴BatchID時序的第二防線堵住。
     """
     try:
         reply = shift_query.live_group_shift_changeover_reply(
@@ -735,6 +773,7 @@ def _handle_live_shift_query_async(chat_id, cmd):
     ok, desc, reply_bid = teamplus_api.send_message_get_batch_id(reply, chat_id=chat_id)
     if ok:
         teamplus_api._record_self_sent_batch_id(reply_bid)
+        _remember_own_reply(room_state, reply)
     else:
         print(f"[警告] 聊天室{chat_id}背景班別查詢結果送出失敗: {desc}")
 
@@ -772,6 +811,14 @@ def _poll_room_once(chat_id, room_state):
             sent_batch_ids.remove(bid)
             continue
         if bid and bid in cross_process_sent_ids:
+            continue
+
+        # 第二道自問自答防線(2026/08/12使用者實測要求)：不管上面兩層BatchID
+        # 比對出於什麼原因失效(見_remember_own_reply()開頭說明)，只要這則
+        # 訊息的文字「完全等於」機器人自己最近送出過的某一則訊息，直接當
+        # 自己的回音跳過——連下面內容型3次防迴圈的次數都不計，因為這種
+        # 情況根本不該被當一次「觸發」。
+        if text in room_state.get("recent_own_reply_texts", ()):
             continue
 
         cmd = parse_query(text)
@@ -825,8 +872,9 @@ def _poll_room_once(chat_id, room_state):
                 sent_batch_ids.append(ack_bid)
                 if len(sent_batch_ids) > 30:
                     sent_batch_ids.pop(0)
+                _remember_own_reply(room_state, ack)
                 threading.Thread(
-                    target=_handle_live_shift_query_async, args=(chat_id, cmd), daemon=True
+                    target=_handle_live_shift_query_async, args=(chat_id, cmd, room_state), daemon=True
                 ).start()
             else:
                 print(f"[警告] 聊天室{chat_id}送出「查詢中」提示失敗: {desc}")
@@ -840,6 +888,7 @@ def _poll_room_once(chat_id, room_state):
             sent_batch_ids.append(reply_bid)
             if len(sent_batch_ids) > 30:
                 sent_batch_ids.pop(0)
+            _remember_own_reply(room_state, reply)
         else:
             print(f"[警告] 聊天室{chat_id}送出訊息失敗: {desc}")
 

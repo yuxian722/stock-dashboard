@@ -760,6 +760,48 @@ class TestPollOnceLiveShiftQuery(unittest.TestCase):
         self.assertIn("ESEC改機", sent[1][0].replace(" ", ""))  # 最終結果應該是shift_query組出來的報告
         # 兩則都要記進跨process共用的sent_batch_ids，避免被自己讀回去誤判成新查詢
         self.assertIn(sent[1][1], recorded)
+        # 背景查詢完成後的最終報告文字也要記進room_state，給第二道
+        # 內容型防線用(2026/08/12使用者實測要求)，不能只靠跨process的BatchID記錄
+        self.assertIn(sent[1][0], state["recent_own_reply_texts"])
+
+    def test_final_report_read_back_with_fresh_batch_id_does_not_trigger_second_reply(self):
+        # 模擬實測中發現的情況：跨process的BatchID記錄這次「失效」了
+        # (recent_self_sent_batch_ids一路回空集合)，班別查詢的最終報告被
+        # 原封不動讀回來、當成一則全新訊息——這裡驗證靠room_state記錄的
+        # 文字內容防線還是能擋下來，不會被_CHANGEOVER_GROUP_PATTERNS等
+        # 規則誤判成新的一般改機查詢、觸發第二輪回覆
+        listener.teamplus_api.recent_self_sent_batch_ids = lambda: set()
+
+        bid_counter = [0]
+        sent = []
+
+        def fake_send_bid(message, chat_id=None):
+            bid_counter[0] += 1
+            bid = f"bid-{bid_counter[0]}"
+            sent.append((message, bid))
+            return True, "ok", bid
+
+        listener.teamplus_api.send_message_get_batch_id = fake_send_bid
+        listener.teamplus_api._record_self_sent_batch_id = lambda bid: None  # 模擬記錄失效/沒發生效果
+        shift_query.cpis_api.fetch_ee_maintenance_xls = lambda *a, **k: []
+        shift_query.cpis_scraper.parse_ee_maintenance_xls = lambda raw: []
+
+        state = {"cursor": "cursor-1", "sent_batch_ids": [], "recent_reply_times": []}
+        listener.teamplus_api.read_new_messages = (
+            lambda cursor, chat_id=None: (_msgs("2100 AD改機"), "cursor-2")
+        )
+        listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
+        self.assertEqual(len(sent), 2)  # 「查詢中」提示 + 最終報告
+        final_report_text = sent[1][0]
+
+        # 下一輪poll讀到「機器人自己剛送出的最終報告」原文，batch_id是全新的
+        # (模擬BatchID記錄沒追上)，不該再觸發第二次回覆
+        listener.teamplus_api.read_new_messages = (
+            lambda cursor, chat_id=None: (_msgs(final_report_text, start=50), "cursor-3")
+        )
+        listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
+
+        self.assertEqual(len(sent), 2)  # 沒有第3則
 
     def test_does_not_block_main_loop_synchronously(self):
         # 用真正的threading.Thread(不換成_SyncThread)驗證_poll_room_once()
@@ -869,6 +911,60 @@ class TestPollOnceContentBasedLoopBreaker(unittest.TestCase):
 
         self.assertEqual(sent, [])  # 這是第4次，延續前一輪的streak，不該回覆
         self.assertEqual(state["same_text_streak"], 4)
+
+
+class TestPollOnceOwnReplyTextEcho(unittest.TestCase):
+    """
+    第二道自問自答防線(2026/08/12使用者實測要求)：班別即時查詢的最終報告
+    是背景執行緒送出的，實測發現即使有跨process的BatchID記錄，仍然偶爾被
+    讀回去、誤判成新查詢(懷疑是send成功到寫檔記錄之間的時間差)。這裡直接
+    比對「文字內容」——只要收到的文字完全等於機器人自己最近送出過的某一則
+    訊息，一律當自己的回音跳過，不看BatchID、也不計入內容型3次防迴圈的
+    次數(見_remember_own_reply())。
+    """
+
+    def setUp(self):
+        self._orig_read = listener.teamplus_api.read_new_messages
+        self._orig_send_bid = listener.teamplus_api.send_message_get_batch_id
+        self._orig_recent_self_sent = listener.teamplus_api.recent_self_sent_batch_ids
+
+    def tearDown(self):
+        listener.teamplus_api.read_new_messages = self._orig_read
+        listener.teamplus_api.send_message_get_batch_id = self._orig_send_bid
+        listener.teamplus_api.recent_self_sent_batch_ids = self._orig_recent_self_sent
+
+    def test_text_matching_a_recent_own_reply_is_skipped_even_with_fresh_batch_id(self):
+        # 這則訊息的batch_id從沒被記錄過(模擬BatchID機制失效)，但文字內容
+        # 跟room_state裡記錄的「自己最近送過的訊息」完全一樣，還是要跳過
+        listener.teamplus_api.recent_self_sent_batch_ids = lambda: set()
+        own_report = "【ESEC改機】08/11（A班早班）共29台\n早班13台 夜班16台"
+        messages = _msgs(own_report, start=99)
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: (messages, "cursor-2")
+
+        sent = []
+        listener.teamplus_api.send_message_get_batch_id = (
+            lambda message, chat_id=None: (sent.append(message) or (True, "ok", "should-not-be-called"))
+        )
+
+        state = {"cursor": "cursor-1", "sent_batch_ids": [], "recent_reply_times": [],
+                 "recent_own_reply_texts": [own_report]}
+        listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
+
+        self.assertEqual(sent, [])  # 不該回覆自己的回音
+        self.assertEqual(state.get("same_text_streak", 0), 0)  # 不計入內容型防迴圈的次數
+
+    def test_normal_reply_gets_recorded_for_future_echo_detection(self):
+        listener.teamplus_api.recent_self_sent_batch_ids = lambda: set()
+        messages = _msgs("BA220")
+        listener.teamplus_api.read_new_messages = lambda cursor, chat_id=None: (messages, "cursor-2")
+        listener.teamplus_api.send_message_get_batch_id = (
+            lambda message, chat_id=None: (True, "ok", "reply-bid-1")
+        )
+
+        state = {"cursor": "cursor-1", "sent_batch_ids": [], "recent_reply_times": []}
+        listener._poll_room_once(listener.teamplus_api.CHAT_ID, state)
+
+        self.assertEqual(len(state["recent_own_reply_texts"]), 1)
 
 
 class TestInitListenerStateBootstrap(unittest.TestCase):
