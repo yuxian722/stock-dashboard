@@ -30,8 +30,10 @@ BeautifulSoup解析HTML表格。欄位對照(0-indexed)是實測驗證過的既�
 """
 import sys
 import os
+import re
 import sqlite3
 import datetime
+from bs4 import BeautifulSoup
 
 import cpis_api
 
@@ -162,6 +164,93 @@ def _rows_to_records(rows):
 def parse_ee_maintenance_xls(raw_bytes):
     """解析CPIS EE Maintenance報表(EJP_*.xls)，回傳list of dict。"""
     return _rows_to_records(_xls_bytes_to_rows(raw_bytes))
+
+
+# ---------------------------------------------------------------------------
+# 有Shift篩選功能的查詢表單(maintenance_record_h.aspx)結果HTML解析
+# (2026/08/12使用者要求：cpis_api.fetch_ee_maintenance_xls()走的
+# maintenance_record_r.aspx，shift查詢參數實測沒有真正被伺服器套用，
+# 改用這個真正有Shift下拉選單的表單頁面，回傳的是HTML表格不是XLS)
+# ---------------------------------------------------------------------------
+
+_SHIFT_TABLE_REQUIRED_HEADERS = {"MACHINEID", "ENDTIME", "ENGINEERID", "ETAG", "JOBCODE"}
+
+
+def _normalize_header(text):
+    """表頭文字正規化成只留大寫英數字，避免"ENGINEER ID."(含空格句點)
+    這種寫法比對失敗。"""
+    return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+
+
+def _extract_hhmm(text):
+    """從"2026/08/11 09:17"這種日期+時間合併文字擷取"09:17"，抓不到回傳None。"""
+    if not text:
+        return None
+    m = re.search(r"(\d{1,2}:\d{2})", text)
+    return m.group(1) if m else None
+
+
+def _first_token(text):
+    """工號欄位實測會顯示成"26163 26163"這種重複兩次的寫法(比照XLS版
+    ENG1/ENG2/ENG3子欄位相同時的顯示邏輯)，取第一個空白分隔的token即可。"""
+    if not text:
+        return None
+    parts = text.split()
+    return parts[0] if parts else None
+
+
+def parse_ee_maintenance_shift_html(html):
+    """
+    解析maintenance_record_h.aspx查詢表單按下Fetch後回傳的結果HTML表格，
+    回傳list of dict，欄位是parse_ee_maintenance_xls()那份dict的相容子集：
+    machine_id/job_code/engineer_id/dur/wait_dur/end_time/e_tag——
+    shift_query.py只需要這幾個欄位；這個HTML表格版面沒有BD_ID/PRODUCT
+    這兩欄，跟XLS報表不是同一份完整資料，不能拿來做machine_changeover_
+    detail_reply()那種需要Product/B-D欄位的查詢。
+
+    用BeautifulSoup抓所有<table>，白名單制(表頭要同時包含MACHINE ID/
+    END-TIME/ENGINEER ID./E.TAG/JOB.CODE，正規化後比對)排除頁面上其他
+    無關表格(查詢表單本身等)，比照cpis_utilization_scraper.py的作法。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
+        raw_headers = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
+        norm_headers = [_normalize_header(h) for h in raw_headers]
+        if not _SHIFT_TABLE_REQUIRED_HEADERS.issubset(set(norm_headers)):
+            continue
+
+        idx = {name: i for i, name in enumerate(norm_headers)}
+
+        def cell(cells, name):
+            i = idx.get(name)
+            return cells[i] if i is not None and i < len(cells) else None
+
+        records = []
+        for tr in rows[1:]:
+            cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if len(cells) != len(norm_headers):
+                continue
+
+            machine_id = cell(cells, "MACHINEID")
+            if not machine_id:
+                continue
+
+            records.append({
+                "machine_id": machine_id,
+                "end_time": _extract_hhmm(cell(cells, "ENDTIME")),
+                "wait_dur": _to_float(cell(cells, "WAITDUR")),
+                "dur": _to_float(cell(cells, "DUR")),
+                "engineer_id": _first_token(cell(cells, "ENGINEERID")),
+                "e_tag": cell(cells, "ETAG") or None,
+                "job_code": cell(cells, "JOBCODE") or None,
+            })
+        return records  # 找到資料表格就直接回傳，不用繼續掃描其他<table>
+
+    return []
 
 
 def save_to_db(records, date_start=None, date_end=None):

@@ -41,6 +41,14 @@ AUTH_FAIL = ("Logon.aspx", "TimeOut.aspx", "系統停滯過久", "請重新登�
 EE_R_BASE = "http://tncpisapg.tn.chipmos.com.tw"
 EE_R_PATH = "/APG/APGREPORT/EE/wFrmEEMaintenanceRecord/maintenance_record_r.aspx"
 
+# 2026/08/12使用者實測發現：EE_R_PATH(maintenance_record_r.aspx)這個「report
+# 產生端點」的shift查詢參數(&shift=AD)其實沒有被伺服器端真正套用(shift=AD
+# 查出來的筆數跟shift=None完全一樣)。真正有實作Shift篩選的是另一個查詢
+# 表單頁面maintenance_record_h.aspx(使用者用瀏覽器開發人員工具實際擷取到
+# Fetch按鈕送出的POST請求，欄位清單如下)，見_fetch_ee_maintenance_shift_
+# chunk()。
+EE_H_PATH = "/APG/APGREPORT/EE/wFrmEEMaintenanceRecord/maintenance_record_h.aspx"
+
 UTIL_BASE = "http://tncpis.tn.chipmos.com.tw"
 UTIL_DATA_PATH = "/APG/APGPROD/EQUIPMENT/wFrmUtilizationAnalysis/util_overa2.aspx"
 
@@ -256,6 +264,113 @@ def fetch_ee_maintenance_xls(date_start, date_end, entity="BA*", jobcode="", shi
         jc = "*"
 
     return [_fetch_ee_maintenance_chunk(date_start, date_end, entity, jc, shift)]
+
+
+# ---------------------------------------------------------------------------
+# EE Maintenance Record - 真正有Shift篩選功能的查詢表單(maintenance_record_h.aspx)
+#
+# 這個表單有一個ASP.NET第三方擴充控制項「DropDownCheckBoxes」(Operation複選
+# 框)，postback時一定要把全部選項欄位(DropDownCheckBoxes1$0~$84)照使用者
+# 截圖擷取到的完整清單原樣送回去，缺漏任何一項都可能讓伺服器端EventValidation
+# 判斷這次postback跟原本渲染的表單狀態不一致而拒絕/出錯。這份清單是查詢頁面
+# 「Operation」欄位全部可選代碼，不會頻繁變動，跟查詢的日期/機台無關。
+# ---------------------------------------------------------------------------
+
+_EE_H_OPERATION_CODES = [
+    "AOST", "AUTO-VI", "BM", "BP", "CCT", "CD", "D/LS", "DA", "DA10", "DA3",
+    "DA4", "DA5", "DA6", "DA7", "DA8", "DA9", "DC", "DFT", "DS", "DSHC",
+    "DSP", "DT", "DTR", "EC", "EGT", "EPOXY-CURE", "FS", "FT", "FT2", "FV",
+    "FWMK", "ILB", "IP", "LGV", "LP", "LS", "MD", "MK", "OLP", "OS",
+    "PICK-PLACE", "PK", "PLASMA", "PMC", "PMT", "POT", "PP", "PPC", "PRT", "PS",
+    "S/D", "SA", "SDFT", "SFDA", "SING", "SLB", "SLM", "SMT", "SP", "SS",
+    "TM", "TP", "TPM", "WAOI1", "WAOI2", "WAOI3", "WAOI4", "WAOI5", "WAOI6", "WAOI7",
+    "WAOI8", "WB", "WB2", "WB3", "WB4", "WB5", "WB6", "WB7", "WB8", "WBC",
+    "WI", "WM", "WMK", "WPP", "WS",
+]
+
+
+def _fetch_ee_maintenance_shift_chunk(date_start, date_end, entity, shift, jobcode="", etag="S"):
+    """
+    登入後模擬在maintenance_record_h.aspx這個查詢表單裡選好Shift、按下
+    「Fetch」按鈕的動作(2026/08/12使用者用瀏覽器開發人員工具實際擷取到的
+    真實POST請求，逐一比對出來的欄位名稱)。跟_fetch_ee_maintenance_chunk()
+    (maintenance_record_r.aspx)是完全不同的端點/流程：
+      - 那個「report產生端點」query string雖然也接受shift參數，但實測發現
+        伺服器端根本沒有真正套用這個篩選(shift=AD查出來的筆數跟shift=None
+        一樣)，是這次班別查詢需求踩到的根因。
+      - 這裡改用真正有Shift下拉選單、實測畫面上選AD/AN/BD/BN確實會篩出
+        不同資料的表單頁面，用真實的ASP.NET postback(__VIEWSTATE/
+        __EVENTVALIDATION)模擬按下Fetch。
+
+    回傳的是這個頁面查詢後的HTML(字串)，不是XLS檔案——這個表單直接把結果
+    表格嵌在同一頁回傳，要用cpis_scraper.parse_ee_maintenance_shift_html()
+    (BeautifulSoup解析HTML表格)解析，不能沿用xlrd讀EJP_*.xls那條路。
+    """
+    cfg = config.load()
+    config.require(cfg, "apg_user", "apg_password")
+
+    ee_h_url = f"{EE_R_BASE}{EE_H_PATH}"
+    login_url = f"{EE_R_BASE}/APG/Logon.aspx?ReturnUrl=" + urllib.parse.quote(EE_H_PATH, safe="")
+
+    opener = build_opener()
+    login_html, _ = _read(opener, login_url, timeout=20)
+    payload = {
+        "__VIEWSTATE": extract_input(login_html, "__VIEWSTATE"),
+        "__VIEWSTATEGENERATOR": extract_input(login_html, "__VIEWSTATEGENERATOR"),
+        "__EVENTVALIDATION": extract_input(login_html, "__EVENTVALIDATION"),
+        "UserName": cfg["apg_user"],
+        "Password": cfg["apg_password"],
+        "Login.x": "50",
+        "Login.y": "15",
+    }
+    html, final_url = _post_form(opener, login_url, payload, referer=login_url, timeout=120)
+    if "logon" in final_url.lower():
+        raise CpisAuthError(f"EE Maintenance(班別)登入失敗，仍停留在登入頁：{final_url}")
+
+    # 登入後理論上會直接redirect到maintenance_record_h.aspx這個查詢表單頁；
+    # 萬一沒有(例如落到某個通用的登入後首頁)，這裡保險再GET一次拿表單初始狀態。
+    if "maintenance_record_h" not in final_url.lower():
+        html, final_url = _read(opener, ee_h_url, timeout=30)
+
+    fields = {
+        "__VIEWSTATE": extract_input(html, "__VIEWSTATE"),
+        "__VIEWSTATEGENERATOR": extract_input(html, "__VIEWSTATEGENERATOR"),
+        "__EVENTVALIDATION": extract_input(html, "__EVENTVALIDATION"),
+        "txtStart_date": date_start,
+        "txtEnd_date": date_end,
+        "txtentity": entity,
+        "ddl_shift": shift,
+        "ddl_floor": "A2",
+        "ddl_bd_id": "None",
+        "txtProduct": "",
+        "btnFetch": "Fetch",
+        "DropDownCheckBoxes1$sll": "on",
+        "dllDept": "None",
+        "ddl_etag": etag,
+        "txt_jobcode": jobcode,
+        "txt_enginerr": "",
+        "txt_assylot": "",
+        "oper_type": "WD",
+        "txt_oper_type": "0",
+        "txt_description": "",
+    }
+    for i, code in enumerate(_EE_H_OPERATION_CODES):
+        fields[f"DropDownCheckBoxes1${i}"] = code
+
+    result_html, _ = _post_form(opener, ee_h_url, fields, referer=ee_h_url, timeout=90)
+    if is_auth_fail(result_html, ee_h_url):
+        raise CpisAuthError("EE Maintenance(班別)查詢途中session過期")
+    return result_html
+
+
+def fetch_ee_maintenance_shift_html(date_start, date_end, entity="BA*", shift="AD", jobcode="", etag="S"):
+    """
+    查詢真正有Shift篩選功能的EE Maintenance Record查詢表單，回傳結果HTML
+    (字串)。只給shift_query.py的單日即時查詢用，不像fetch_ee_maintenance_xls()
+    那樣自動切段查跨月區間——班別查詢用不到那種長區間查詢。
+    """
+    _check_entity_pattern(entity)
+    return _fetch_ee_maintenance_shift_chunk(date_start, date_end, entity, shift, jobcode, etag)
 
 
 # ---------------------------------------------------------------------------

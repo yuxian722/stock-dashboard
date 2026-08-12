@@ -2,10 +2,16 @@
 """
 班別(AD/AN/BD/BN)改機查詢(2026/08/10使用者要求)。
 
-背景：CPIS EE Maintenance Record報表的「Shift」是查詢時的過濾參數
-(cpis_api._ee_query_string()裡的shift=)，不是回傳資料裡的一個欄位——
-同一段時間查shift=None會拿到AD+AN+BD+BN全部班別的紀錄合在一起，事後
-沒辦法從資料本身分辨出處。使用者確認：A/B是班組、D/N是早班/夜班。
+背景：CPIS EE Maintenance Record有兩個查詢入口。原本用的
+maintenance_record_r.aspx(「report產生端點」，cpis_api.fetch_ee_
+maintenance_xls())query string雖然也接受shift參數，但2026/08/12使用者
+實測發現(比對shift=None跟AD/AN/BD/BN四班查出來的筆數/內容)伺服器端根本
+沒有真正套用這個篩選——shift=AD查出來的筆數跟shift=None一模一樣，等於
+沒篩選。真正有實作Shift篩選的是另一個查詢表單頁面maintenance_record_h.
+aspx(使用者用瀏覽器開發人員工具實際擷取到選Shift、按「Fetch」按鈕送出
+的POST請求欄位)，這裡改用cpis_api.fetch_ee_maintenance_shift_html() +
+cpis_scraper.parse_ee_maintenance_shift_html()這條新的HTML表格解析路線
+(不是XLS)。A/B是班組、D/N是早班/夜班(使用者確認)。
 
 使用者明確要求不要把這個功能做進整點自動排程(run_pipeline.py)裡多抓
 4次(AD/AN/BD/BN各一次)——那樣會讓每次整點任務的執行時間拉長、也會讓
@@ -13,7 +19,7 @@ CPIS的請求量變成4倍。改成「查詢的當下才即時去CPIS抓」，�
 在team+問班別問題時才發生，不進正式ETL流程、也不寫進本地SQLite——
 每次查完就丟掉，不快取。
 
-即時查CPIS要重新登入+下載+解析報表，實測其他報表(cpis_scraper.py)
+即時查CPIS要重新登入+查詢+解析頁面，實測其他報表(cpis_scraper.py)
 需要到幾十秒，呼叫端(teamplus_listener.py)一定要把這個函式丟到背景
 執行緒執行，不能卡住即時問答的主迴圈(同一個理由，比照da_bot_service.py
 把整點任務丟背景執行緒的做法)。
@@ -50,14 +56,13 @@ def live_group_shift_changeover_reply(group_name: str, shift: str, date_ymd: str
     day_word = f"{date_label}（{shift_word}）"
 
     try:
-        xls_chunks = cpis_api.fetch_ee_maintenance_xls(date_ymd, date_ymd, entity="BA*", shift=shift)
+        result_html = cpis_api.fetch_ee_maintenance_shift_html(
+            date_ymd, date_ymd, entity="BA*", shift=shift, etag="S"
+        )
     except Exception as e:
         return f"{display_name}改機（{shift_word}）{date_label} 即時查詢CPIS失敗: {type(e).__name__}: {e}"
 
-    records = []
-    for raw in xls_chunks:
-        records.extend(cpis_scraper.parse_ee_maintenance_xls(raw))
-
+    records = cpis_scraper.parse_ee_maintenance_shift_html(result_html)
     changeover_records = [r for r in records if r.get("e_tag") == "S"]
     rows = query_bot._filter_changeover_rows(changeover_records, group_name)
 

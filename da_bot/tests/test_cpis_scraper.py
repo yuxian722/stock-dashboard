@@ -214,5 +214,126 @@ class TestSaveToDbDedup(unittest.TestCase):
         self.assertEqual(self._count(), 2)
 
 
+class TestNormalizeHeader(unittest.TestCase):
+    def test_strips_spaces_and_punctuation(self):
+        self.assertEqual(cpis_scraper._normalize_header("ENGINEER ID."), "ENGINEERID")
+        self.assertEqual(cpis_scraper._normalize_header("E.TAG"), "ETAG")
+        self.assertEqual(cpis_scraper._normalize_header("JOB.CODE"), "JOBCODE")
+        self.assertEqual(cpis_scraper._normalize_header("MACHINE ID"), "MACHINEID")
+
+    def test_empty_or_none(self):
+        self.assertEqual(cpis_scraper._normalize_header(""), "")
+        self.assertEqual(cpis_scraper._normalize_header(None), "")
+
+
+class TestExtractHhmm(unittest.TestCase):
+    def test_extracts_time_from_combined_datetime_text(self):
+        self.assertEqual(cpis_scraper._extract_hhmm("2026/08/11 09:17"), "09:17")
+
+    def test_blank_returns_none(self):
+        self.assertIsNone(cpis_scraper._extract_hhmm(""))
+        self.assertIsNone(cpis_scraper._extract_hhmm(None))
+
+
+class TestFirstToken(unittest.TestCase):
+    def test_duplicated_engineer_id_takes_first(self):
+        # 實測工號欄位會顯示"26163 26163"這種重複兩次的寫法
+        self.assertEqual(cpis_scraper._first_token("26163 26163"), "26163")
+
+    def test_single_token(self):
+        self.assertEqual(cpis_scraper._first_token("S3145"), "S3145")
+
+    def test_blank_returns_none(self):
+        self.assertIsNone(cpis_scraper._first_token(""))
+        self.assertIsNone(cpis_scraper._first_token(None))
+
+
+class TestParseEeMaintenanceShiftHtml(unittest.TestCase):
+    """
+    2026/08/12使用者實測發現maintenance_record_r.aspx的shift查詢參數沒有
+    真正被伺服器套用，改用真正有Shift篩選功能的maintenance_record_h.aspx
+    表單頁面——這個頁面按下Fetch後把結果表格直接嵌在同一頁HTML回傳(不是
+    XLS下載連結)，欄位是Production Line/MACHINE ID/WAIT-TIME/BGN-TIME/
+    END-TIME/WAIT-DUR/DUR/ENGINEER ID./E.TAG/JOB.CODE/TOOL NUMBER/CAUSE
+    (使用者截圖確認的實際表頭)。
+    """
+
+    def _html(self, rows_html):
+        # 頁面上還有查詢表單本身的<table>(白名單制要能正確跳過，只挑出
+        # 真正的資料表格)
+        form_table = (
+            "<table><tr><td>Date Range</td><td>Entity</td><td>Shift</td></tr>"
+            "<tr><td>20260811</td><td>BA*</td><td>AD</td></tr></table>"
+        )
+        data_table = (
+            "<table>"
+            "<tr><th>Production Line</th><th>MACHINE ID</th><th>WAIT-TIME</th>"
+            "<th>BGN-TIME</th><th>END-TIME</th><th>WAIT-DUR</th><th>DUR</th>"
+            "<th>ENGINEER ID.</th><th>E.TAG</th><th>JOB.CODE</th>"
+            "<th>TOOL NUMBER</th><th>CAUSE</th></tr>"
+            + rows_html +
+            "</table>"
+        )
+        return f"<html><body>{form_table}{data_table}</body></html>"
+
+    def test_parses_data_rows_and_skips_form_table(self):
+        rows_html = (
+            "<tr><td>APG</td><td>BA205</td><td>2026/08/11 09:03</td>"
+            "<td>2026/08/11 09:10</td><td>2026/08/11 09:17</td><td>0.12</td>"
+            "<td>0.13</td><td>26163 26163</td><td>S</td><td>CWT</td>"
+            "<td></td><td>CWT</td></tr>"
+        )
+        records = cpis_scraper.parse_ee_maintenance_shift_html(self._html(rows_html))
+
+        self.assertEqual(len(records), 1)
+        r = records[0]
+        self.assertEqual(r["machine_id"], "BA205")
+        self.assertEqual(r["end_time"], "09:17")
+        self.assertEqual(r["wait_dur"], 0.12)
+        self.assertEqual(r["dur"], 0.13)
+        self.assertEqual(r["engineer_id"], "26163")
+        self.assertEqual(r["e_tag"], "S")
+        self.assertEqual(r["job_code"], "CWT")
+
+    def test_blank_wait_dur_becomes_none(self):
+        rows_html = (
+            "<tr><td>APG</td><td>BA205</td><td></td>"
+            "<td>2026/08/11 10:04</td><td>2026/08/11 10:38</td><td></td>"
+            "<td>0.58</td><td>18745 18745</td><td>S</td><td>INK</td>"
+            "<td></td><td>WI INK 270EA</td></tr>"
+        )
+        records = cpis_scraper.parse_ee_maintenance_shift_html(self._html(rows_html))
+
+        self.assertEqual(len(records), 1)
+        self.assertIsNone(records[0]["wait_dur"])
+
+    def test_multiple_rows(self):
+        rows_html = (
+            "<tr><td>APG</td><td>BA205</td><td></td><td></td>"
+            "<td>2026/08/11 09:17</td><td></td><td>0.13</td>"
+            "<td>26163</td><td>S</td><td>CWT</td><td></td><td></td></tr>"
+            "<tr><td>APG</td><td>BA207</td><td></td><td></td>"
+            "<td>2026/08/11 12:14</td><td>0.31</td><td>0.50</td>"
+            "<td>S3145</td><td>S</td><td>CSN</td><td></td><td></td></tr>"
+        )
+        records = cpis_scraper.parse_ee_maintenance_shift_html(self._html(rows_html))
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual([r["machine_id"] for r in records], ["BA205", "BA207"])
+
+    def test_no_matching_table_returns_empty_list(self):
+        html = "<html><body><table><tr><td>不相關的表格</td></tr></table></body></html>"
+        self.assertEqual(cpis_scraper.parse_ee_maintenance_shift_html(html), [])
+
+    def test_row_with_missing_machine_id_is_skipped(self):
+        rows_html = (
+            "<tr><td>APG</td><td></td><td></td><td></td>"
+            "<td>2026/08/11 09:17</td><td></td><td>0.13</td>"
+            "<td>26163</td><td>S</td><td>CWT</td><td></td><td></td></tr>"
+        )
+        records = cpis_scraper.parse_ee_maintenance_shift_html(self._html(rows_html))
+        self.assertEqual(records, [])
+
+
 if __name__ == "__main__":
     unittest.main()
