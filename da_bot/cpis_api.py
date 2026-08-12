@@ -44,24 +44,10 @@ EE_R_PATH = "/APG/APGREPORT/EE/wFrmEEMaintenanceRecord/maintenance_record_r.aspx
 # 2026/08/12使用者實測發現：EE_R_PATH(maintenance_record_r.aspx)這個「report
 # 產生端點」的shift查詢參數(&shift=AD)其實沒有被伺服器端真正套用(shift=AD
 # 查出來的筆數跟shift=None完全一樣)。真正有實作Shift篩選的是另一個查詢
-# 表單頁面maintenance_record_h.aspx(使用者用瀏覽器開發人員工具實際擷取到
-# Fetch按鈕送出的POST請求，欄位清單如下)，見_fetch_ee_maintenance_shift_
-# chunk()。
-EE_H_PATH = "/APG/APGREPORT/EE/wFrmEEMaintenanceRecord/maintenance_record_h.aspx"
-
-# 2026/08/12使用者實測發現：即使補齊__EVENTTARGET/__EVENTARGUMENT等標準
-# ASP.NET欄位，直接登入後POST maintenance_record_h.aspx仍然回500 Internal
-# Server Error。使用者截圖顯示這個表單平常是透過內部選單框架頁Default.aspx
-# (帶isCopy/FuncId/ServerName/UserName這幾個查詢參數)進入的——懷疑CPIS
-# 伺服器端會在存取這個報表模組時檢查session是否已經透過選單「授權」進入
-# 過這個FuncId(=569)，不是打完帳密就直接能查maintenance_record_h.aspx。
-# 這裡先GET一次這個帶FuncId的入口頁「暖身」session，再GET/POST真正的
-# 查詢表單。EQS01不像本系統其他地方的工號格式(例如s10435)，比較像是這個
-# 選單項目固定帶的識別碼(不是登入者本人的帳號)，先原樣沿用。
-EE_H_ENTRY_PATH = (
-    "/APG/APGREPORT/EE/wFrmEEMaintenanceRecord/Default.aspx"
-    "?isCopy=True&FuncId=569&ServerName=CPIS&UserName=EQS01"
-)
+# 表單頁面maintenance_record_h.aspx，純urllib模擬POST這個表單試過兩輪
+# (補__EVENTTARGET/__EVENTARGUMENT、先訪問FuncId入口頁「暖身」)都還是回
+# 500 Internal Server Error，改用cpis_ee_shift_scraper.py的無頭瀏覽器
+# 做法，不在這個模組裡處理。
 
 UTIL_BASE = "http://tncpis.tn.chipmos.com.tw"
 UTIL_DATA_PATH = "/APG/APGPROD/EQUIPMENT/wFrmUtilizationAnalysis/util_overa2.aspx"
@@ -278,122 +264,6 @@ def fetch_ee_maintenance_xls(date_start, date_end, entity="BA*", jobcode="", shi
         jc = "*"
 
     return [_fetch_ee_maintenance_chunk(date_start, date_end, entity, jc, shift)]
-
-
-# ---------------------------------------------------------------------------
-# EE Maintenance Record - 真正有Shift篩選功能的查詢表單(maintenance_record_h.aspx)
-#
-# 這個表單有一個ASP.NET第三方擴充控制項「DropDownCheckBoxes」(Operation複選
-# 框)，postback時一定要把全部選項欄位(DropDownCheckBoxes1$0~$84)照使用者
-# 截圖擷取到的完整清單原樣送回去，缺漏任何一項都可能讓伺服器端EventValidation
-# 判斷這次postback跟原本渲染的表單狀態不一致而拒絕/出錯。這份清單是查詢頁面
-# 「Operation」欄位全部可選代碼，不會頻繁變動，跟查詢的日期/機台無關。
-# ---------------------------------------------------------------------------
-
-_EE_H_OPERATION_CODES = [
-    "AOST", "AUTO-VI", "BM", "BP", "CCT", "CD", "D/LS", "DA", "DA10", "DA3",
-    "DA4", "DA5", "DA6", "DA7", "DA8", "DA9", "DC", "DFT", "DS", "DSHC",
-    "DSP", "DT", "DTR", "EC", "EGT", "EPOXY-CURE", "FS", "FT", "FT2", "FV",
-    "FWMK", "ILB", "IP", "LGV", "LP", "LS", "MD", "MK", "OLP", "OS",
-    "PICK-PLACE", "PK", "PLASMA", "PMC", "PMT", "POT", "PP", "PPC", "PRT", "PS",
-    "S/D", "SA", "SDFT", "SFDA", "SING", "SLB", "SLM", "SMT", "SP", "SS",
-    "TM", "TP", "TPM", "WAOI1", "WAOI2", "WAOI3", "WAOI4", "WAOI5", "WAOI6", "WAOI7",
-    "WAOI8", "WB", "WB2", "WB3", "WB4", "WB5", "WB6", "WB7", "WB8", "WBC",
-    "WI", "WM", "WMK", "WPP", "WS",
-]
-
-
-def _fetch_ee_maintenance_shift_chunk(date_start, date_end, entity, shift, jobcode="", etag="S"):
-    """
-    登入後模擬在maintenance_record_h.aspx這個查詢表單裡選好Shift、按下
-    「Fetch」按鈕的動作(2026/08/12使用者用瀏覽器開發人員工具實際擷取到的
-    真實POST請求，逐一比對出來的欄位名稱)。跟_fetch_ee_maintenance_chunk()
-    (maintenance_record_r.aspx)是完全不同的端點/流程：
-      - 那個「report產生端點」query string雖然也接受shift參數，但實測發現
-        伺服器端根本沒有真正套用這個篩選(shift=AD查出來的筆數跟shift=None
-        一樣)，是這次班別查詢需求踩到的根因。
-      - 這裡改用真正有Shift下拉選單、實測畫面上選AD/AN/BD/BN確實會篩出
-        不同資料的表單頁面，用真實的ASP.NET postback(__VIEWSTATE/
-        __EVENTVALIDATION)模擬按下Fetch。
-
-    回傳的是這個頁面查詢後的HTML(字串)，不是XLS檔案——這個表單直接把結果
-    表格嵌在同一頁回傳，要用cpis_scraper.parse_ee_maintenance_shift_html()
-    (BeautifulSoup解析HTML表格)解析，不能沿用xlrd讀EJP_*.xls那條路。
-    """
-    cfg = config.load()
-    config.require(cfg, "apg_user", "apg_password")
-
-    ee_h_url = f"{EE_R_BASE}{EE_H_PATH}"
-    login_url = f"{EE_R_BASE}/APG/Logon.aspx?ReturnUrl=" + urllib.parse.quote(EE_H_ENTRY_PATH, safe="")
-
-    opener = build_opener()
-    login_html, _ = _read(opener, login_url, timeout=20)
-    payload = {
-        "__VIEWSTATE": extract_input(login_html, "__VIEWSTATE"),
-        "__VIEWSTATEGENERATOR": extract_input(login_html, "__VIEWSTATEGENERATOR"),
-        "__EVENTVALIDATION": extract_input(login_html, "__EVENTVALIDATION"),
-        "UserName": cfg["apg_user"],
-        "Password": cfg["apg_password"],
-        "Login.x": "50",
-        "Login.y": "15",
-    }
-    html, final_url = _post_form(opener, login_url, payload, referer=login_url, timeout=120)
-    if "logon" in final_url.lower():
-        raise CpisAuthError(f"EE Maintenance(班別)登入失敗，仍停留在登入頁：{final_url}")
-
-    # 登入後應該落在EE_H_ENTRY_PATH(帶FuncId的選單入口頁，讓session被伺服器
-    # 端登記成「已授權進入這個報表模組」)，不是maintenance_record_h.aspx本身
-    # (那是個frameset，真正的查詢表單在裡面的frame)。這裡不管入口頁長什麼
-    # 樣子，直接再GET一次maintenance_record_h.aspx拿表單目前狀態——此時
-    # session已經透過上面那次入口頁請求「暖身」過，理論上不會再被伺服器
-    # 認為是未授權的直接存取。
-    html, final_url = _read(opener, ee_h_url, timeout=30)
-
-    fields = {
-        # 2026/08/12使用者用瀏覽器開發人員工具擷取到的真實POST請求，最前面
-        # 還有__EVENTTARGET/__EVENTARGUMENT這兩個標準ASP.NET WebForms欄位
-        # (按鈕直接送出時是空字串，但一定要存在，不能整個缺漏——這是第一次
-        # 版本漏掉這兩個欄位、實測回500 Internal Server Error的根因)。
-        "__EVENTTARGET": "",
-        "__EVENTARGUMENT": "",
-        "__VIEWSTATE": extract_input(html, "__VIEWSTATE"),
-        "__VIEWSTATEGENERATOR": extract_input(html, "__VIEWSTATEGENERATOR"),
-        "__EVENTVALIDATION": extract_input(html, "__EVENTVALIDATION"),
-        "txtStart_date": date_start,
-        "txtEnd_date": date_end,
-        "txtentity": entity,
-        "ddl_shift": shift,
-        "ddl_floor": "A2",
-        "ddl_bd_id": "None",
-        "txtProduct": "",
-        "btnFetch": "Fetch",
-        "DropDownCheckBoxes1$sll": "on",
-        "dllDept": "None",
-        "ddl_etag": etag,
-        "txt_jobcode": jobcode,
-        "txt_enginerr": "",
-        "txt_assylot": "",
-        "oper_type": "WD",
-        "txt_oper_type": "0",
-        "txt_description": "",
-    }
-    for i, code in enumerate(_EE_H_OPERATION_CODES):
-        fields[f"DropDownCheckBoxes1${i}"] = code
-
-    result_html, _ = _post_form(opener, ee_h_url, fields, referer=ee_h_url, timeout=90)
-    if is_auth_fail(result_html, ee_h_url):
-        raise CpisAuthError("EE Maintenance(班別)查詢途中session過期")
-    return result_html
-
-
-def fetch_ee_maintenance_shift_html(date_start, date_end, entity="BA*", shift="AD", jobcode="", etag="S"):
-    """
-    查詢真正有Shift篩選功能的EE Maintenance Record查詢表單，回傳結果HTML
-    (字串)。只給shift_query.py的單日即時查詢用，不像fetch_ee_maintenance_xls()
-    那樣自動切段查跨月區間——班別查詢用不到那種長區間查詢。
-    """
-    _check_entity_pattern(entity)
-    return _fetch_ee_maintenance_shift_chunk(date_start, date_end, entity, shift, jobcode, etag)
 
 
 # ---------------------------------------------------------------------------

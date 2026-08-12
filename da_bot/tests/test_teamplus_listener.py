@@ -304,8 +304,8 @@ class TestParseQueryDatedChangeoverAndWorkhours(unittest.TestCase):
         self.assertEqual(cmd, {"mode": "group_repair_code_detail", "group_name": "ESEC", "code": "AD"})
 
     def test_build_reply_live_group_shift_changeover_dispatches(self):
-        orig_fetch = shift_query.cpis_api.fetch_ee_maintenance_shift_html
-        shift_query.cpis_api.fetch_ee_maintenance_shift_html = lambda *a, **k: []
+        orig_fetch = shift_query.cpis_ee_shift_scraper.fetch_ee_maintenance_shift_html
+        shift_query.cpis_ee_shift_scraper.fetch_ee_maintenance_shift_html = lambda *a, **k: []
         try:
             reply = listener.build_reply({
                 "mode": "live_group_shift_changeover", "group_name": "DB", "shift": "AD",
@@ -313,7 +313,7 @@ class TestParseQueryDatedChangeoverAndWorkhours(unittest.TestCase):
             })
             self.assertIsInstance(reply, str)
         finally:
-            shift_query.cpis_api.fetch_ee_maintenance_shift_html = orig_fetch
+            shift_query.cpis_ee_shift_scraper.fetch_ee_maintenance_shift_html = orig_fetch
 
     def test_group_repair_code_query(self):
         # "2100 BWD"(2026/08/10使用者要求)：群組後面直接接大寫代碼，
@@ -716,7 +716,7 @@ class TestPollOnceLiveShiftQuery(unittest.TestCase):
         self._orig_recent_self_sent = listener.teamplus_api.recent_self_sent_batch_ids
         self._orig_record_self_sent = listener.teamplus_api._record_self_sent_batch_id
         self._orig_thread = listener.threading.Thread
-        self._orig_fetch = shift_query.cpis_api.fetch_ee_maintenance_shift_html
+        self._orig_fetch = shift_query.cpis_ee_shift_scraper.fetch_ee_maintenance_shift_html
         self._orig_parse = shift_query.cpis_scraper.parse_ee_maintenance_shift_html
         listener.threading.Thread = _SyncThread
 
@@ -726,7 +726,7 @@ class TestPollOnceLiveShiftQuery(unittest.TestCase):
         listener.teamplus_api.recent_self_sent_batch_ids = self._orig_recent_self_sent
         listener.teamplus_api._record_self_sent_batch_id = self._orig_record_self_sent
         listener.threading.Thread = self._orig_thread
-        shift_query.cpis_api.fetch_ee_maintenance_shift_html = self._orig_fetch
+        shift_query.cpis_ee_shift_scraper.fetch_ee_maintenance_shift_html = self._orig_fetch
         shift_query.cpis_scraper.parse_ee_maintenance_shift_html = self._orig_parse
 
     def test_sends_ack_then_final_result_and_records_both_as_self_sent(self):
@@ -748,7 +748,7 @@ class TestPollOnceLiveShiftQuery(unittest.TestCase):
         recorded = []
         listener.teamplus_api._record_self_sent_batch_id = lambda bid: recorded.append(bid)
 
-        shift_query.cpis_api.fetch_ee_maintenance_shift_html = lambda *a, **k: []
+        shift_query.cpis_ee_shift_scraper.fetch_ee_maintenance_shift_html = lambda *a, **k: []
         shift_query.cpis_scraper.parse_ee_maintenance_shift_html = lambda raw: []
 
         state = {"cursor": "cursor-1", "sent_batch_ids": [], "recent_reply_times": []}
@@ -783,7 +783,7 @@ class TestPollOnceLiveShiftQuery(unittest.TestCase):
 
         listener.teamplus_api.send_message_get_batch_id = fake_send_bid
         listener.teamplus_api._record_self_sent_batch_id = lambda bid: None  # 模擬記錄失效/沒發生效果
-        shift_query.cpis_api.fetch_ee_maintenance_shift_html = lambda *a, **k: []
+        shift_query.cpis_ee_shift_scraper.fetch_ee_maintenance_shift_html = lambda *a, **k: []
         shift_query.cpis_scraper.parse_ee_maintenance_shift_html = lambda raw: []
 
         state = {"cursor": "cursor-1", "sent_batch_ids": [], "recent_reply_times": []}
@@ -834,7 +834,7 @@ class TestPollOnceLiveShiftQuery(unittest.TestCase):
             release.wait(timeout=5)  # 模擬即時查CPIS要花很久
             return []
 
-        shift_query.cpis_api.fetch_ee_maintenance_shift_html = slow_fetch
+        shift_query.cpis_ee_shift_scraper.fetch_ee_maintenance_shift_html = slow_fetch
         shift_query.cpis_scraper.parse_ee_maintenance_shift_html = lambda raw: []
 
         state = {"cursor": "cursor-1", "sent_batch_ids": [], "recent_reply_times": []}

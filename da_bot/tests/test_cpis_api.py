@@ -112,28 +112,6 @@ class TestEeQueryString(unittest.TestCase):
         self.assertIn("shift=AD", qs)
 
 
-class TestEeHOperationCodes(unittest.TestCase):
-    """
-    maintenance_record_h.aspx(真正有Shift篩選功能的查詢表單)的Operation
-    複選框控制項，postback時一定要把使用者截圖擷取到的完整選項清單原樣送
-    回去，缺漏會讓伺服器端EventValidation拒絕/出錯——這裡鎖定清單筆數
-    (85項)跟沒有重複，避免之後有人不小心改壞。
-    """
-
-    def test_has_85_codes_matching_user_screenshot_capture(self):
-        self.assertEqual(len(cpis_api._EE_H_OPERATION_CODES), 85)
-
-    def test_no_duplicate_codes(self):
-        codes = cpis_api._EE_H_OPERATION_CODES
-        self.assertEqual(len(codes), len(set(codes)))
-
-
-class TestFetchEeMaintenanceShiftHtmlValidation(unittest.TestCase):
-    def test_rejects_bad_entity_pattern_before_any_network_call(self):
-        with self.assertRaises(ValueError):
-            cpis_api.fetch_ee_maintenance_shift_html("20260811", "20260811", entity="B*", shift="AD")
-
-
 class TestFindEjpUrl(unittest.TestCase):
     def test_finds_full_url(self):
         html = '<a href="http://tncpisapg.tn.chipmos.com.tw/APG/assyfab/cpis/report/EJP_20260803192310.xls">Here</a>'
