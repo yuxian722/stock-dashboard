@@ -333,6 +333,12 @@ def _fetch_ee_maintenance_shift_chunk(date_start, date_end, entity, shift, jobco
         html, final_url = _read(opener, ee_h_url, timeout=30)
 
     fields = {
+        # 2026/08/12使用者用瀏覽器開發人員工具擷取到的真實POST請求，最前面
+        # 還有__EVENTTARGET/__EVENTARGUMENT這兩個標準ASP.NET WebForms欄位
+        # (按鈕直接送出時是空字串，但一定要存在，不能整個缺漏——這是第一次
+        # 版本漏掉這兩個欄位、實測回500 Internal Server Error的根因)。
+        "__EVENTTARGET": "",
+        "__EVENTARGUMENT": "",
         "__VIEWSTATE": extract_input(html, "__VIEWSTATE"),
         "__VIEWSTATEGENERATOR": extract_input(html, "__VIEWSTATEGENERATOR"),
         "__EVENTVALIDATION": extract_input(html, "__EVENTVALIDATION"),
