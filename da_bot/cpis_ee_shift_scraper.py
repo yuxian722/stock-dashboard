@@ -176,16 +176,43 @@ def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, time
         Select(driver.find_element(By.ID, "ddl_shift")).select_by_value(shift)
         Select(driver.find_element(By.ID, "ddl_etag")).select_by_visible_text(etag)
 
-        # Job Code填"C*"(不是空白，也不碰Operation那個不穩定的自訂控制項)，
-        # 見上面docstring說明。
+        # Job Code填"C*"(見上面docstring說明)。
         jobcode_input = driver.find_element(By.ID, "txt_jobcode")
         jobcode_input.clear()
         jobcode_input.send_keys("C*")
 
+        # 2026/08/13使用者實測發現：光填Job Code="C*"還是查出"No Data"，
+        # 代表Operation欄位還是要點「Select all」，不是Job Code就能取代——
+        # 兩個條件都要滿足。這裡重新加回這段，並且用checked狀態驗證+重試，
+        # 確保真的點成功(不只是送出click事件，還要確認checkbox變成checked，
+        # 沒成功的話再試一次)。
+        try:
+            checkbox_panel_trigger = driver.find_element(By.ID, "DropDownCheckBoxes1_sl")
+            driver.execute_script("arguments[0].click();", checkbox_panel_trigger)
+            time.sleep(1)
+            select_all_checkbox = None
+            for _ in range(3):
+                checkboxes = driver.find_elements(
+                    By.CSS_SELECTOR, "#DropDownCheckBoxes1_dv input[type=checkbox]"
+                )
+                if checkboxes:
+                    select_all_checkbox = checkboxes[0]
+                    break
+                time.sleep(1)
+
+            if select_all_checkbox is not None:
+                for _ in range(3):
+                    if select_all_checkbox.is_selected():
+                        break
+                    driver.execute_script("arguments[0].click();", select_all_checkbox)
+                    time.sleep(0.5)
+        except Exception:
+            pass
+
         driver.find_element(By.ID, "btnFetch").click()
         status = (
             f"[表單] 已填好日期({date_start}~{date_end})/entity={entity}/shift={shift}/etag={etag}"
-            "/jobcode=C*，按下Fetch"
+            "/jobcode=C*/Operation=select all，按下Fetch"
         )
     except Exception as e:
         status = f"[表單] 找到frame了，但填寫/點擊失敗: {type(e).__name__}: {e}"
