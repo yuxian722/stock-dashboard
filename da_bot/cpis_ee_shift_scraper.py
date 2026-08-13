@@ -117,13 +117,19 @@ def _find_result_html(driver, max_depth=5, log=None):
     return None
 
 
-def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, timeout=15):
+def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, timeout=15):
     """
-    切進查詢表單所在的frame，填好Date Range/Entity/Shift/E-tag、按下Fetch。
+    切進查詢表單所在的frame，填好Date Range/Entity/Shift、按下Fetch。
     跟cpis_pm_monitor_scraper.py的_select_oper_kind_and_fetch()同款寫法：
     frame巢狀好幾層時，剛導覽過去frame可能還沒完全載入完，在timeout秒內
     每秒重試一次找ddl_shift所在的frame，回傳status字串描述實際發生的狀況
     (不默默吞掉例外，方便診斷)。
+
+    2026/08/12使用者實測發現：E-tag(ddl_etag)這個欄位不設，維持頁面預設
+    (顯示"None(P,R,S,QC)"這種把P/R/S/QC全部包在一起的複合選項，沒有單獨
+    的"S"選項可選，select_by_value("S")會直接丟例外)，靠呼叫端(shift_
+    query.py)既有的client端e_tag=="S"過濾就好，不用也不能靠CPIS伺服器端
+    先篩好。
     """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import Select
@@ -155,10 +161,8 @@ def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, time
         entity_input.send_keys(entity)
 
         Select(driver.find_element(By.ID, "ddl_shift")).select_by_value(shift)
-        Select(driver.find_element(By.ID, "ddl_etag")).select_by_value(etag)
-
         driver.find_element(By.ID, "btnFetch").click()
-        status = f"[表單] 已填好日期({date_start}~{date_end})/entity={entity}/shift={shift}/etag={etag}，按下Fetch"
+        status = f"[表單] 已填好日期({date_start}~{date_end})/entity={entity}/shift={shift}，按下Fetch(E-tag維持預設，靠client端過濾)"
     except Exception as e:
         status = f"[表單] 找到frame了，但填寫/點擊失敗: {type(e).__name__}: {e}"
     finally:
@@ -166,11 +170,12 @@ def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, time
     return status
 
 
-def fetch_ee_maintenance_shift_html(date_start, date_end, entity="BA*", shift="AD", etag="S",
+def fetch_ee_maintenance_shift_html(date_start, date_end, entity="BA*", shift="AD",
                                      wait_seconds=WAIT_SECONDS):
     """
     開無頭瀏覽器，實際操作maintenance_record_h.aspx這個查詢表單(選好
-    Shift/Entity/日期/E-tag、按Fetch)，回傳結果頁面的HTML，交給
+    Shift/Entity/日期、按Fetch，E-tag欄位維持頁面預設，見
+    _fill_form_and_fetch()說明)，回傳結果頁面的HTML，交給
     cpis_scraper.parse_ee_maintenance_shift_html()解析。
 
     找不到結果表格時，會先存一張目前畫面的截圖(SCREENSHOT_PATH)再丟例外
@@ -179,7 +184,7 @@ def fetch_ee_maintenance_shift_html(date_start, date_end, entity="BA*", shift="A
     driver = _make_driver()
     try:
         driver.get(EE_H_URL)
-        fill_status = _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag)
+        fill_status = _fill_form_and_fetch(driver, date_start, date_end, entity, shift)
         print(fill_status)
         time.sleep(wait_seconds)
         log = []
