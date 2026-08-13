@@ -100,6 +100,12 @@ def _login(driver):
     driver.find_element(By.NAME, "UserName").send_keys(cfg["apg_user"])
     driver.find_element(By.NAME, "Password").send_keys(cfg["apg_password"])
     driver.find_element(By.NAME, "Login").click()
+    time.sleep(2)  # 等登入的postback/redirect跑完，避免下一步立刻讀到還沒轉址完成的頁面
+
+    # 2026/08/13使用者實測發現：加了登入步驟後結果沒變，還是查不到資料，
+    # 不確定登入本身到底有沒有真的成功——印出登入後瀏覽器實際停在哪個
+    # 網址、頁面標題是什麼，直接從log判斷，不要再靠猜的。
+    return f"[登入] 送出帳密後，瀏覽器停在: {driver.current_url}  頁面標題: {driver.title!r}"
 
 
 def _switch_to_frame_with_element(driver, element_id, max_depth=5):
@@ -254,7 +260,8 @@ def fetch_ee_maintenance_shift_html(date_start, date_end, entity="BA*", shift="A
     """
     driver = _make_driver()
     try:
-        _login(driver)
+        login_status = _login(driver)
+        print(login_status)
         fill_status = _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag)
         print(fill_status)
         time.sleep(wait_seconds)
@@ -270,7 +277,7 @@ def fetch_ee_maintenance_shift_html(date_start, date_end, entity="BA*", shift="A
             raise EeShiftScraperError(
                 "找不到含MACHINE ID+JOB.CODE表頭的結果表格，可能查詢還沒跑完"
                 f"(可以拉長wait_seconds，目前是{wait_seconds}秒)，或頁面結構變了。\n"
-                f"{fill_status}\n"
+                f"{login_status}\n{fill_status}\n"
                 f"掃過的每一層HTML長度: {log}\n{shot_note}"
             )
         return html
