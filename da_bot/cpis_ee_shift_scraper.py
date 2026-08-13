@@ -142,10 +142,19 @@ def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, time
        問題所在，這個表單真正需要的只有Job Code填非空值(說明文字寫著
        "Entity+job code為必填"，可以用單一字元+萬用字元，範例"如K*")。
        之前加的Operation點擊邏輯完全是白費工夫、甚至可能反而干擾了表單
-       狀態，這裡整段移除，只保留填Job Code="C*"(涵蓋所有改機相關代碼
-       的字首：ESEC/DB的CE*/CD、LOC的CN*/CD)。
+       狀態，改成只保留填Job Code="C*"。
+    3. 光靠send_keys()填完Job Code後，機器人跑出來還是"No Data"，但
+       使用者手動打字+滑鼠點開別的欄位測試卻查得到資料——兩者的差異是
+       人手動輸入完會自然點開/切到別的欄位(觸發blur事件)，send_keys()
+       本身雖然會模擬打字(觸發keydown/keyup)，但欄位「失去焦點」這個
+       動作不會自動發生，如果這個表單的驗證邏輯是綁在onblur/onchange
+       (常見於「輸入完才检查/正規化這個欄位」的JS寫法)，少了這個事件
+       這個欄位在JS層面可能沒有真正被判定為「已填寫」。這裡在每個文字
+       輸入欄位填完後都補送Keys.TAB(模擬真人打完字按Tab跳到下一欄)，
+       確保有觸發blur事件。
     """
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import Select
 
     deadline = time.time() + timeout
@@ -165,24 +174,28 @@ def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, time
         start_input = driver.find_element(By.ID, "txtStart_date")
         start_input.clear()
         start_input.send_keys(date_start)
+        start_input.send_keys(Keys.TAB)
 
         end_input = driver.find_element(By.ID, "txtEnd_date")
         end_input.clear()
         end_input.send_keys(date_end)
+        end_input.send_keys(Keys.TAB)
 
         entity_input = driver.find_element(By.ID, "txtentity")
         entity_input.clear()
         entity_input.send_keys(entity)
+        entity_input.send_keys(Keys.TAB)
 
         Select(driver.find_element(By.ID, "ddl_shift")).select_by_value(shift)
         Select(driver.find_element(By.ID, "ddl_etag")).select_by_visible_text(etag)
 
         # Job Code填"C*"(見上面docstring說明)。這是真正必填的關鍵欄位，
         # Operation不用碰(使用者實測手動不點Operation、只填Job Code也能
-        # 查到資料)。
+        # 查到資料)。填完額外按Tab觸發blur，見上面docstring第3點說明。
         jobcode_input = driver.find_element(By.ID, "txt_jobcode")
         jobcode_input.clear()
         jobcode_input.send_keys("C*")
+        jobcode_input.send_keys(Keys.TAB)
 
         driver.find_element(By.ID, "btnFetch").click()
         status = (
