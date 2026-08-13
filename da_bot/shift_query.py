@@ -74,4 +74,15 @@ def live_group_shift_changeover_reply(group_name: str, shift: str, date_ymd: str
     changeover_records = [r for r in records if r.get("e_tag") == "S"]
     rows = query_bot._filter_changeover_rows(changeover_records, group_name)
 
+    # 2026/08/13使用者實測發現：即使沒有丟例外(代表有抓到含表頭的表格)，
+    # 篩到特定群組後還是可能變成0筆，跟"完全沒抓到資料"是兩種不同的情況
+    # (前者可能是頁面渲染還沒跑完、後者才是真的查無資料)。印出每個階段
+    # 的筆數，方便直接看服務黑色視窗裡的log判斷問題出在哪一階段，不用
+    # 再靠截圖來回確認。
+    print(
+        f"[shift_query] {group_name} {shift} {date_ymd}: "
+        f"原始抓到{len(records)}筆 -> e_tag=S有{len(changeover_records)}筆 -> "
+        f"屬於{group_name}群組的改機有{len(rows)}筆"
+    )
+
     return query_bot._changeover_report_text(display_name, day_word, rows)

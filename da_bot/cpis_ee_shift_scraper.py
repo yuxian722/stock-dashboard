@@ -40,9 +40,13 @@ EE_H_URL = (
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DRIVER_PATH = os.path.join(SCRIPT_DIR, "msedgedriver.exe")
 
-# 全頁postback(不是PM Monitor那種JS背景抓資料)，理論上不用等太久，
-# 但保留跟cpis_pm_monitor_scraper.py類似的緩衝時間避免公司網路較慢時撲空
-WAIT_SECONDS = 10
+# 2026/08/13使用者實測發現：entity=BA*這種查全樓層的查詢，結果動輒好幾十列
+# (使用者截圖看到的表格還要往下捲)，全頁postback要完整渲染完這麼多列可能
+# 不只10秒——之前用10秒時，程式沒有丟錯誤(有抓到含表頭的表格，代表頁面
+# 骨架已經到了)，但抓到的實際上是列表還沒填滿的中間狀態，篩到特定群組後
+# 變成0筆，跟使用者手動測試同樣條件明明有資料對不起來。拉長到20秒，give
+# 伺服器更多時間把整頁資料跑完。
+WAIT_SECONDS = 20
 
 SCREENSHOT_PATH = os.path.join(SCRIPT_DIR, "ee_shift_debug.png")
 
