@@ -129,24 +129,20 @@ def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, time
     每秒重試一次找ddl_shift所在的frame，回傳status字串描述實際發生的狀況
     (不默默吞掉例外，方便診斷)。
 
-    2026/08/12~08/13使用者實測發現三件事：
+    2026/08/12~08/13使用者實測發現：
     1. ddl_etag這個下拉選單的<option value="...">跟畫面顯示的文字不一樣
-       (select_by_value("S")找不到對應選項、直接丟例外，導致這支函式
-       提早中斷、從沒真的按到Fetch)。改用select_by_visible_text(etag)
-       改選畫面上顯示的文字"S"，不是底層value。
-    2. E-tag/Shift/Entity/日期都填對、Fetch也真的按下去了，還是查出
-       "No Data"。使用者實際手動測試後確認：Operation欄位(一個帶核取
-       方塊的下拉控制項，不是普通<select>)雖然DevTools截圖看起來裡面
-       每一項預設都打勾，但那個勾勾狀態沒有真的「生效/送出」，一定要
-       使用者自己點過一次「Select all」才會真的套用全選——這裡改成
-       用Selenium主動點開這個控制項、點擊清單裡第一項(兩次截圖都確認
-       "Select all"排在第一個)，模擬使用者這個動作。
-    3. Operation控制項的DOM id前綴是"DropDownCheckBoxes1"(使用者截圖
-       確認)，跟表單postback欄位名稱DropDownCheckBoxes1$0~$84是同一組
-       (eWorld.UI.DropDownCheckBoxes這套第三方ASP.NET控制項的典型
-       命名慣例)：外層容器id="DropDownCheckBoxes1_sl"(點它會展開/收合
-       清單面板)，面板id="DropDownCheckBoxes1_dv"(裡面才是真正的
-       <input type="checkbox">清單)。
+       (select_by_value("S")找不到對應選項、直接丟例外)。改用
+       select_by_visible_text(etag)改選畫面上顯示的文字"S"，不是底層value。
+    2. E-tag/Shift/Entity/日期都填對、Fetch也真的按下去了，還是常常查出
+       "No Data"(或抓到表格但篩到目標群組後變0筆)，而且行為不穩定
+       (同樣步驟有時候有資料有時候沒有)。一開始懷疑是Operation欄位(帶
+       核取方塊的下拉控制項)沒有正確點選「Select all」，改用JavaScript
+       強制觸發click後仍然不穩定。後來比對使用者自己手動測試成功的兩次
+       截圖，發現共同點是都有填Job Code="CE*"，而失敗的幾次都是空白——
+       這個表單的說明文字也寫著Job Code可以用單一字元+萬用字元(範例
+       "如K*")，不像Entity要求至少2個字元。改成直接把Job Code填成"C*"
+       (含蓋所有改機相關代碼的字首：ESEC/DB的CE*/CD、LOC的CN*/CD)，
+       完全不用再碰Operation那個不穩定的自訂控制項。
     """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import Select
@@ -180,34 +176,17 @@ def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, time
         Select(driver.find_element(By.ID, "ddl_shift")).select_by_value(shift)
         Select(driver.find_element(By.ID, "ddl_etag")).select_by_visible_text(etag)
 
-        # Operation欄位：點開DropDownCheckBoxes控制項、點擊清單第一項("Select
-        # all")。2026/08/13使用者實測發現用WebDriver原生.click()時好時壞
-        # (同樣的步驟，有時候查得到資料、有時候查出來變No Data)——這種
-        # 自訂JS下拉面板常見的問題是面板展開/收合有CSS transition或JS
-        # 事件時序，原生.click()要求元素「當下完全可見、沒被其他東西蓋住」
-        # 才會成功，稍有不同步就可能點空或點到別的地方。改用JavaScript
-        # 直接觸發click事件(繞過WebDriver的可見性/遮擋判斷，效果等同瀏覽器
-        # 真的收到那個元素的click，但不受畫面當下渲染狀態影響)，比較不會
-        # 因為時序問題而飄忽不定。不再刻意把面板收合(收合的點擊本身也是
-        # 不穩定的來源之一)，直接用JS點Fetch即可，就算面板還開著、視覺上
-        # 蓋住其他東西也不影響JS click的目標元素。找不到控制項或點擊失敗
-        # 不當作致命錯誤(捕捉獨立的例外，不中斷整個流程)——就算Operation
-        # 真的沒選成功，還是讓Fetch照樣按下去，靠最終結果反映問題。
-        try:
-            driver.execute_script(
-                "arguments[0].click();", driver.find_element(By.ID, "DropDownCheckBoxes1_sl")
-            )
-            time.sleep(0.5)  # 面板展開的checkbox清單可能是JS另外渲染出來的，給一點時間
-            checkboxes = driver.find_elements(
-                By.CSS_SELECTOR, "#DropDownCheckBoxes1_dv input[type=checkbox]"
-            )
-            if checkboxes:
-                driver.execute_script("arguments[0].click();", checkboxes[0])
-        except Exception:
-            pass
+        # Job Code填"C*"(不是空白，也不碰Operation那個不穩定的自訂控制項)，
+        # 見上面docstring說明。
+        jobcode_input = driver.find_element(By.ID, "txt_jobcode")
+        jobcode_input.clear()
+        jobcode_input.send_keys("C*")
 
-        driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "btnFetch"))
-        status = f"[表單] 已填好日期({date_start}~{date_end})/entity={entity}/shift={shift}/etag={etag}，按下Fetch"
+        driver.find_element(By.ID, "btnFetch").click()
+        status = (
+            f"[表單] 已填好日期({date_start}~{date_end})/entity={entity}/shift={shift}/etag={etag}"
+            "/jobcode=C*，按下Fetch"
+        )
     except Exception as e:
         status = f"[表單] 找到frame了，但填寫/點擊失敗: {type(e).__name__}: {e}"
     finally:
