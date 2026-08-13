@@ -24,18 +24,25 @@ postback細節(DropDownCheckBoxes控制項的用戶端狀態、或其他沒能�
     records = cpis_scraper.parse_ee_maintenance_shift_html(html)
 
 前置：跟cpis_pm_monitor_scraper.py一樣，da_bot資料夾下要有msedgedriver.exe
-(版本要跟電腦上的Edge相符)。
+(版本要跟電腦上的Edge相符)，另外要有config.txt(apg_user/apg_password，
+2026/08/13新增的登入步驟需要，見下面_login()說明)。
 
 單獨測試(不用寫程式，直接看結果)：
     python cpis_ee_shift_scraper.py 20260811 20260811 AD
 """
 import os
 import time
+import urllib.parse
 
-EE_H_URL = (
-    "http://tncpisapg.tn.chipmos.com.tw/APG/APGREPORT/EE/wFrmEEMaintenanceRecord/"
-    "Default.aspx?isCopy=True&FuncId=569&ServerName=CPIS&UserName=EQS01"
+import config
+
+EE_H_BASE = "http://tncpisapg.tn.chipmos.com.tw"
+EE_H_PATH = (
+    "/APG/APGREPORT/EE/wFrmEEMaintenanceRecord/Default.aspx"
+    "?isCopy=True&FuncId=569&ServerName=CPIS&UserName=EQS01"
 )
+EE_H_URL = EE_H_BASE + EE_H_PATH
+LOGIN_URL = EE_H_BASE + "/APG/Logon.aspx?ReturnUrl=" + urllib.parse.quote(EE_H_PATH, safe="")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DRIVER_PATH = os.path.join(SCRIPT_DIR, "msedgedriver.exe")
@@ -68,6 +75,31 @@ def _make_driver():
     for a in ["--headless=new", "--window-size=1600,1200", "--disable-gpu", "--no-sandbox"]:
         opts.add_argument(a)
     return webdriver.Edge(service=Service(executable_path=DRIVER_PATH), options=opts)
+
+
+def _login(driver):
+    """
+    2026/08/13使用者實測發現：機器人自動填好Shift/Job Code等欄位、按下
+    Fetch，查出來卻常常是"No Data"，但使用者自己(已用真實帳號登入CPIS)
+    手動操作完全一樣的條件卻查得到大量真實資料。回頭檢視發現：
+    cpis_ee_shift_scraper.py(跟它照搬的cpis_pm_monitor_scraper.py)從頭
+    到尾沒有登入步驟，直接開查詢頁——這個報表模組顯然允許「未登入也能
+    打開表單畫面」，但實際按Fetch查詢執行時，對未登入/匿名的session
+    很可能直接回空結果(而不是明確跳出「請登入」錯誤，才會一直誤以為是
+    表單欄位填錯)。cpis_api.py其他函式(fetch_ee_maintenance_xls等)全部
+    都會先用config.txt裡的帳密登入才查詢，這裡也比照辦理：開查詢頁之前
+    先訪問Logon.aspx、填好帳密送出，登入成功後靠ReturnUrl機制直接被
+    redirect到EE_H_URL。
+    """
+    from selenium.webdriver.common.by import By
+
+    cfg = config.load()
+    config.require(cfg, "apg_user", "apg_password")
+
+    driver.get(LOGIN_URL)
+    driver.find_element(By.NAME, "UserName").send_keys(cfg["apg_user"])
+    driver.find_element(By.NAME, "Password").send_keys(cfg["apg_password"])
+    driver.find_element(By.NAME, "Login").click()
 
 
 def _switch_to_frame_with_element(driver, element_id, max_depth=5):
@@ -222,7 +254,7 @@ def fetch_ee_maintenance_shift_html(date_start, date_end, entity="BA*", shift="A
     """
     driver = _make_driver()
     try:
-        driver.get(EE_H_URL)
+        _login(driver)
         fill_status = _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag)
         print(fill_status)
         time.sleep(wait_seconds)
