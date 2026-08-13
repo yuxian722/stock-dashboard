@@ -199,6 +199,26 @@ def _first_token(text):
     return parts[0] if parts else None
 
 
+def _shift_cell_text(cell):
+    """
+    儲存格文字，跟cpis_pm_monitor_scraper.py的_cell_text()同款：這個表格
+    的表頭不是純文字，是ASP.NET GridView做成可排序按鈕
+    (<th><input type="submit" value="MACHINE ID" ...></th>)——文字放在
+    <input>的value屬性裡，<input>本身沒有文字節點，get_text()永遠抓到
+    空字串。2026/08/13使用者實測發現：這正是parse_ee_maintenance_shift_
+    html()抓到真正有資料的表格、卻解析出0筆的根因——表頭正規化後全部是
+    空字串，白名單比對永遠對不上，整個表格被當成「不是資料表格」跳過。
+    這裡改成：先試get_text()，抓不到內容(常見於這種按鈕式表頭)改讀裡面
+    <input>的value屬性。
+    """
+    text = cell.get_text(strip=True)
+    if not text:
+        inp = cell.find("input")
+        if inp is not None:
+            text = (inp.get("value") or "").strip()
+    return text
+
+
 def parse_ee_maintenance_shift_html(html):
     """
     解析maintenance_record_h.aspx查詢表單按下Fetch後回傳的結果HTML表格，
@@ -218,7 +238,7 @@ def parse_ee_maintenance_shift_html(html):
         rows = table.find_all("tr")
         if len(rows) < 2:
             continue
-        raw_headers = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
+        raw_headers = [_shift_cell_text(c) for c in rows[0].find_all(["th", "td"])]
         norm_headers = [_normalize_header(h) for h in raw_headers]
         if not _SHIFT_TABLE_REQUIRED_HEADERS.issubset(set(norm_headers)):
             continue
@@ -231,7 +251,7 @@ def parse_ee_maintenance_shift_html(html):
 
         records = []
         for tr in rows[1:]:
-            cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+            cells = [_shift_cell_text(td) for td in tr.find_all("td")]
             if len(cells) != len(norm_headers):
                 continue
 

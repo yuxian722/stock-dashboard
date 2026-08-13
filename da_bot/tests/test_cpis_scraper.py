@@ -334,6 +334,46 @@ class TestParseEeMaintenanceShiftHtml(unittest.TestCase):
         records = cpis_scraper.parse_ee_maintenance_shift_html(self._html(rows_html))
         self.assertEqual(records, [])
 
+    def test_headers_rendered_as_sortable_submit_buttons_still_parse(self):
+        # 2026/08/13使用者實測發現真正的根因：這個表格的表頭不是純文字，
+        # 是ASP.NET GridView做成的可排序按鈕(<th><input type="submit"
+        # value="MACHINE ID" .../></th>)，文字放在value屬性裡，<th>本身
+        # 沒有文字節點——get_text()永遠抓到空字串，白名單比對永遠對不上，
+        # 整個表格被當成「不是資料表格」跳過，變成「抓到真正有資料的表格、
+        # 卻解析出0筆」(跟cpis_pm_monitor_scraper.py早就踩過的同一種坑)。
+        form_table = (
+            "<table><tr><td>Date Range</td><td>Entity</td><td>Shift</td></tr>"
+            "<tr><td>20260811</td><td>BA*</td><td>AD</td></tr></table>"
+        )
+        data_table = (
+            "<table>"
+            '<tr><th><input type="submit" value="Production Line"/></th>'
+            '<th><input type="submit" value="MACHINE ID"/></th>'
+            '<th><input type="submit" value="WAIT-TIME"/></th>'
+            '<th><input type="submit" value="BGN-TIME"/></th>'
+            '<th><input type="submit" value="END-TIME"/></th>'
+            '<th><input type="submit" value="WAIT-DUR"/></th>'
+            '<th><input type="submit" value="DUR"/></th>'
+            '<th><input type="submit" value="ENGINEER ID."/></th>'
+            '<th><input type="submit" value="E.TAG"/></th>'
+            '<th><input type="submit" value="JOB.CODE"/></th>'
+            '<th><input type="submit" value="TOOL NUMBER"/></th>'
+            '<th><input type="submit" value="CAUSE"/></th></tr>'
+            "<tr><td>APG</td><td>BA205</td><td>2026/08/11 09:03</td>"
+            "<td>2026/08/11 09:10</td><td>2026/08/11 09:17</td><td>0.12</td>"
+            "<td>0.13</td><td>27376 27376</td><td>S</td><td>CEDO</td>"
+            "<td></td><td></td></tr>"
+            "</table>"
+        )
+        html = f"<html><body>{form_table}{data_table}</body></html>"
+
+        records = cpis_scraper.parse_ee_maintenance_shift_html(html)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["machine_id"], "BA205")
+        self.assertEqual(records[0]["job_code"], "CEDO")
+        self.assertEqual(records[0]["engineer_id"], "27376")
+
 
 if __name__ == "__main__":
     unittest.main()
