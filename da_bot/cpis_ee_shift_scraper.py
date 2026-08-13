@@ -125,15 +125,24 @@ def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, time
     每秒重試一次找ddl_shift所在的frame，回傳status字串描述實際發生的狀況
     (不默默吞掉例外，方便診斷)。
 
-    2026/08/12使用者實測發現兩件事：
+    2026/08/12~08/13使用者實測發現三件事：
     1. ddl_etag這個下拉選單的<option value="...">跟畫面顯示的文字不一樣
        (select_by_value("S")找不到對應選項、直接丟例外，導致這支函式
        提早中斷、從沒真的按到Fetch)。改用select_by_visible_text(etag)
        改選畫面上顯示的文字"S"，不是底層value。
-    2. 一開始改成完全不設這個欄位、維持預設"None(P,R,S,QC)"，結果查出來
-       是"No Data"——證實"None"不是「P/R/S/QC都算」的意思，反而像是某種
-       完全不同的篩選(可能字面上就是篩etag為空)，不能省略這一步，一定要
-       明確選到"S"這個選項才查得到資料。
+    2. E-tag/Shift/Entity/日期都填對、Fetch也真的按下去了，還是查出
+       "No Data"。使用者實際手動測試後確認：Operation欄位(一個帶核取
+       方塊的下拉控制項，不是普通<select>)雖然DevTools截圖看起來裡面
+       每一項預設都打勾，但那個勾勾狀態沒有真的「生效/送出」，一定要
+       使用者自己點過一次「Select all」才會真的套用全選——這裡改成
+       用Selenium主動點開這個控制項、點擊清單裡第一項(兩次截圖都確認
+       "Select all"排在第一個)，模擬使用者這個動作。
+    3. Operation控制項的DOM id前綴是"DropDownCheckBoxes1"(使用者截圖
+       確認)，跟表單postback欄位名稱DropDownCheckBoxes1$0~$84是同一組
+       (eWorld.UI.DropDownCheckBoxes這套第三方ASP.NET控制項的典型
+       命名慣例)：外層容器id="DropDownCheckBoxes1_sl"(點它會展開/收合
+       清單面板)，面板id="DropDownCheckBoxes1_dv"(裡面才是真正的
+       <input type="checkbox">清單)。
     """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import Select
@@ -166,6 +175,24 @@ def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, time
 
         Select(driver.find_element(By.ID, "ddl_shift")).select_by_value(shift)
         Select(driver.find_element(By.ID, "ddl_etag")).select_by_visible_text(etag)
+
+        # Operation欄位：點開DropDownCheckBoxes控制項、點擊清單第一項("Select
+        # all")、再點一次容器把面板收起來(避免蓋住其他欄位/按鈕，導致
+        # 後面btnFetch點不到)。找不到這個控制項或點擊失敗不當作致命錯誤
+        # (捕捉獨立的例外，不中斷整個流程)——就算Operation真的沒選成功，
+        # 還是讓Fetch照樣按下去，靠最終結果(有沒有資料)反映問題，而不是
+        # 卡在這裡讓其他明明成功的欄位也白填。
+        try:
+            driver.find_element(By.ID, "DropDownCheckBoxes1_sl").click()
+            checkboxes = driver.find_elements(
+                By.CSS_SELECTOR, "#DropDownCheckBoxes1_dv input[type=checkbox]"
+            )
+            if checkboxes:
+                checkboxes[0].click()
+            driver.find_element(By.ID, "DropDownCheckBoxes1_sl").click()
+        except Exception:
+            pass
+
         driver.find_element(By.ID, "btnFetch").click()
         status = f"[表單] 已填好日期({date_start}~{date_end})/entity={entity}/shift={shift}/etag={etag}，按下Fetch"
     except Exception as e:
