@@ -42,11 +42,12 @@ class TestLiveGroupShiftChangeoverReply(unittest.TestCase):
     def test_fetches_with_correct_shift_and_date_params(self):
         captured = {}
 
-        def fake_fetch(date_start, date_end, entity="BA*", shift="AD", wait_seconds=10):
+        def fake_fetch(date_start, date_end, entity="BA*", shift="AD", etag="S", wait_seconds=10):
             captured["date_start"] = date_start
             captured["date_end"] = date_end
             captured["entity"] = entity
             captured["shift"] = shift
+            captured["etag"] = etag
             return "<html></html>"
 
         cpis_ee_shift_scraper.fetch_ee_maintenance_shift_html = fake_fetch
@@ -58,6 +59,7 @@ class TestLiveGroupShiftChangeoverReply(unittest.TestCase):
         self.assertEqual(captured["date_end"], "20260811")
         self.assertEqual(captured["entity"], "BA*")
         self.assertEqual(captured["shift"], "AD")  # 要轉大寫傳給CPIS
+        self.assertEqual(captured["etag"], "S")  # 只要改機完成(e_tag=S)的紀錄
 
     def test_filters_to_group_and_formats_report(self):
         cpis_ee_shift_scraper.fetch_ee_maintenance_shift_html = lambda *a, **k: "<html>fake</html>"

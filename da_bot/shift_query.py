@@ -65,7 +65,7 @@ def live_group_shift_changeover_reply(group_name: str, shift: str, date_ymd: str
 
     try:
         result_html = cpis_ee_shift_scraper.fetch_ee_maintenance_shift_html(
-            date_ymd, date_ymd, entity="BA*", shift=shift
+            date_ymd, date_ymd, entity="BA*", shift=shift, etag="S"
         )
     except Exception as e:
         return f"{display_name}改機（{shift_word}）{date_label} 即時查詢CPIS失敗: {type(e).__name__}: {e}"
