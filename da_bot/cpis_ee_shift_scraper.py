@@ -227,13 +227,44 @@ def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, time
         Select(driver.find_element(By.ID, "ddl_shift")).select_by_value(shift)
         Select(driver.find_element(By.ID, "ddl_etag")).select_by_visible_text(etag)
 
-        # Job Code填"C*"(見上面docstring說明)。這是真正必填的關鍵欄位，
-        # Operation不用碰(使用者實測手動不點Operation、只填Job Code也能
-        # 查到資料)。填完額外按Tab觸發blur，見上面docstring第3點說明。
+        # Job Code填"C*"(見上面docstring說明)。填完額外按Tab觸發blur，
+        # 見上面docstring第3點說明。
         jobcode_input = driver.find_element(By.ID, "txt_jobcode")
         jobcode_input.clear()
         jobcode_input.send_keys("C*")
         jobcode_input.send_keys(Keys.TAB)
+
+        # 2026/08/13使用者要求：重新加回Operation「Select all」點擊，這次
+        # 用is_selected()明確驗證checkbox是否真的變成checked，把結果直接
+        # 印出來，不要再靠猜的——之前拿掉這段是因為使用者手動測試「完全
+        # 不碰Operation」也查得到資料，但機器人自動測試就算填好Job Code
+        # 還是查不到，兩者矛盾，這裡重新確認Operation這一步到底發生了
+        # 什麼事。
+        operation_status = "[Operation] 沒有嘗試(找不到控制項或例外)"
+        try:
+            driver.execute_script(
+                "arguments[0].click();", driver.find_element(By.ID, "DropDownCheckBoxes1_sl")
+            )
+            time.sleep(1)
+            checkboxes = driver.find_elements(
+                By.CSS_SELECTOR, "#DropDownCheckBoxes1_dv input[type=checkbox]"
+            )
+            if not checkboxes:
+                operation_status = "[Operation] 點開面板後找不到任何checkbox"
+            else:
+                select_all_checkbox = checkboxes[0]
+                before = select_all_checkbox.is_selected()
+                if not before:
+                    driver.execute_script("arguments[0].click();", select_all_checkbox)
+                    time.sleep(0.5)
+                after = select_all_checkbox.is_selected()
+                operation_status = (
+                    f"[Operation] 找到{len(checkboxes)}個checkbox，第一個(Select all)"
+                    f"點擊前is_selected()={before}，點擊後is_selected()={after}"
+                )
+        except Exception as e:
+            operation_status = f"[Operation] 例外: {type(e).__name__}: {e}"
+        print(operation_status)
 
         driver.find_element(By.ID, "btnFetch").click()
         status = (
