@@ -103,16 +103,16 @@ class TestEeQueryString(unittest.TestCase):
 
     def test_shift_defaults_to_none(self):
         qs = cpis_api._ee_query_string("20260801", "20260809", "BA*")
-        self.assertIn("ddl_shift=None", qs)
+        self.assertIn("shift=None", qs)
 
     def test_shift_can_be_overridden(self):
         # 2026/08/10使用者要求：CPIS查詢頁的Shift下拉選單值是AD/AN/BD/BN
         # (A/B班組×早/夜班)，這是查詢時的過濾參數(不是回傳資料裡的欄位)。
-        # 2026/08/13使用者實測發現真正的查詢字串參數名稱是"ddl_shift="
-        # (跟maintenance_record_h.aspx表單的DOM欄位名稱一致)，不是"shift="
-        # ——這是之前誤判這個端點"沒有實作Shift篩選"的根因。
+        # 2026/08/13曾一度改成"ddl_shift="測試，結果連shift=None都查詢
+        # 失敗，證實這個端點的參數名稱本來就是"shift"，問題出在這個端點
+        # 的shift參數本身沒有真正接到篩選邏輯，不是參數名稱猜錯，已改回。
         qs = cpis_api._ee_query_string("20260801", "20260809", "BA*", shift="AD")
-        self.assertIn("ddl_shift=AD", qs)
+        self.assertIn("shift=AD", qs)
 
 
 class TestFindEjpUrl(unittest.TestCase):
