@@ -353,3 +353,14 @@ if __name__ == "__main__":
     print(f"共擷取到 {len(records)} 筆")
     for r in records[:10]:
         print(r)
+
+    if not records:
+        # 2026/08/13使用者實測發現：Operation確認有勾選成功、Fetch也按了、
+        # 也真的找到含MACHINE ID+JOB.CODE表頭的表格(沒有丟例外)，但解析
+        # 出來卻是0筆——跟之前"整頁都是No Data文字"的情況不一樣，這次是
+        # 「找得到表格骨架，但解析不出裡面的資料列」，把找到的那個表格
+        # 原始HTML存成檔案，直接打開看裡面長什麼樣，不用再猜解析邏輯錯在哪。
+        dump_path = os.path.join(SCRIPT_DIR, "ee_shift_debug_table.html")
+        with open(dump_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"0筆但沒有例外，已把抓到的完整HTML存到 {dump_path}，用瀏覽器或記事本打開看內容")
