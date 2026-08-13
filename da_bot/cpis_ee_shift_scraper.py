@@ -134,15 +134,16 @@ def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, time
        (select_by_value("S")找不到對應選項、直接丟例外)。改用
        select_by_visible_text(etag)改選畫面上顯示的文字"S"，不是底層value。
     2. E-tag/Shift/Entity/日期都填對、Fetch也真的按下去了，還是常常查出
-       "No Data"(或抓到表格但篩到目標群組後變0筆)，而且行為不穩定
-       (同樣步驟有時候有資料有時候沒有)。一開始懷疑是Operation欄位(帶
-       核取方塊的下拉控制項)沒有正確點選「Select all」，改用JavaScript
-       強制觸發click後仍然不穩定。後來比對使用者自己手動測試成功的兩次
-       截圖，發現共同點是都有填Job Code="CE*"，而失敗的幾次都是空白——
-       這個表單的說明文字也寫著Job Code可以用單一字元+萬用字元(範例
-       "如K*")，不像Entity要求至少2個字元。改成直接把Job Code填成"C*"
-       (含蓋所有改機相關代碼的字首：ESEC/DB的CE*/CD、LOC的CN*/CD)，
-       完全不用再碰Operation那個不穩定的自訂控制項。
+       "No Data"，而且行為不穩定。一路懷疑到Operation欄位(帶核取方塊的
+       下拉控制項)沒有正確點選「Select all」，前後試過WebDriver原生click、
+       JavaScript強制click、加驗證重試，都還是不穩定。最後使用者直接在
+       CPIS畫面手動測試「Shift=AD、Job Code=C*、Operation完全不碰(維持
+       預設'Select')」，結果查得到大量真實資料——證實Operation根本不是
+       問題所在，這個表單真正需要的只有Job Code填非空值(說明文字寫著
+       "Entity+job code為必填"，可以用單一字元+萬用字元，範例"如K*")。
+       之前加的Operation點擊邏輯完全是白費工夫、甚至可能反而干擾了表單
+       狀態，這裡整段移除，只保留填Job Code="C*"(涵蓋所有改機相關代碼
+       的字首：ESEC/DB的CE*/CD、LOC的CN*/CD)。
     """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import Select
@@ -176,43 +177,17 @@ def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, time
         Select(driver.find_element(By.ID, "ddl_shift")).select_by_value(shift)
         Select(driver.find_element(By.ID, "ddl_etag")).select_by_visible_text(etag)
 
-        # Job Code填"C*"(見上面docstring說明)。
+        # Job Code填"C*"(見上面docstring說明)。這是真正必填的關鍵欄位，
+        # Operation不用碰(使用者實測手動不點Operation、只填Job Code也能
+        # 查到資料)。
         jobcode_input = driver.find_element(By.ID, "txt_jobcode")
         jobcode_input.clear()
         jobcode_input.send_keys("C*")
 
-        # 2026/08/13使用者實測發現：光填Job Code="C*"還是查出"No Data"，
-        # 代表Operation欄位還是要點「Select all」，不是Job Code就能取代——
-        # 兩個條件都要滿足。這裡重新加回這段，並且用checked狀態驗證+重試，
-        # 確保真的點成功(不只是送出click事件，還要確認checkbox變成checked，
-        # 沒成功的話再試一次)。
-        try:
-            checkbox_panel_trigger = driver.find_element(By.ID, "DropDownCheckBoxes1_sl")
-            driver.execute_script("arguments[0].click();", checkbox_panel_trigger)
-            time.sleep(1)
-            select_all_checkbox = None
-            for _ in range(3):
-                checkboxes = driver.find_elements(
-                    By.CSS_SELECTOR, "#DropDownCheckBoxes1_dv input[type=checkbox]"
-                )
-                if checkboxes:
-                    select_all_checkbox = checkboxes[0]
-                    break
-                time.sleep(1)
-
-            if select_all_checkbox is not None:
-                for _ in range(3):
-                    if select_all_checkbox.is_selected():
-                        break
-                    driver.execute_script("arguments[0].click();", select_all_checkbox)
-                    time.sleep(0.5)
-        except Exception:
-            pass
-
         driver.find_element(By.ID, "btnFetch").click()
         status = (
             f"[表單] 已填好日期({date_start}~{date_end})/entity={entity}/shift={shift}/etag={etag}"
-            "/jobcode=C*/Operation=select all，按下Fetch"
+            "/jobcode=C*，按下Fetch"
         )
     except Exception as e:
         status = f"[表單] 找到frame了，但填寫/點擊失敗: {type(e).__name__}: {e}"
