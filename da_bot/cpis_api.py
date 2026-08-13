@@ -163,10 +163,17 @@ def _check_entity_pattern(entity_pattern):
 
 
 def _ee_query_string(date_start, date_end, entity, jobcode="", shift="None"):
+    # 2026/08/13使用者實測發現：原本用的查詢參數名稱"shift="猜錯了——真正
+    # 有Shift篩選功能的表單(maintenance_record_h.aspx)裡，Shift下拉選單
+    # 的真實欄位名稱是"ddl_shift"(DOM/postback都確認過)，不是"shift"。
+    # 之前用"shift="這個查詢字串參數名稱測試，很可能被這個報表產生端點
+    # 當成不認得的參數直接忽略掉，才會出現shift=AD跟shift=None查出來
+    # 筆數一樣的假象(誤判成這個端點"沒有實作Shift篩選")。改用"ddl_shift="
+    # 這個真正的欄位名稱重新測試。
     return (
         "HIDCOUNT=1&pkg_type=T"
         f"&start_date={date_start}&end_date={date_end}"
-        f"&entity={entity}&shift={shift}&floor=A2&operation=None"
+        f"&entity={entity}&ddl_shift={shift}&floor=A2&operation=None"
         f"&etag=None&jobcode={jobcode}&enginerr=&value=WD&oper_type=0"
         "&dept=None&description=&bd_id=None&assylot=&product="
     )
