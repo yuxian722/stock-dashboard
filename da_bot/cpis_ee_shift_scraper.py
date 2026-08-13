@@ -74,7 +74,24 @@ def _make_driver():
     opts = Options()
     for a in ["--headless=new", "--window-size=1600,1200", "--disable-gpu", "--no-sandbox"]:
         opts.add_argument(a)
-    return webdriver.Edge(service=Service(executable_path=DRIVER_PATH), options=opts)
+    # 2026/08/13使用者實測發現：帳號本身確定有EE Maintenance存取權(既有的
+    # DB改機等查詢一直穩定運作)、表單欄位/登入都確認正確，但Selenium
+    # 開的無頭瀏覽器操作maintenance_record_h.aspx這個表單，不管有沒有選
+    # 班別都查不到資料(頁面/欄位互動全部正常，只有實際查詢結果是空的)——
+    # 這種「畫面/互動正常、資料悄悄消失」的模式很符合網站有偵測
+    # Selenium自動化(navigator.webdriver這個瀏覽器旗標)、對偵測到的自動化
+    # session直接回應空結果(不跳明確錯誤)這種常見的反爬蟲/反自動化手法。
+    # 這裡用CDP指令在每個新頁面載入前，把navigator.webdriver這個屬性蓋掉，
+    # 讓頁面偵測不到這是Selenium在操作。
+    driver = webdriver.Edge(service=Service(executable_path=DRIVER_PATH), options=opts)
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
+        )
+    except Exception:
+        pass  # 不是所有瀏覽器/驅動版本都支援這個CDP指令，失敗就算了，不影響其他功能
+    return driver
 
 
 def _login(driver):
