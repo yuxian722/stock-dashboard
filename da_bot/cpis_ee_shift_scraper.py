@@ -181,23 +181,32 @@ def _fill_form_and_fetch(driver, date_start, date_end, entity, shift, etag, time
         Select(driver.find_element(By.ID, "ddl_etag")).select_by_visible_text(etag)
 
         # Operation欄位：點開DropDownCheckBoxes控制項、點擊清單第一項("Select
-        # all")、再點一次容器把面板收起來(避免蓋住其他欄位/按鈕，導致
-        # 後面btnFetch點不到)。找不到這個控制項或點擊失敗不當作致命錯誤
-        # (捕捉獨立的例外，不中斷整個流程)——就算Operation真的沒選成功，
-        # 還是讓Fetch照樣按下去，靠最終結果(有沒有資料)反映問題，而不是
-        # 卡在這裡讓其他明明成功的欄位也白填。
+        # all")。2026/08/13使用者實測發現用WebDriver原生.click()時好時壞
+        # (同樣的步驟，有時候查得到資料、有時候查出來變No Data)——這種
+        # 自訂JS下拉面板常見的問題是面板展開/收合有CSS transition或JS
+        # 事件時序，原生.click()要求元素「當下完全可見、沒被其他東西蓋住」
+        # 才會成功，稍有不同步就可能點空或點到別的地方。改用JavaScript
+        # 直接觸發click事件(繞過WebDriver的可見性/遮擋判斷，效果等同瀏覽器
+        # 真的收到那個元素的click，但不受畫面當下渲染狀態影響)，比較不會
+        # 因為時序問題而飄忽不定。不再刻意把面板收合(收合的點擊本身也是
+        # 不穩定的來源之一)，直接用JS點Fetch即可，就算面板還開著、視覺上
+        # 蓋住其他東西也不影響JS click的目標元素。找不到控制項或點擊失敗
+        # 不當作致命錯誤(捕捉獨立的例外，不中斷整個流程)——就算Operation
+        # 真的沒選成功，還是讓Fetch照樣按下去，靠最終結果反映問題。
         try:
-            driver.find_element(By.ID, "DropDownCheckBoxes1_sl").click()
+            driver.execute_script(
+                "arguments[0].click();", driver.find_element(By.ID, "DropDownCheckBoxes1_sl")
+            )
+            time.sleep(0.5)  # 面板展開的checkbox清單可能是JS另外渲染出來的，給一點時間
             checkboxes = driver.find_elements(
                 By.CSS_SELECTOR, "#DropDownCheckBoxes1_dv input[type=checkbox]"
             )
             if checkboxes:
-                checkboxes[0].click()
-            driver.find_element(By.ID, "DropDownCheckBoxes1_sl").click()
+                driver.execute_script("arguments[0].click();", checkboxes[0])
         except Exception:
             pass
 
-        driver.find_element(By.ID, "btnFetch").click()
+        driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "btnFetch"))
         status = f"[表單] 已填好日期({date_start}~{date_end})/entity={entity}/shift={shift}/etag={etag}，按下Fetch"
     except Exception as e:
         status = f"[表單] 找到frame了，但填寫/點擊失敗: {type(e).__name__}: {e}"
