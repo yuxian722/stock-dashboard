@@ -287,16 +287,28 @@ def get_pm_monitor_records():
 
 _PM_CHANGEOVER_STATUSES = ("SETUP", "WAIT-SETUP")
 
+# 2026/08/20使用者實測發現：待改(WAIT-SETUP)彙總欄一直是0，但機台明細
+# 清單明明列得出好幾台「等待改機」(BA212/BA223/BA224/BA422/BA720/BA855
+# 等)。查出來是因為jcode過濾邏輯把SETUP/WAIT-SETUP一視同仁，但WAIT-SETUP
+# 階段的jcode欄位實測看起來是產品/配方代碼(例如"CRN"、"E-V34ABEM DA1"、
+# "RLRQ")，不是CED/CEDO/CD/CEE這種任務代碼——機台都還沒真的開始改機，
+# CPIS當然還沒把它歸類成哪一種改機任務，用SETUP那套「已經在改機、jcode
+# 應該已經確定」的標準去篩WAIT-SETUP，篩掉的幾乎是全部。使用者確認：
+# WAIT-SETUP這個狀態本身就代表「正在等待改機」，不需要再看jcode才算數。
+# 只對SETUP(改機中，這時jcode已經確定、篩選才有意義)套用jcode過濾。
+_PM_JCODE_FILTERED_STATUSES = ("SETUP",)
+
 
 def _pm_group_stats_from_rows(rows):
     """
     依機型群組(ESEC/DB/LOC/FC)統計PM Monitor各STATUS台數，回傳
-    {group: {status_code: 台數}}。SETUP/WAIT-SETUP(改機中/待改)這兩種
-    狀態額外用_changeover_jcode_category()篩過，只算jcode對得到該群組
-    真正改機類別的紀錄——PM Monitor同一個STATUS='SETUP'底下混了CWTM/EI/
-    INK這類生產中小動作，不是每一筆都是真正改機(2026/08/09使用者確認，
-    要跟改機完成的判斷標準統一，且各群組標準不同)。其餘狀態(IN-REPAIR/
-    WAIT-REPAIR/PM/ENG)不受影響，照原樣全部計入。
+    {group: {status_code: 台數}}。SETUP(改機中)額外用
+    _changeover_jcode_category()篩過，只算jcode對得到該群組真正改機類別
+    的紀錄——PM Monitor同一個STATUS='SETUP'底下混了CWTM/EI/INK這類生產中
+    小動作，不是每一筆都是真正改機(2026/08/09使用者確認，要跟改機完成的
+    判斷標準統一，且各群組標準不同)。WAIT-SETUP(待改)不套用這個過濾(見上
+    面2026/08/20的說明)。其餘狀態(IN-REPAIR/WAIT-REPAIR/PM/ENG)不受影響，
+    照原樣全部計入。
     """
     stats = {g: {} for g in ("ESEC", "DB", "LOC", "FC")}
     for r in rows:
@@ -304,7 +316,7 @@ def _pm_group_stats_from_rows(rows):
         if g is None:
             continue
         status = r["status"]
-        if status in _PM_CHANGEOVER_STATUSES and _changeover_jcode_category(g, r["jcode"]) is None:
+        if status in _PM_JCODE_FILTERED_STATUSES and _changeover_jcode_category(g, r["jcode"]) is None:
             continue
         stats[g][status] = stats[g].get(status, 0) + 1
     return stats

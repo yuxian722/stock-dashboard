@@ -592,7 +592,7 @@ class TestGetPmMonitorGroupStats(unittest.TestCase):
         self.assertEqual(stats["FC"], {})
 
     def test_setup_status_excludes_non_changeover_jcode(self):
-        # PM Monitor的STATUS='SETUP'底下混了CWTM/EI/INK這類生產中小動作，
+        # PM Monitor的STATUS='SETUP'底下混了CWTM/EI這類生產中小動作，
         # 不是每一筆都是真正改機，2026/08/09使用者確認要跟改機完成的判斷
         # 標準統一，只算CED/CEE/CD/CE類的jcode
         hourly_push.DB_PATH = _make_db_with_records([])
@@ -600,11 +600,27 @@ class TestGetPmMonitorGroupStats(unittest.TestCase):
             {"entity": "BAA01", "status": "SETUP", "jcode": "CED"},   # 真正改機，算
             {"entity": "BAA02", "status": "SETUP", "jcode": "CWTM"},  # 生產中小動作，不算
             {"entity": "BAA03", "status": "SETUP", "jcode": "EI"},    # 生產中小動作，不算
-            {"entity": "BAB01", "status": "WAIT-SETUP", "jcode": "INK"},  # 生產中小動作，不算
-            {"entity": "BAB02", "status": "WAIT-SETUP", "jcode": "CE"},   # "CE"是獨立的真正改機代碼，算
         ])
         stats = hourly_push.get_pm_monitor_group_stats()
-        self.assertEqual(stats["DB"], {"SETUP": 1, "WAIT-SETUP": 1})
+        self.assertEqual(stats["DB"], {"SETUP": 1})
+
+    def test_wait_setup_status_counts_regardless_of_jcode(self):
+        # 2026/08/20使用者實測發現：待改(WAIT-SETUP)彙總欄一直是0，但機台
+        # 明細清單明明列得出好幾台「等待改機」。查出來是WAIT-SETUP階段的
+        # jcode欄位實際上是產品/配方代碼(例如"CRN"、"E-V34ABEM DA1")，不是
+        # CED/CEDO/CD/CEE這種任務代碼——機台都還沒真的開始改機，CPIS當然
+        # 還沒把它歸類成哪一種改機任務。使用者確認：WAIT-SETUP這個狀態
+        # 本身就代表「正在等待改機」，不需要再看jcode才算數，只有SETUP
+        # (已經在改機、jcode應該已經確定)才套用jcode過濾。
+        hourly_push.DB_PATH = _make_db_with_records([])
+        _add_pm_monitor_rows(hourly_push.DB_PATH, [
+            {"entity": "BAB01", "status": "WAIT-SETUP", "jcode": "INK"},   # 不是CED家族，一樣算
+            {"entity": "BAB02", "status": "WAIT-SETUP", "jcode": "CRN"},   # 產品/配方代碼，一樣算
+            {"entity": "BAB03", "status": "WAIT-SETUP", "jcode": None},    # 還沒有jcode，一樣算
+            {"entity": "BAB04", "status": "WAIT-SETUP", "jcode": "CE"},    # 剛好是真正改機代碼，也算
+        ])
+        stats = hourly_push.get_pm_monitor_group_stats()
+        self.assertEqual(stats["DB"], {"WAIT-SETUP": 4})
 
     def test_non_changeover_statuses_not_filtered_by_jcode(self):
         # IN-REPAIR/WAIT-REPAIR/PM/ENG這些狀態不受jcode篩選影響，全部照算
