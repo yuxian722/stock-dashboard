@@ -82,10 +82,16 @@ _MACHINE_CHANGEOVER_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}\d{2,4})\s*�
 
 # CPIS Utilization Analysis 頁面最下方「GROUP」彙總表官方群組名稱，
 # 對應query_bot.OFFICIAL_GROUP_LABELS，用來辨識「<官方群組名稱>+downrate關鍵字」
-# 這種要查官方原始彙總數字(而非我們自己算的平均)的訊息
-_OFFICIAL_GROUP_LABELS = [
-    "2100SD", "DATACON8800", "DB700", "DB800", "DB830",
-    "EPOXY(DB)", "Epoxy", "Flip Chip", "LOC",
+# 這種要查官方原始彙總數字(而非我們自己算的平均)的訊息。key是使用者輸入時
+# 比對用的字樣，value是query_bot.OFFICIAL_GROUP_LABELS認得的內部標籤——
+# "DB"是2026/08/20使用者要求新增的別名，對到"EPOXY(DB)"這個CPIS官方本來
+# 就有的彙總列(=DB700+DB800+DB830加總，不是我們自己算的)，跟改機/修機/
+# 產品查詢那邊"DB"這個別名是同一個機型群組概念，但downrate這裡因為要
+# 對應CPIS原始表格的欄位名稱，內部值要用官方認得的"EPOXY(DB)"。
+_OFFICIAL_GROUP_KEYWORDS = [
+    ("2100SD", "2100SD"), ("DATACON8800", "DATACON8800"),
+    ("DB700", "DB700"), ("DB800", "DB800"), ("DB830", "DB830"), ("DB", "EPOXY(DB)"),
+    ("EPOXY(DB)", "EPOXY(DB)"), ("Epoxy", "Epoxy"), ("Flip Chip", "Flip Chip"), ("LOC", "LOC"),
 ]
 
 
@@ -94,7 +100,9 @@ def _build_official_group_pattern(label):
     return re.compile(r"(?<![A-Za-z0-9])" + escaped + r"(?![A-Za-z0-9])", re.IGNORECASE)
 
 
-_OFFICIAL_GROUP_PATTERNS = [(label, _build_official_group_pattern(label)) for label in _OFFICIAL_GROUP_LABELS]
+_OFFICIAL_GROUP_PATTERNS = [
+    (internal, _build_official_group_pattern(keyword)) for keyword, internal in _OFFICIAL_GROUP_KEYWORDS
+]
 
 # downrate關鍵字判斷全部共用這一份，避免像"DOWN RATE"(中間有空格)這種寫法
 # 在某一處判斷式裡漏比對到(容忍空格、大小寫都要跟這裡一致)
@@ -259,10 +267,11 @@ HELP_TEXT = (
     "  改查指定那一天，例：8/9 DB改機／8/9工時／8/9 DB／8/9 BAA02改機\n"
     "\n"
     "官方GROUP彙總表原始數字（CPIS Utilization Analysis頁面原始列，不是我們自己逐台平均算的）：\n"
-    "• <官方群組名稱>＋downrate/稼動明細/停機明細 → 例：DB800 downrate\n"
+    "• <官方群組名稱>＋downrate/稼動明細/停機明細 → 例：DB800 downrate／DB downrate\n"
     "  官方群組名稱：2100SD / DATACON8800 / DB700 / DB800 / DB830 / EPOXY(DB) / Epoxy / Flip Chip / LOC\n"
+    "  （DB是EPOXY(DB)的別名，等於DB700+DB800+DB830的CPIS官方加總列）\n"
     "• downrate（不加群組）→ 列出全部官方群組的downrate彙總\n"
-    "• 以上可以加「8/9」這種日期，改查指定那一天，例：8/9 DB800downrate／8/9 down rate\n"
+    "• 以上可以加「8/9」這種日期，改查指定那一天，例：8/9 DB800downrate／8/9 DB downrate／8/9 down rate\n"
     "\n"
     "範例：BA220／BA220今天／BAA02上週／BAA08 down rate／DB800downrate\n"
     "\n"
@@ -351,8 +360,12 @@ def parse_query(text):
 
     # 只打日期+群組關鍵字、沒加「改機」兩個字(例如"8/9 DB")：等同查那天
     # 的<群組>改機彙總(2026/08/10使用者要求)。一定要先抓到日期才觸發，不然
-    # 裸的"DB"要維持原本查即時彙總(db_group_reply)的行為，不能被這裡攔截掉
-    if query_now is not None:
+    # 裸的"DB"要維持原本查即時彙總(db_group_reply)的行為，不能被這裡攔截掉。
+    # 2026/08/21發現："8/20 DB downrate"也會比對到裸的"DB"，如果沒排除
+    # downrate關鍵字，會在走到下面官方GROUP downrate判斷式之前就被這裡搶走
+    # 變成改機彙總查詢，所以這裡也要跟下面downrate區塊一樣排除有downrate
+    # 關鍵字的情況，讓它往後留給downrate判斷式處理。
+    if query_now is not None and not _DOWNRATE_KW_RE.search(text):
         for internal, pattern in _CHANGEOVER_GROUP_BARE_PATTERNS:
             if pattern.search(text):
                 return {"mode": "group_changeover_detail", "group_name": internal,

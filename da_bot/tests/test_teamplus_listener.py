@@ -62,6 +62,23 @@ class TestParseQueryDownrate(unittest.TestCase):
         cmd = listener.parse_query("BAA08downrate")
         self.assertEqual(cmd, {"machine": "BAA08", "mode": "downrate"})
 
+    def test_db_alias_resolves_to_epoxy_db_official_label(self):
+        # 2026/08/20使用者要求："DB downrate"要能查到CPIS官方本來就有的
+        # "EPOXY(DB)"彙總列(=DB700+DB800+DB830加總)，不是逐一列出全部群組
+        cmd = listener.parse_query("DB downrate")
+        self.assertEqual(cmd, {"mode": "group_official_downrate", "group_label": "EPOXY(DB)"})
+
+    def test_db_alias_downrate_with_date(self):
+        cmd = listener.parse_query("8/20 DB downrate")
+        self.assertEqual(cmd["mode"], "group_official_downrate")
+        self.assertEqual(cmd["group_label"], "EPOXY(DB)")
+        self.assertEqual(cmd["date_label"], "08/20")
+
+    def test_db700_still_resolves_to_itself_not_the_db_alias(self):
+        # "DB"別名不能搶走既有的DB700/DB800/DB830個別群組查詢
+        cmd = listener.parse_query("DB700 downrate")
+        self.assertEqual(cmd, {"mode": "group_official_downrate", "group_label": "DB700"})
+
 
 class TestParseQueryChangeoverGroupDetail(unittest.TestCase):
     """「<群組>改機」查詢(2026/08/09使用者要求)，必須排在「DB」等機型群組bare
@@ -238,6 +255,14 @@ class TestParseQueryDatedChangeoverAndWorkhours(unittest.TestCase):
         self.assertEqual(cmd["mode"], "group_repair_detail")
         self.assertEqual(cmd["group_name"], "DB")
         self.assertEqual(cmd["date_label"], "08/09")
+
+    def test_group_repair_query_with_date_and_space(self):
+        # 2026/08/20使用者要求確認「8/20 DB 修機」(群組跟動作字樣中間有
+        # 空格)這種寫法也要能查指定日期
+        cmd = listener.parse_query("8/20 DB 修機")
+        self.assertEqual(cmd["mode"], "group_repair_detail")
+        self.assertEqual(cmd["group_name"], "DB")
+        self.assertEqual(cmd["date_label"], "08/20")
 
     def test_group_product_type_query(self):
         # "DB產品"/"2100產品"/"LOC產品"(2026/08/10使用者要求)
