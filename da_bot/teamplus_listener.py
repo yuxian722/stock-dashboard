@@ -243,6 +243,8 @@ HELP_TEXT = (
     "• CM700 → CM700機型群組\n"
     "• Esec2100 → 2100advi+2100SD機型群組\n"
     "• 機況 / 即時機況（不加機台代號）→ 全公司PM Monitor即時機況總覽（分組台數＋機台明細＋超時機台）\n"
+    "• 閒置（不加機台代號）→ 目前閒置人員清單（工號＋姓名＋閒置時間＋上次結束機台＋code＋結束時間），\n"
+    "  依閒置時間由長到短排序，只看今日已完成過修機/改機、但現在不在PM Monitor忙碌快照裡的人員\n"
     "\n"
     "改機明細/工時查詢：\n"
     "• <群組>改機 → 今日該群組改機台數＋CED/CEE/CD分類平均工時＋依人員(工號)分類明細＋\n"
@@ -410,6 +412,14 @@ def parse_query(text):
     # (那種情況留給下面掃到機台代號之後的"機況"關鍵字判斷處理)。
     if "機況" in text and not MACHINE_RE.search(text):
         return {"mode": "all_live_status"}
+
+    # 「閒置」查詢，不加機台代號(例如單獨打"閒置")：列出目前閒置中的人員
+    # (今日已完成過修機/改機、但目前不在PM Monitor忙碌快照裡的工號)，
+    # 2026/09使用者要求。要排在沒有機台代號這個條件成立時才觸發，跟「機況」
+    # 判斷式的排列理由一致——不能讓"BA220閒置"這種帶機台代號的寫法被這裡
+    # 攔截掉(這裡固定回全公司閒置人員清單，不是單一機台的閒置細項)。
+    if "閒置" in text and not MACHINE_RE.search(text):
+        return {"mode": "idle_engineers"}
 
     # 「工時」查詢(例如"s10435工時"、"27512總工時"、"8/9工時"，或單獨打"工時"
     # 列出今天所有人員)：指定日期(預設今日)該工號人員的修機+改機總工時
@@ -625,6 +635,12 @@ def build_reply(cmd):
             return query_bot.all_live_status_reply()
         except Exception as e:
             return f"即時機況查詢時發生錯誤: {type(e).__name__}: {e}"
+
+    if mode == "idle_engineers":
+        try:
+            return query_bot.idle_engineers_reply()
+        except Exception as e:
+            return f"人員閒置查詢時發生錯誤: {type(e).__name__}: {e}"
 
     if mode == "workhours":
         try:

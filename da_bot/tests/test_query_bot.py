@@ -447,6 +447,115 @@ class TestAllLiveStatusReply(unittest.TestCase):
         self.assertIn("(目前無超過標準工時的機台)", reply)
 
 
+class TestIdleEngineersReply(unittest.TestCase):
+    """「閒置」查詢(2026/09使用者要求)：列出今日已完成過修機/改機、但目前
+    不在PM/REPAIR/SETUP Monitor快照裡被列為忙碌中的人員，依閒置時間排序。"""
+
+    # 除了要驗證的紀錄外，額外插一筆跟目標工號無關的PM Monitor快照，讓
+    # _pm_latest_rows()的has_data成立(pm_rows完全是空list時，MAX(fetched_at)
+    # 是NULL，會被當成「還沒抓過」，跟「抓過但沒人忙碌」是兩種不同情境，
+    # 要用這筆佔位資料把兩者分開測試)。
+    _UNRELATED_PM_ROW = {"entity": "ZZ999", "status": "PM", "operator": "unrelated999",
+                          "in_time": "2026/08/09 08:00"}
+
+    def setUp(self):
+        self._orig_db_path = query_bot.DB_PATH
+        self._orig_master_path = engineer_master.PATH
+        self._orig_master_cache = engineer_master._cache
+        engineer_master.PATH = "/tmp/does_not_exist_engineer_master_test.json"
+        engineer_master._cache = None
+
+    def tearDown(self):
+        query_bot.DB_PATH = self._orig_db_path
+        engineer_master.PATH = self._orig_master_path
+        engineer_master._cache = self._orig_master_cache
+
+    def test_no_data_message_when_pm_monitor_table_missing(self):
+        query_bot.DB_PATH = _make_db_for_group_tests(no_pm_table=True)
+        reply = query_bot.idle_engineers_reply()
+        self.assertIn("尚未抓取", reply)
+
+    def test_no_idle_message_when_no_records_today(self):
+        query_bot.DB_PATH = _make_db_for_group_tests(pm_rows=[self._UNRELATED_PM_ROW])
+        reply = query_bot.idle_engineers_reply(datetime.datetime(2026, 8, 9, 14, 0))
+        self.assertIn("目前沒有閒置人員", reply)
+
+    def test_lists_idle_engineer_not_currently_busy(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_group_tests(
+            ee_rows=[
+                {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "12:00",
+                 "job_code": "CED", "engineer_id": "s10435", "dur": 1.0},
+            ],
+            pm_rows=[self._UNRELATED_PM_ROW],
+        )
+        reply = query_bot.idle_engineers_reply(now)
+        self.assertIn("【人員閒置】", reply)
+        self.assertIn("閒置2.00hr", reply)
+        self.assertIn("上次:BAA01 改機/CED 12:00結束", reply)
+
+    def test_excludes_currently_busy_engineer(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_group_tests(
+            ee_rows=[
+                {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "12:00",
+                 "job_code": "CED", "engineer_id": "s10435", "dur": 1.0},
+            ],
+            pm_rows=[{"entity": "BAA02", "status": "IN-REPAIR", "operator": "s10435",
+                      "in_time": "2026/08/09 13:00"}],
+        )
+        reply = query_bot.idle_engineers_reply(now)
+        self.assertIn("目前沒有閒置人員", reply)
+
+    def test_waiting_status_operator_not_treated_as_busy(self):
+        # WAIT-SETUP/WAIT-REPAIR是機台在等待、還沒真的開始動作，operator
+        # 欄位不代表現在有人在忙，不應該把這個人排除在閒置清單外
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_group_tests(
+            ee_rows=[
+                {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "12:00",
+                 "job_code": "CED", "engineer_id": "s10435", "dur": 1.0},
+            ],
+            pm_rows=[{"entity": "BAA02", "status": "WAIT-SETUP", "operator": "s10435",
+                      "in_time": "2026/08/09 13:00"}],
+        )
+        reply = query_bot.idle_engineers_reply(now)
+        self.assertIn("s10435", reply)
+
+    def test_sorted_by_idle_time_descending(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_group_tests(
+            ee_rows=[
+                {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "13:00",
+                 "job_code": "CED", "engineer_id": "s1", "dur": 1.0},
+                {"machine_id": "BAA02", "e_tag": "R", "end_date": today, "end_time": "10:00",
+                 "job_code": "BWD", "engineer_id": "s2", "dur": 1.0},
+            ],
+            pm_rows=[self._UNRELATED_PM_ROW],
+        )
+        reply = query_bot.idle_engineers_reply(now)
+        self.assertLess(reply.index("s2"), reply.index("s1"))
+
+    def test_engineer_name_appended_when_found(self):
+        now = datetime.datetime(2026, 8, 9, 14, 0)
+        today = now.date().isoformat()
+        query_bot.DB_PATH = _make_db_for_group_tests(
+            ee_rows=[
+                {"machine_id": "BAA01", "e_tag": "S", "end_date": today, "end_time": "12:00",
+                 "job_code": "CED", "engineer_id": "s10435", "dur": 1.0},
+            ],
+            pm_rows=[self._UNRELATED_PM_ROW],
+        )
+        engineer_master.PATH = _make_engineer_master([("10435", "王小明", "EE")])
+        engineer_master._cache = None
+        reply = query_bot.idle_engineers_reply(now)
+        self.assertIn("s10435(王小明)", reply)
+
+
 def _make_db_for_official_downrate_tests(rows):
     """rows是list of dict，每個可含model/entity/util/fetched_at/
     query_date_start/query_date_end(缺的欄位當NULL)，寫進utilization_record。

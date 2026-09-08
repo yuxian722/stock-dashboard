@@ -492,6 +492,30 @@ class TestParseQueryLiveStatus(unittest.TestCase):
             hourly_push.DB_PATH = orig_hp_db_path
 
 
+class TestParseQueryIdleEngineers(unittest.TestCase):
+    """「閒置」查詢(2026/09使用者要求)：不加機台代號時列出目前閒置中的人員；
+    帶機台代號的寫法不受影響(留給既有的機台查詢規則處理)。"""
+
+    def test_bare_keyword_routes_to_idle_engineers(self):
+        self.assertEqual(listener.parse_query("閒置"), {"mode": "idle_engineers"})
+
+    def test_keyword_with_surrounding_text_still_routes(self):
+        self.assertEqual(listener.parse_query("目前閒置人員"), {"mode": "idle_engineers"})
+
+    def test_machine_code_present_does_not_route_to_idle_engineers(self):
+        cmd = listener.parse_query("BA220閒置")
+        self.assertNotEqual(cmd.get("mode"), "idle_engineers")
+
+    def test_build_reply_idle_engineers_dispatches_to_query_bot(self):
+        orig_db_path = query_bot.DB_PATH
+        query_bot.DB_PATH = tempfile.mktemp(suffix=".db")
+        try:
+            reply = listener.build_reply({"mode": "idle_engineers"})
+            self.assertIsInstance(reply, str)
+        finally:
+            query_bot.DB_PATH = orig_db_path
+
+
 class TestParseQueryDatedDownrate(unittest.TestCase):
     """「8/9」這種指定日期可以加在「<官方群組名稱>downrate」「downrate」
     (不加群組)查詢前後，改查那一天的官方GROUP彙總資料(2026/08/10使用者

@@ -731,6 +731,120 @@ def all_live_status_reply(now: datetime.datetime = None) -> str:
     return "\n".join(lines)
 
 
+# 「閒置」查詢用：判斷目前正在忙碌(操作機台中)的人員工號集合，只有這幾種
+# STATUS的operator才算「現在正在動手做事」——WAIT-REPAIR/WAIT-SETUP是機台
+# 在等待、還沒真的開始動作，這兩種狀態的operator欄位不代表現在有人在忙。
+_BUSY_PM_STATUSES = ("IN-REPAIR", "SETUP", "PM", "ENG")
+
+
+def _busy_engineer_ids(pm_rows):
+    """從PM/REPAIR/SETUP Monitor快照抓「現在正在忙碌」的工號集合(正規化過，
+    用engineer_master._normalize_id()跟ee_maintenance_record.engineer_id的
+    格式對齊，同一個人不管CPIS吐出"s10435"還是"10435"都能比對成同一個人)，
+    只有_BUSY_PM_STATUSES這幾種狀態的operator才算(2026/09使用者要求「閒置」
+    查詢：要排除掉「現在正在忙」的人，才能列出真正閒置中的人員)。
+    """
+    busy = set()
+    for r in pm_rows:
+        if r["status"] not in _BUSY_PM_STATUSES:
+            continue
+        if r["operator"]:
+            key = engineer_master._normalize_id(r["operator"])
+            if key:
+                busy.add(key)
+    return busy
+
+
+def _last_finished_job_by_engineer(cur, now):
+    """
+    回傳{正規化工號: row}，row是該工號今日(跟班別對齊，見
+    hourly_push._shift_day_bounds())最後一筆已完成(e_tag屬於R修機/S改機)
+    紀錄的原始列(machine_id/job_code/e_tag/end_date/end_time/engineer_id)。
+    每個工號只留時間最晚的一筆(query依end_date/end_time遞增排序，後面的
+    覆蓋前面的，取代GROUP BY+子查詢，比較直覺)。查無engineer_id的紀錄不
+    計入(沒有工號無法判斷是誰閒置)。
+    """
+    shift_date, next_date = hourly_push._shift_day_bounds(now)
+    cur.execute("""
+        SELECT DISTINCT machine_id, bgn_date, bgn_time, job_code, e_tag, end_date, end_time, engineer_id
+        FROM ee_maintenance_record
+        WHERE e_tag IN ('R', 'S') AND engineer_id IS NOT NULL AND engineer_id != '' AND (
+            (end_date = ? AND end_time >= ?)
+            OR (end_date = ? AND end_time < ?)
+        )
+        ORDER BY end_date, end_time
+    """, (shift_date, hourly_push.SHIFT_CHANGE_TIME, next_date, hourly_push.SHIFT_CHANGE_TIME))
+
+    latest = {}
+    for r in cur.fetchall():
+        key = engineer_master._normalize_id(r["engineer_id"])
+        if not key:
+            continue
+        latest[key] = r
+    return latest
+
+
+def _idle_elapsed_hours(end_date, end_time, now):
+    """跟_pm_elapsed_hours()類似，但這裡的end_date/end_time是
+    ee_maintenance_record的格式("YYYY-MM-DD"+"HH:MM")，不是PM Monitor的
+    "YYYY/MM/DD HH:MM"格式，不能共用同一支函式。"""
+    try:
+        dt = datetime.datetime.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return None
+    return (now - dt).total_seconds() / 3600.0
+
+
+def idle_engineers_reply(now: datetime.datetime = None) -> str:
+    """
+    「閒置」查詢(2026/09使用者要求：打「閒置」關鍵字要即時回覆目前人員
+    閒置時間/工號/姓名/上次結束機台/code/時間)：列出目前閒置中的人員——
+    今日(跟班別對齊)已完成過至少一筆修機/改機紀錄，但目前不在PM/REPAIR/
+    SETUP Monitor即時快照裡被列為忙碌中(見_busy_engineer_ids())的工號，
+    依閒置時間(now - 最後一筆完成紀錄的end_time)由長到短排序。
+
+    PM Monitor資料還沒抓過時無法判斷誰正在忙碌(有可能把正在忙的人誤列成
+    閒置)，回傳提示文字而不是不準確的結果，跟這個檔案其他仰賴PM Monitor
+    快照的功能(all_live_status_reply()等)一致。
+    """
+    if now is None:
+        now = datetime.datetime.now()
+    conn = get_conn()
+    cur = conn.cursor()
+
+    pm_rows, pm_has_data = _pm_latest_rows(cur)
+    if not pm_has_data:
+        conn.close()
+        return "無法判斷人員閒置狀態(PM/REPAIR/SETUP Monitor即時資料尚未抓取)"
+
+    busy_ids = _busy_engineer_ids(pm_rows)
+    last_jobs = _last_finished_job_by_engineer(cur, now)
+    conn.close()
+
+    tag_label = {"R": "修機", "S": "改機"}
+    idle_entries = []
+    for key, r in last_jobs.items():
+        if key in busy_ids:
+            continue
+        elapsed = _idle_elapsed_hours(r["end_date"], r["end_time"], now)
+        idle_entries.append((elapsed, r))
+
+    if not idle_entries:
+        return "【人員閒置】目前沒有閒置人員(今日有紀錄的人員都在忙碌中，或今日尚無完成紀錄)"
+
+    idle_entries.sort(key=lambda t: -(t[0] or 0.0))
+
+    lines = [f"【人員閒置】{now.strftime('%m/%d %H:%M')}"]
+    for elapsed, r in idle_entries:
+        eng_txt = engineer_master.format_engineer(r["engineer_id"])
+        elapsed_txt = f"{elapsed:.2f}hr" if elapsed is not None else "?"
+        label = tag_label.get(r["e_tag"], r["e_tag"])
+        lines.append(
+            f"{eng_txt}  閒置{elapsed_txt}  上次:{r['machine_id']} {label}/{r['job_code']} {r['end_time']}結束"
+        )
+    return "\n".join(lines)
+
+
 # CPIS Utilization Analysis 頁面最下方「GROUP」彙總表裡，官方本身就有的群組名稱清單
 # (這些是cpis_utilization_scraper.py抓取時，連同機台明細一起原封不動存進DB的整列彙總數字，
 # 跟db_group_reply()裡自己逐台平均算出來的數字是兩回事，可能因為官方是用產量加權平均
